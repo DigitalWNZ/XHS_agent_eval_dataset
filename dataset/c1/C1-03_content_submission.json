@@ -1,0 +1,301 @@
+{
+  "instance_id": "C1-03",
+  "category": "C1",
+  "category_name": "需求理解与预评审",
+  "maps_to_journey": "Journey 3: Content Submission & Revision",
+  "input": {
+    "role": "Product Manager",
+    "requirement_description": "After a creator is accepted into a campaign, they need to submit their content for review. The content should go through some automated checks before the brand sees it. Creators might need to revise and resubmit. We need to keep track of different versions. The content service and campaign service already exist.",
+    "context": "The system is a FastAPI microservice called campaign-service. We have existing User, Content, and Campaign services. Creators have already been accepted into campaigns via the application flow. Tech stack: Python, PostgreSQL, Redis, Celery."
+  },
+  "gold_standard_output": {
+    "structured_spec": {
+      "overview": "Enable accepted creators to submit content drafts for campaign collaborations. Submissions pass through an automated validation pipeline before reaching the brand for review. The system supports iterative revision workflows with full version history tracking.",
+      "user_stories": [
+        {
+          "id": "US-3.1",
+          "story": "As an accepted creator, I want to submit a content draft for a campaign so that the brand can review and approve it for publication.",
+          "acceptance_criteria": [
+            "Creator can submit: title (required, 5-100 chars), body text (required, min length defined by campaign requirements), image URLs (1-9 images, must be valid URLs from XHS CDN domain), video URL (optional, must be valid XHS CDN URL), hashtags (0-20 tags, each 1-30 chars)",
+            "Submission is linked to the creator's accepted application for the specific campaign",
+            "System validates that the creator has an accepted application for this campaign before allowing submission",
+            "Submission is created with status 'auto_checking' and version number 1",
+            "Returns 403 if user is not the accepted creator for this campaign",
+            "Returns 422 if required fields are missing or fail format validation"
+          ]
+        },
+        {
+          "id": "US-3.2",
+          "story": "As the system, I want to automatically validate submitted content against campaign requirements so that obviously non-compliant content is rejected before reaching the brand.",
+          "acceptance_criteria": [
+            "Auto-check pipeline runs asynchronously after submission (Celery task)",
+            "Checks performed in order: (1) text length vs campaign min_word_count, (2) image count vs campaign min_image_count/max_image_count, (3) sensitive word detection via internal dictionary, (4) image quality score via external API stub (threshold: score >= 60)",
+            "If all checks pass → status becomes 'pending_review'",
+            "If any check fails → status becomes 'auto_rejected' with a list of failure reasons (one per failed check, human-readable)",
+            "Each check result is recorded with check_name, passed (bool), and detail message",
+            "Auto-check pipeline must complete within 30 seconds (timeout handling required)"
+          ]
+        },
+        {
+          "id": "US-3.3",
+          "story": "As an accepted creator, I want to revise and resubmit my content after it has been rejected or revision-requested so that I can address the feedback.",
+          "acceptance_criteria": [
+            "Creator can resubmit content when the current submission status is 'auto_rejected' or 'revision_requested'",
+            "Resubmission creates a new version (version number incremented: v2, v3, ...)",
+            "Previous version is preserved in history (not overwritten)",
+            "Resubmission goes through the full auto-check pipeline again",
+            "Maximum revision count is configurable per campaign (default: 3 revisions, meaning up to 4 total submissions including the original)",
+            "Returns 422 if max revision count exceeded with message: 'Maximum number of revisions (N) reached. Please contact the brand directly.'"
+          ]
+        },
+        {
+          "id": "US-3.4",
+          "story": "As an accepted creator, I want to view my submission history for a campaign so that I can track what I've submitted and what feedback I received.",
+          "acceptance_criteria": [
+            "Creator can list all submission versions for a specific campaign application, ordered by version descending",
+            "Each version shows: version number, status, submitted_at timestamp, auto-check results, brand feedback (if any), content snapshot (title, body, images, video, hashtags)",
+            "Creator can view a single submission version's full details",
+            "Returns 403 if the user is not the creator for this submission"
+          ]
+        },
+        {
+          "id": "US-3.5",
+          "story": "As an accepted creator, I want to save a content draft before submitting so that I can work on it incrementally.",
+          "acceptance_criteria": [
+            "Creator can create/update a draft for a campaign application without triggering the auto-check pipeline",
+            "Only one active draft per application at a time",
+            "Draft is stored with status 'draft' and is not visible to the brand",
+            "Creator can submit the draft, which transitions it to 'auto_checking' and triggers the pipeline",
+            "Draft is auto-deleted after successful submission"
+          ]
+        },
+        {
+          "id": "US-3.6",
+          "story": "As a brand marketing manager, I want to see submitted content that passed auto-checks so that I can review it for quality and campaign fit.",
+          "acceptance_criteria": [
+            "Brand can list all submissions in 'pending_review' status for their campaigns, with pagination",
+            "Brand can view the full content of a specific submission including auto-check results",
+            "Brand can filter submissions by campaign_id and status",
+            "Returns 403 if the user is not the campaign owner"
+          ]
+        },
+        {
+          "id": "US-3.7",
+          "story": "As a platform operator, I want the system to enforce submission deadlines so that the campaign timeline is respected.",
+          "acceptance_criteria": [
+            "System rejects new submissions (including revisions) if the campaign's content_deadline has passed",
+            "Deadline comparison uses UTC timestamps consistently",
+            "Returns 422 with message: 'Content submission deadline has passed (deadline: {datetime})'",
+            "A Celery periodic task marks overdue submissions (accepted applications with no approved content past content_deadline) as 'expired'"
+          ]
+        }
+      ],
+      "state_machine": {
+        "states": [
+          "draft",
+          "auto_checking",
+          "auto_rejected",
+          "pending_review",
+          "revision_requested",
+          "approved",
+          "published",
+          "expired"
+        ],
+        "transitions": [
+          {
+            "from": "draft",
+            "to": "auto_checking",
+            "trigger": "creator submits draft",
+            "guard": "content_deadline not passed, max revisions not exceeded"
+          },
+          {
+            "from": "auto_checking",
+            "to": "pending_review",
+            "trigger": "all auto-checks pass"
+          },
+          {
+            "from": "auto_checking",
+            "to": "auto_rejected",
+            "trigger": "one or more auto-checks fail"
+          },
+          {
+            "from": "auto_rejected",
+            "to": "auto_checking",
+            "trigger": "creator resubmits (new version)",
+            "guard": "content_deadline not passed, max revisions not exceeded"
+          },
+          {
+            "from": "pending_review",
+            "to": "revision_requested",
+            "trigger": "brand requests revision with feedback"
+          },
+          {
+            "from": "pending_review",
+            "to": "approved",
+            "trigger": "brand approves"
+          },
+          {
+            "from": "revision_requested",
+            "to": "auto_checking",
+            "trigger": "creator resubmits (new version)",
+            "guard": "content_deadline not passed, max revisions not exceeded"
+          },
+          {
+            "from": "approved",
+            "to": "published",
+            "trigger": "creator confirms publication with post URL"
+          },
+          {
+            "from": [
+              "draft",
+              "auto_checking",
+              "auto_rejected",
+              "pending_review",
+              "revision_requested"
+            ],
+            "to": "expired",
+            "trigger": "system detects content_deadline passed"
+          }
+        ]
+      },
+      "edge_cases": [
+        {
+          "id": "EC-3.1",
+          "scenario": "Creator submits content after the campaign's content_deadline has passed",
+          "handling": "Reject with 422: 'Content submission deadline has passed.' Check is performed using UTC comparison at the moment of submission. Any in-progress auto_checking submissions at the time of deadline expiry are allowed to complete their current check cycle."
+        },
+        {
+          "id": "EC-3.2",
+          "scenario": "Creator exceeds maximum revision count",
+          "handling": "Reject with 422: 'Maximum number of revisions (3) reached.' The count is the number of resubmissions (not total submissions), so original + 3 revisions = 4 total versions."
+        },
+        {
+          "id": "EC-3.3",
+          "scenario": "Creator submits a new version while the previous version is still in 'auto_checking' status",
+          "handling": "Reject with 409: 'A previous submission is still being processed. Please wait for the auto-check to complete.' Only one submission may be in the auto_checking pipeline at a time per application."
+        },
+        {
+          "id": "EC-3.4",
+          "scenario": "Image URL becomes invalid (CDN 404) after submission but before brand review",
+          "handling": "Auto-check pipeline includes a URL reachability check as part of image validation. If the image URL returns a non-200 status, the check fails with 'Image at URL {url} is not accessible.' For post-check changes, brand review UI shows a warning if images fail to load."
+        },
+        {
+          "id": "EC-3.5",
+          "scenario": "Auto-check external image quality API times out or returns an error",
+          "handling": "If the external API call exceeds 10 seconds, mark the image quality check as 'skipped' with reason 'Image quality service unavailable.' The submission proceeds to 'pending_review' with a flag indicating incomplete auto-checks. Do NOT block the creator due to external service failures."
+        },
+        {
+          "id": "EC-3.6",
+          "scenario": "Two concurrent submission requests from the same creator for the same application",
+          "handling": "Use database-level advisory lock on (application_id) during submission creation. The second request receives 409: 'A submission is already being processed.' This prevents duplicate version numbers and race conditions in version counting."
+        },
+        {
+          "id": "EC-3.7",
+          "scenario": "Content passes auto-check but brand requests revision repeatedly, approaching the max revision limit",
+          "handling": "Display remaining revision count in the revision_requested feedback to the creator: 'You have N revision(s) remaining.' When the last revision is used, include a warning: 'This is your final revision.' Do not allow the brand to request further revisions once the creator has exhausted their revision count."
+        },
+        {
+          "id": "EC-3.8",
+          "scenario": "Campaign is cancelled or paused while content is in 'auto_checking' or 'pending_review' status",
+          "handling": "Allow in-progress auto-checks to complete. Transition all non-terminal submissions for the campaign to 'expired' status. Notify affected creators: 'The campaign has been cancelled/paused. Your submission is no longer under review.'"
+        },
+        {
+          "id": "EC-3.9",
+          "scenario": "Creator submits content with body text containing only whitespace or special characters",
+          "handling": "Auto-check pipeline includes a text content quality check: body must contain at least N actual words (non-whitespace, non-punctuation tokens) matching the campaign min_word_count. Pure whitespace/emoji submissions are rejected."
+        }
+      ],
+      "clarifying_questions": [
+        {
+          "id": "CQ-3.1",
+          "question": "Should the auto-check pipeline be synchronous (block the API response) or asynchronous (return immediately, check in background)?",
+          "impact": "Synchronous is simpler but blocks the creator for up to 30 seconds. Asynchronous requires a polling/callback mechanism for status updates but provides better UX.",
+          "assumption_if_unanswered": "Asynchronous via Celery task. Submission API returns immediately with status 'auto_checking'. Creator polls or receives a push notification on completion."
+        },
+        {
+          "id": "CQ-3.2",
+          "question": "Are image and video files uploaded to our CDN before submission, or does the creator provide external URLs?",
+          "impact": "If pre-uploaded to CDN, we can validate file existence and format server-side. If external URLs, we need URL validation, reachability checks, and content-type verification.",
+          "assumption_if_unanswered": "Images/videos are pre-uploaded to XHS CDN. Submission contains CDN URLs only. URL validation checks the CDN domain whitelist."
+        },
+        {
+          "id": "CQ-3.3",
+          "question": "Should the sensitive word detection use a static dictionary or call an external moderation API?",
+          "impact": "Static dictionary is fast but may miss new sensitive terms. External API is more accurate but adds latency and a dependency.",
+          "assumption_if_unanswered": "Static dictionary for v1, loaded from a config file. Plan to migrate to external moderation API in v2."
+        },
+        {
+          "id": "CQ-3.4",
+          "question": "What constitutes 'publication' — does the creator publish through our platform, or do they publish on XHS manually and provide the post URL?",
+          "impact": "Affects whether we need a content publishing integration or just a URL input field.",
+          "assumption_if_unanswered": "Creator publishes manually on XHS and provides the post URL. Platform verifies the URL points to a valid XHS post."
+        },
+        {
+          "id": "CQ-3.5",
+          "question": "Should brand feedback on revision requests be structured (checklist of issues) or free-text?",
+          "impact": "Structured feedback enables analytics on common rejection reasons. Free-text is simpler to implement.",
+          "assumption_if_unanswered": "Free-text feedback for v1 (required, 10-1000 chars). Add structured categories in v2."
+        },
+        {
+          "id": "CQ-3.6",
+          "question": "Is there a file size limit for images and videos, and who enforces it?",
+          "impact": "If the CDN enforces limits, campaign-service doesn't need to. If not, we need to check file metadata.",
+          "assumption_if_unanswered": "CDN enforces upload limits. Campaign-service only validates URL format and count."
+        }
+      ],
+      "non_functional_requirements": [
+        {
+          "id": "NFR-3.1",
+          "category": "Performance",
+          "requirement": "Content submission API should respond within 500ms (p95). Auto-check pipeline should complete within 30 seconds end-to-end.",
+          "rationale": "Submission is a quick save; auto-check runs async so latency is less critical but should not block creators for too long."
+        },
+        {
+          "id": "NFR-3.2",
+          "category": "Reliability",
+          "requirement": "Auto-check pipeline must be idempotent and retryable. Failed Celery tasks should retry up to 3 times with exponential backoff (1s, 4s, 16s).",
+          "rationale": "External API calls (image quality) may fail transiently. Retry logic prevents permanent failures from blocking creators."
+        },
+        {
+          "id": "NFR-3.3",
+          "category": "Data Integrity",
+          "requirement": "Submission versions must be immutable once created. Version numbers must be strictly sequential per application with no gaps. Concurrent submission prevention via database locking.",
+          "rationale": "Version history is used for audit and dispute resolution. Gaps or overwrites would compromise the audit trail."
+        },
+        {
+          "id": "NFR-3.4",
+          "category": "Security",
+          "requirement": "Image/video URLs must be validated against a CDN domain whitelist. Arbitrary external URLs must be rejected to prevent SSRF and content injection.",
+          "rationale": "Prevent creators from submitting links to malicious or inappropriate content hosted externally."
+        },
+        {
+          "id": "NFR-3.5",
+          "category": "Observability",
+          "requirement": "Auto-check pipeline should emit structured logs for each check step (check_name, duration_ms, result, error). Overall pipeline duration should be tracked as a metric.",
+          "rationale": "Enable debugging of slow or failing checks and monitoring of external service health."
+        }
+      ],
+      "priority_classification": {
+        "P0_must_have": [
+          "US-3.1 (Submit content)",
+          "US-3.2 (Auto-check pipeline)",
+          "US-3.3 (Revise & resubmit)",
+          "US-3.7 (Deadline enforcement)",
+          "State machine with validation"
+        ],
+        "P1_should_have": [
+          "US-3.4 (Version history view)",
+          "US-3.6 (Brand review list)",
+          "US-3.5 (Draft save)",
+          "Retry logic for auto-check"
+        ],
+        "P2_nice_to_have": [
+          "Real-time status push notifications",
+          "Structured revision feedback categories",
+          "Content diff view between versions"
+        ]
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c1_requirements.json"
+}

@@ -1,0 +1,57 @@
+{
+  "instance_id": "C4-06",
+  "category": "C4",
+  "category_name": "代码评审",
+  "maps_to_journey": "Journey 6: Campaign Search",
+  "base_commit": "07968bf",
+  "input": {
+    "pr_title": "feat: add campaign search with text query",
+    "pr_description": "Adds a dedicated search endpoint for campaigns with text-based filtering.\n\n## Changes\n- CampaignRepository: new `search_campaigns` method with LIKE-based title search\n- CampaignService: new `search_campaigns` method with pagination\n- API: new `GET /campaigns/search?q=...` endpoint with optional status filter\n\n## Notes\n- Reuses existing pagination pattern from list_brand_campaigns\n- Search is case-sensitive for now; can switch to ilike later if needed",
+    "bugged_diff": "diff --git a/app/api/v1/campaigns.py b/app/api/v1/campaigns.py\nindex 5800b3b..a1c2d3e 100644\n--- a/app/api/v1/campaigns.py\n+++ b/app/api/v1/campaigns.py\n@@ -32,6 +32,20 @@ async def list_campaigns(\n     )\n \n \n+@router.get(\"/search\", response_model=PaginatedResponse[CampaignResponse])\n+async def search_campaigns(\n+    db: DBSession,\n+    q: str = Query(..., min_length=1),\n+    status: str | None = Query(None),\n+    page: int = Query(1, ge=1),\n+    page_size: int = Query(20, ge=1, le=100),\n+):\n+    service = _get_service(db)\n+    return await service.search_campaigns(\n+        query_text=q, status=status, page=page, page_size=page_size\n+    )\n+\n+\n @router.get(\"/marketplace\", response_model=PaginatedResponse[CampaignResponse])\n async def list_marketplace(\n     db: DBSession,\ndiff --git a/app/repositories/campaign_repo.py b/app/repositories/campaign_repo.py\nindex f6d8005..b3e4f5a 100644\n--- a/app/repositories/campaign_repo.py\n+++ b/app/repositories/campaign_repo.py\n@@ -41,6 +41,32 @@ class CampaignRepository:\n         campaigns = list(result.scalars().all())\n         return campaigns, total\n \n+    async def search_campaigns(\n+        self,\n+        query_text: str,\n+        status: CampaignStatus | None = None,\n+        page: int = 1,\n+        page_size: int = 20,\n+    ) -> tuple[list[Campaign], int]:\n+        base = [Campaign.is_deleted.is_(False)]\n+        if status is not None:\n+            base.append(Campaign.status == status)\n+\n+        search_filter = Campaign.title.like(f\"%{query_text}%\")\n+        base.append(search_filter)\n+\n+        count_query = select(func.count()).select_from(Campaign).where(*base)\n+        total = (await self.db.execute(count_query)).scalar_one()\n+\n+        query = (\n+            select(Campaign)\n+            .where(*base)\n+            .order_by(Campaign.created_at.desc())\n+            .offset((page - 1) * page_size)\n+            .limit(page_size)\n+        )\n+        result = await self.db.execute(query)\n+        campaigns = list(result.scalars().all())\n+        return campaigns, total\n+\n     async def list_active(\n         self, page: int = 1, page_size: int = 20\n     ) -> tuple[list[Campaign], int]:\ndiff --git a/app/services/campaign_service.py b/app/services/campaign_service.py\nindex 435fc06..c7d8e9f 100644\n--- a/app/services/campaign_service.py\n+++ b/app/services/campaign_service.py\n@@ -45,6 +45,24 @@ class CampaignService:\n             total_pages=math.ceil(total / page_size) if page_size > 0 else 0,\n         )\n \n+    async def search_campaigns(\n+        self,\n+        query_text: str,\n+        status: str | None = None,\n+        page: int = 1,\n+        page_size: int = 20,\n+    ) -> PaginatedResponse[CampaignResponse]:\n+        status_enum = CampaignStatus(status) if status else None\n+        campaigns, total = await self.repo.search_campaigns(\n+            query_text=query_text, status=status_enum, page=page, page_size=page_size\n+        )\n+        return PaginatedResponse[CampaignResponse](\n+            items=[CampaignResponse.model_validate(c) for c in campaigns],\n+            total=total,\n+            page=page,\n+            page_size=page_size,\n+            total_pages=max(1, math.ceil(total / page_size)),\n+        )\n+\n     async def list_marketplace(\n         self, page: int = 1, page_size: int = 20\n     ) -> PaginatedResponse[CampaignResponse]:\n"
+  },
+  "planted_defects": [
+    {
+      "id": "D-C4-06-1",
+      "file": "app/repositories/campaign_repo.py",
+      "line_range_in_diff": "search_campaigns method, search_filter line",
+      "category": "Security",
+      "severity": "Major",
+      "title": "SQL LIKE wildcard injection in campaign search",
+      "description": "The search query text is interpolated directly into the LIKE pattern without escaping SQL wildcard characters (`%` and `_`). An attacker can inject `%` to match all campaigns regardless of title, or use `_` as a single-character wildcard to probe for campaign names character-by-character. For example, searching for just `%` returns every campaign, bypassing any intended access filtering. This is a LIKE injection vulnerability.",
+      "root_cause": "The f-string `f\"%{query_text}%\"` passes user input directly into `Campaign.title.like()` without escaping the special LIKE metacharacters `%` and `_`. The `%` in user input acts as a zero-or-more wildcard and `_` acts as a single-character wildcard.",
+      "expected_location": {
+        "file": "app/repositories/campaign_repo.py",
+        "function": "search_campaigns",
+        "line_hint": "search_filter = Campaign.title.like(f\"%{query_text}%\")"
+      },
+      "suggested_fix": "Escape LIKE wildcards in user input before constructing the pattern. Either use a helper like `query_text.replace('%', '\\\\%').replace('_', '\\\\_')` with the `escape='\\\\'` parameter, or use SQLAlchemy's `contains()` which handles escaping automatically."
+    },
+    {
+      "id": "D-C4-06-2",
+      "file": "app/services/campaign_service.py",
+      "line_range_in_diff": "search_campaigns method, total_pages calculation",
+      "category": "Defect",
+      "severity": "Major",
+      "title": "Incorrect pagination for empty search results",
+      "description": "The `total_pages` calculation uses `max(1, math.ceil(total / page_size))` which always returns at least 1, even when there are 0 results. This produces a misleading response: the client sees `total: 0, items: [], total_pages: 1`, suggesting there is 1 page of data when in fact there are none. This is inconsistent with the existing `list_brand_campaigns` and `list_marketplace` methods which correctly return `total_pages: 0` when there are no results. The inconsistency can confuse clients that use `total_pages` to determine if more data exists.",
+      "root_cause": "Using `max(1, math.ceil(total / page_size))` instead of the established pattern `math.ceil(total / page_size) if page_size > 0 else 0`. The `max(1, ...)` forces a minimum of 1 page even for empty result sets.",
+      "expected_location": {
+        "file": "app/services/campaign_service.py",
+        "function": "search_campaigns",
+        "line_hint": "total_pages=max(1, math.ceil(total / page_size))"
+      },
+      "suggested_fix": "Use the same pattern as other methods: `total_pages=math.ceil(total / page_size) if page_size > 0 else 0`"
+    }
+  ],
+  "evaluation_config": {
+    "total_planted_defects": 2,
+    "defect_categories": {
+      "Security": 1,
+      "Defect": 1
+    },
+    "defect_severities": {
+      "Major": 2
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c4_review.json"
+}

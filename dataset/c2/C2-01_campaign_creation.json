@@ -1,0 +1,785 @@
+{
+  "instance_id": "C2-01",
+  "category": "C2",
+  "category_name": "技术方案设计",
+  "maps_to_journey": "Journey 1: Brand Campaign Creation",
+  "input": {
+    "requirements_spec": "Enable brand users to create, manage, and publish campaign briefs to a creator marketplace. Core user stories: (US-1.1) Brand creates campaign with brief, budget, timeline, and creator eligibility criteria — saved as 'draft'. (US-1.2) Brand edits campaign with constraints — all fields editable in draft/pending_review, restricted edits in active (no budget change, no edits after applications received). (US-1.3) Brand submits campaign for platform review — validates required fields, budget >= min_fee, deadlines in future. (US-1.4) Admin approves or rejects with reason — notification to brand. (US-1.5) Brand pauses/resumes/cancels campaign — terminal statuses are immutable, cancel triggers creator notification. (US-1.6) Brand lists/views own campaigns with pagination and status filter. State machine: draft → pending_review → active → paused → completed → cancelled (also rejected from pending_review, with re-edit path). Key requirements: optimistic locking for concurrent edits, audit trail for status transitions, ownership authorization, deadline enforcement.",
+    "system_context": "Existing FastAPI microservice 'xhs-campaign-service' (Python 3.11). Layered architecture: Model (SQLAlchemy 2.0 with Mapped[] annotations) → Repository (async, DB access only) → Service (business logic) → API (FastAPI routers under /api/v1/). PostgreSQL via asyncpg, Redis available, Celery for async tasks. Existing patterns from User module: UUID string PKs (generate_uuid()), TimestampMixin (created_at/updated_at), SoftDeleteMixin (is_deleted/deleted_at), Pydantic v2 schemas (Create/Update/Response), custom exceptions (NotFoundError, ConflictError, ForbiddenError, ValidationError), auth via X-User-Id header → CurrentUser dependency, role enforcement via require_role(). PaginatedResponse[T] generic for list endpoints. Dependency wiring: _get_service(db) factory in router module.",
+    "constraints": "Performance: campaign list p95 < 200ms for 10k campaigns. Security: ownership-based authorization — brands see only own campaigns; admin endpoints require admin role. Data integrity: atomic status transitions with optimistic locking. Auditability: log all status changes with actor, timestamp, from/to states. Single currency (CNY) for v1. No external service dependencies for CRUD — notification is fire-and-forget via Celery task."
+  },
+  "gold_standard_output": {
+    "module_design": {
+      "new_files": [
+        {
+          "path": "app/models/campaign.py",
+          "responsibility": "Campaign SQLAlchemy model and CampaignStatus enum. Defines the campaigns table with all columns, indexes, and constraints. Uses Base, TimestampMixin, SoftDeleteMixin from base.py.",
+          "depends_on": [
+            "app/models/base.py"
+          ]
+        },
+        {
+          "path": "app/schemas/campaign.py",
+          "responsibility": "Pydantic v2 schemas: CampaignCreate, CampaignUpdate, CampaignResponse, CampaignSubmitForReview, CampaignAdminAction (approve/reject). Handles field validation (budget constraints, deadline ordering).",
+          "depends_on": [
+            "app/models/campaign.py"
+          ]
+        },
+        {
+          "path": "app/repositories/campaign_repo.py",
+          "responsibility": "CampaignRepository class. All database access for campaigns: get_by_id, list_by_owner, create, update, soft_delete, count_by_status. Follows UserRepository patterns.",
+          "depends_on": [
+            "app/models/campaign.py"
+          ]
+        },
+        {
+          "path": "app/services/campaign_service.py",
+          "responsibility": "CampaignService class. Business logic: create, update (with edit constraints), submit_for_review (with validation), admin_approve, admin_reject, pause, resume, cancel. State transition validation. Optimistic locking checks.",
+          "depends_on": [
+            "app/repositories/campaign_repo.py",
+            "app/schemas/campaign.py",
+            "app/utils/exceptions.py"
+          ]
+        },
+        {
+          "path": "app/api/v1/campaigns.py",
+          "responsibility": "FastAPI router for /api/v1/campaigns. Endpoint definitions with auth dependencies. Wires CampaignService via _get_service() factory pattern.",
+          "depends_on": [
+            "app/services/campaign_service.py",
+            "app/api/deps.py"
+          ]
+        }
+      ],
+      "modified_files": [
+        {
+          "path": "app/models/__init__.py",
+          "change": "Add Campaign and CampaignStatus imports to __all__."
+        },
+        {
+          "path": "app/api/v1/router.py",
+          "change": "Import and include campaigns router with prefix='/campaigns', tags=['campaigns']."
+        }
+      ],
+      "dependency_graph": "API (campaigns.py) → Service (campaign_service.py) → Repository (campaign_repo.py) → Model (campaign.py) → Base (base.py). API also depends on deps.py for auth. No circular dependencies."
+    },
+    "api_design": {
+      "base_path": "/api/v1/campaigns",
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns",
+          "description": "Create a new campaign in draft status",
+          "auth": "CurrentUser (must be brand role)",
+          "request_body": {
+            "schema": "CampaignCreate",
+            "fields": {
+              "title": {
+                "type": "str",
+                "constraints": "min_length=5, max_length=100, required"
+              },
+              "description": {
+                "type": "str",
+                "constraints": "min_length=20, max_length=2000, required"
+              },
+              "content_type": {
+                "type": "str",
+                "constraints": "one of: 'note', 'video', 'note_and_video', required"
+              },
+              "min_word_count": {
+                "type": "int",
+                "constraints": "ge=0, default=0"
+              },
+              "min_image_count": {
+                "type": "int",
+                "constraints": "ge=0, default=0"
+              },
+              "target_audience_tags": {
+                "type": "list[str]",
+                "constraints": "min_items=1, max_items=5"
+              },
+              "total_budget": {
+                "type": "Decimal",
+                "constraints": "gt=0, max_digits=12, decimal_places=2, required"
+              },
+              "min_fee": {
+                "type": "Decimal",
+                "constraints": "gt=0, max_digits=10, decimal_places=2, required"
+              },
+              "max_fee": {
+                "type": "Decimal",
+                "constraints": "gt=0, max_digits=10, decimal_places=2, required"
+              },
+              "application_deadline": {
+                "type": "datetime",
+                "constraints": "must be in the future, required"
+              },
+              "content_deadline": {
+                "type": "datetime",
+                "constraints": "must be after application_deadline, required"
+              },
+              "publish_deadline": {
+                "type": "datetime",
+                "constraints": "must be after content_deadline, required"
+              },
+              "min_follower_count": {
+                "type": "int",
+                "constraints": "ge=0, default=0"
+              },
+              "min_engagement_rate": {
+                "type": "float",
+                "constraints": "ge=0.0, le=1.0, default=0.0"
+              },
+              "required_categories": {
+                "type": "list[str] | None",
+                "constraints": "optional"
+              },
+              "region_restrictions": {
+                "type": "list[str] | None",
+                "constraints": "optional"
+              }
+            },
+            "cross_field_validation": [
+              "max_fee >= min_fee",
+              "total_budget >= min_fee",
+              "application_deadline < content_deadline < publish_deadline"
+            ]
+          },
+          "response": {
+            "status": 201,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 403,
+              "condition": "User is not brand role"
+            },
+            {
+              "status": 422,
+              "condition": "Validation error (field-level or cross-field)"
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/campaigns",
+          "description": "List campaigns owned by the current brand user",
+          "auth": "CurrentUser (must be brand role)",
+          "query_params": {
+            "status": {
+              "type": "str | None",
+              "description": "Filter by campaign status"
+            },
+            "page": {
+              "type": "int",
+              "default": 1,
+              "constraints": "ge=1"
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20,
+              "constraints": "ge=1, le=100"
+            }
+          },
+          "response": {
+            "status": 200,
+            "schema": "PaginatedResponse[CampaignResponse]"
+          },
+          "errors": [
+            {
+              "status": 403,
+              "condition": "User is not brand role"
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/campaigns/{campaign_id}",
+          "description": "Get campaign details by ID",
+          "auth": "CurrentUser (brand sees own only; admin sees all)",
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Brand user does not own this campaign"
+            }
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/campaigns/{campaign_id}",
+          "description": "Update campaign fields (with edit constraints based on status)",
+          "auth": "CurrentUser (must be campaign owner)",
+          "request_body": {
+            "schema": "CampaignUpdate",
+            "note": "All fields optional. Same field definitions as CampaignCreate but all optional. Includes 'version' field for optimistic locking."
+          },
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Not the campaign owner"
+            },
+            {
+              "status": 409,
+              "condition": "Version conflict (optimistic locking) OR campaign has applications and restricted fields are being edited"
+            },
+            {
+              "status": 422,
+              "condition": "Invalid field values or cross-field validation failure"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/submit",
+          "description": "Submit campaign for platform review (draft → pending_review)",
+          "auth": "CurrentUser (must be campaign owner)",
+          "request_body": null,
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Not the campaign owner"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is not in 'draft' status"
+            },
+            {
+              "status": 422,
+              "condition": "Required fields missing, budget < min_fee, or deadlines in the past"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/approve",
+          "description": "Admin approves campaign (pending_review → active)",
+          "auth": "CurrentUser (must be admin role via require_role('admin'))",
+          "request_body": null,
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "User is not admin"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is not in 'pending_review' status"
+            },
+            {
+              "status": 422,
+              "condition": "Campaign deadlines have expired during review"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/reject",
+          "description": "Admin rejects campaign with reason (pending_review → rejected)",
+          "auth": "CurrentUser (must be admin role via require_role('admin'))",
+          "request_body": {
+            "schema": "CampaignAdminReject",
+            "fields": {
+              "reason": {
+                "type": "str",
+                "constraints": "min_length=10, max_length=500, required"
+              }
+            }
+          },
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "User is not admin"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is not in 'pending_review' status"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/pause",
+          "description": "Pause an active campaign (active → paused)",
+          "auth": "CurrentUser (must be campaign owner)",
+          "request_body": null,
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Not the campaign owner"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is not in 'active' status"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/resume",
+          "description": "Resume a paused campaign (paused → active)",
+          "auth": "CurrentUser (must be campaign owner)",
+          "request_body": null,
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Not the campaign owner"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is not in 'paused' status OR deadlines have passed"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/cancel",
+          "description": "Cancel a campaign (any non-terminal status → cancelled)",
+          "auth": "CurrentUser (must be campaign owner)",
+          "request_body": null,
+          "response": {
+            "status": 200,
+            "schema": "CampaignResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Not the campaign owner"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is already in terminal status (completed/cancelled)"
+            }
+          ]
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/campaigns/{campaign_id}",
+          "description": "Soft-delete a campaign (only in draft status)",
+          "auth": "CurrentUser (must be campaign owner)",
+          "response": {
+            "status": 204,
+            "schema": null
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Campaign not found"
+            },
+            {
+              "status": 403,
+              "condition": "Not the campaign owner"
+            },
+            {
+              "status": 409,
+              "condition": "Campaign is not in 'draft' status (published campaigns cannot be deleted, only cancelled)"
+            }
+          ]
+        }
+      ]
+    },
+    "data_model": {
+      "tables": [
+        {
+          "name": "campaigns",
+          "description": "Core campaign table. One row per campaign. Owned by a brand user.",
+          "inherits": [
+            "Base",
+            "TimestampMixin",
+            "SoftDeleteMixin"
+          ],
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "primary_key": true,
+              "default": "generate_uuid()"
+            },
+            {
+              "name": "owner_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "users.id",
+              "description": "Brand user who created this campaign"
+            },
+            {
+              "name": "title",
+              "type": "String(100)",
+              "nullable": false
+            },
+            {
+              "name": "description",
+              "type": "Text",
+              "nullable": false
+            },
+            {
+              "name": "status",
+              "type": "CampaignStatus (enum)",
+              "nullable": false,
+              "default": "CampaignStatus.DRAFT"
+            },
+            {
+              "name": "content_type",
+              "type": "String(20)",
+              "nullable": false
+            },
+            {
+              "name": "min_word_count",
+              "type": "Integer",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "min_image_count",
+              "type": "Integer",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "target_audience_tags",
+              "type": "JSON",
+              "nullable": false,
+              "description": "list[str] stored as JSON array"
+            },
+            {
+              "name": "total_budget",
+              "type": "Numeric(12,2)",
+              "nullable": false
+            },
+            {
+              "name": "min_fee",
+              "type": "Numeric(10,2)",
+              "nullable": false
+            },
+            {
+              "name": "max_fee",
+              "type": "Numeric(10,2)",
+              "nullable": false
+            },
+            {
+              "name": "budget_remaining",
+              "type": "Numeric(12,2)",
+              "nullable": false,
+              "description": "Initialized to total_budget, decremented when applications are accepted"
+            },
+            {
+              "name": "application_deadline",
+              "type": "DateTime(timezone=True)",
+              "nullable": false
+            },
+            {
+              "name": "content_deadline",
+              "type": "DateTime(timezone=True)",
+              "nullable": false
+            },
+            {
+              "name": "publish_deadline",
+              "type": "DateTime(timezone=True)",
+              "nullable": false
+            },
+            {
+              "name": "min_follower_count",
+              "type": "Integer",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "min_engagement_rate",
+              "type": "Float",
+              "nullable": false,
+              "default": 0.0
+            },
+            {
+              "name": "required_categories",
+              "type": "JSON",
+              "nullable": true,
+              "description": "list[str] | null"
+            },
+            {
+              "name": "region_restrictions",
+              "type": "JSON",
+              "nullable": true,
+              "description": "list[str] | null"
+            },
+            {
+              "name": "rejection_reason",
+              "type": "String(500)",
+              "nullable": true,
+              "description": "Filled when admin rejects"
+            },
+            {
+              "name": "version",
+              "type": "Integer",
+              "nullable": false,
+              "default": 1,
+              "description": "Optimistic locking counter"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_campaigns_owner_id",
+              "columns": [
+                "owner_id"
+              ],
+              "rationale": "Fast lookup for brand's campaign list"
+            },
+            {
+              "name": "ix_campaigns_status",
+              "columns": [
+                "status"
+              ],
+              "rationale": "Filter by status in list queries"
+            },
+            {
+              "name": "ix_campaigns_owner_status",
+              "columns": [
+                "owner_id",
+                "status"
+              ],
+              "rationale": "Compound index for owner + status filter (most common query pattern)"
+            },
+            {
+              "name": "ix_campaigns_application_deadline",
+              "columns": [
+                "application_deadline"
+              ],
+              "rationale": "Support marketplace ordering by deadline proximity"
+            }
+          ],
+          "enums": {
+            "CampaignStatus": {
+              "values": [
+                "draft",
+                "pending_review",
+                "active",
+                "paused",
+                "completed",
+                "cancelled",
+                "rejected"
+              ],
+              "implementation": "Python enum.Enum, stored as VARCHAR via SQLAlchemy enum mapping (same pattern as UserRole)"
+            }
+          }
+        },
+        {
+          "name": "campaign_status_logs",
+          "description": "Audit trail for all campaign status transitions. Append-only.",
+          "inherits": [
+            "Base"
+          ],
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "primary_key": true,
+              "default": "generate_uuid()"
+            },
+            {
+              "name": "campaign_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "campaigns.id"
+            },
+            {
+              "name": "from_status",
+              "type": "String(20)",
+              "nullable": true,
+              "description": "null for initial creation"
+            },
+            {
+              "name": "to_status",
+              "type": "String(20)",
+              "nullable": false
+            },
+            {
+              "name": "actor_id",
+              "type": "String(36)",
+              "nullable": false,
+              "description": "User who triggered the transition"
+            },
+            {
+              "name": "reason",
+              "type": "String(500)",
+              "nullable": true,
+              "description": "Optional — filled for rejection"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": false,
+              "server_default": "func.now()"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_status_logs_campaign_id",
+              "columns": [
+                "campaign_id"
+              ],
+              "rationale": "Lookup all transitions for a campaign"
+            }
+          ]
+        }
+      ]
+    },
+    "integration_points": [
+      {
+        "service": "User Service (internal — same DB)",
+        "type": "Direct repository call",
+        "purpose": "Look up campaign owner details (display_name, role) for authorization and response enrichment.",
+        "interface": "UserRepository.get_by_id(owner_id) — already exists in the codebase.",
+        "notes": "User and Campaign share the same database, so no cross-service call needed. The owner_id FK references the users table directly."
+      },
+      {
+        "service": "Notification Service (external)",
+        "type": "Async fire-and-forget via Celery task",
+        "purpose": "Notify brand on campaign approval/rejection. Notify creators on campaign cancellation (future — when application module exists).",
+        "interface": "send_notification.delay(user_id=..., event_type='campaign_approved', payload={...}). Celery task enqueues to Redis.",
+        "notes": "Notification failure must not block the status transition. Use Celery .delay() with ignore_result=True. Stub the task for now — actual Notification service integration is out of scope for campaign CRUD."
+      }
+    ],
+    "technical_decisions": [
+      {
+        "decision": "Use optimistic locking via integer version field",
+        "justification": "Campaign edits are infrequent and conflicts are rare but possible (e.g., two brand team members editing simultaneously). Optimistic locking avoids holding database locks during the user's edit session, which is better for read-heavy workloads.",
+        "alternatives_considered": [
+          {
+            "option": "Pessimistic locking (SELECT ... FOR UPDATE)",
+            "rejected_because": "Holds row-level locks during the full edit-save cycle. In a web application the time between reading and writing can be seconds to minutes — this would cause unnecessary lock contention and risk deadlocks."
+          },
+          {
+            "option": "Last-write-wins (no locking)",
+            "rejected_because": "Silent data loss when concurrent edits overwrite each other. Unacceptable for campaign budget and deadline fields."
+          }
+        ],
+        "implementation": "Add 'version: int' column with default=1. On update, CampaignService checks version matches, increments it, and uses WHERE version = :expected_version in the UPDATE query. If no rows updated, raise ConflictError."
+      },
+      {
+        "decision": "Store campaign status as an enum column, with a separate status_log table for audit trail",
+        "justification": "Current status needs fast reads and filtering (marketplace queries). Audit trail needs append-only history. Combining both in one table would require complex queries for current state.",
+        "alternatives_considered": [
+          {
+            "option": "Event sourcing — derive current status from the latest event",
+            "rejected_because": "Adds significant complexity. Every status read requires aggregating the event log. Not justified for v1 with 7 states and simple transitions."
+          },
+          {
+            "option": "Status column only, no audit log",
+            "rejected_because": "Loses transition history needed for dispute resolution and compliance. NFR-1.4 requires auditability."
+          }
+        ],
+        "implementation": "CampaignStatus enum column on campaigns table (fast queries). CampaignStatusLog table with campaign_id, from_status, to_status, actor_id, reason, created_at. Service layer writes to both atomically within the same DB transaction."
+      },
+      {
+        "decision": "Use Decimal (Numeric) for all monetary fields, not Float",
+        "justification": "Floating-point arithmetic produces rounding errors (e.g., 0.1 + 0.2 != 0.3). Campaign budgets and fees are financial values where precision is critical. Decimal avoids these errors.",
+        "alternatives_considered": [
+          {
+            "option": "Integer cents (store 1000 as amount_cents=100000)",
+            "rejected_because": "Viable but requires constant conversion at the API boundary. Pydantic Decimal fields with max_digits/decimal_places give the same precision with a cleaner API contract."
+          }
+        ],
+        "implementation": "SQLAlchemy Numeric(12,2) for budget fields, Numeric(10,2) for fee fields. Pydantic schemas use condecimal(max_digits=..., decimal_places=2). JSON serialization via Pydantic's built-in Decimal support."
+      }
+    ],
+    "data_flow": {
+      "create_campaign": {
+        "steps": [
+          "1. API layer receives POST /campaigns with CampaignCreate body",
+          "2. FastAPI validates request body via Pydantic schema (field-level + cross-field validators for fee/deadline ordering)",
+          "3. Auth dependency resolves CurrentUser, require_role('brand') checks role",
+          "4. _get_service(db) creates CampaignService → CampaignRepository",
+          "5. CampaignService.create_campaign(owner_id, data) constructs Campaign model with status=DRAFT, budget_remaining=total_budget",
+          "6. CampaignRepository.create(campaign) → db.add(), db.flush(), db.refresh()",
+          "7. CampaignService writes CampaignStatusLog(from_status=None, to_status='draft', actor_id=owner_id)",
+          "8. Return CampaignResponse (201)"
+        ]
+      },
+      "submit_for_review": {
+        "steps": [
+          "1. API receives POST /campaigns/{id}/submit",
+          "2. Auth resolves CurrentUser (brand)",
+          "3. CampaignService.submit_for_review(campaign_id, user_id):",
+          "   a. Fetch campaign via repo.get_by_id()",
+          "   b. Verify ownership (campaign.owner_id == user_id, else ForbiddenError)",
+          "   c. Verify status == 'draft' (else ConflictError: 'Campaign must be in draft status')",
+          "   d. Run submission validation: all required fields non-null, total_budget >= min_fee, all three deadlines > now(UTC)",
+          "   e. If validation fails → raise ValidationError with specific messages",
+          "   f. Set campaign.status = PENDING_REVIEW, increment version",
+          "   g. Write CampaignStatusLog(from='draft', to='pending_review', actor=user_id)",
+          "   h. repo.update(campaign)",
+          "4. Return CampaignResponse (200)"
+        ]
+      },
+      "state_transition_generic": {
+        "steps": [
+          "1. Load campaign, verify ownership/role",
+          "2. Check current status is in the allowed 'from' states for this transition",
+          "3. Check any guards (deadlines not expired, etc.)",
+          "4. Update campaign.status, increment campaign.version",
+          "5. Write CampaignStatusLog entry (same transaction)",
+          "6. If transition triggers notification (approve, reject, cancel), enqueue Celery task",
+          "7. Return updated CampaignResponse"
+        ],
+        "note": "All status transitions follow this pattern. The service method validates the specific 'from' status and guards, but the flow is identical."
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c2_design.json"
+}

@@ -1,0 +1,338 @@
+{
+  "instance_id": "C1-04",
+  "category": "C1",
+  "category_name": "需求理解与预评审",
+  "maps_to_journey": "Journey 4: Review & Approval Workflow",
+  "input": {
+    "role": "Product Manager",
+    "requirement_description": "We need a review workflow for campaign content. Brands should be able to review what creators submit and give feedback. There should also be a compliance check from our side before content goes live. Track all the back-and-forth. Content and campaign services already exist.",
+    "context": "The system is a FastAPI microservice called campaign-service. We have existing User, Content, Campaign, and Application services. Tech stack: Python, PostgreSQL, Redis, Celery. Content submissions already have a status field and version tracking."
+  },
+  "gold_standard_output": {
+    "structured_spec": {
+      "overview": "Implement a two-level content review workflow for campaign collaborations. After a creator submits content, the brand reviews and either approves or requests revisions. Once the brand approves, a platform compliance reviewer performs a second-level check for policy violations and brand safety before the content is cleared for publishing. The system must track the full revision history with an audit trail.",
+      "user_stories": [
+        {
+          "id": "US-4.1",
+          "story": "As a brand marketing manager, I want to review content submitted by creators so that I can ensure it meets my campaign brief.",
+          "acceptance_criteria": [
+            "Brand can view all content submissions for their campaigns, filtered by status (pending_brand_review, revision_requested, brand_approved, etc.)",
+            "Brand can view the full content: title, body text, images, video, hashtags, and which campaign/creator it belongs to",
+            "Brand can view all previous versions of the submission side-by-side for comparison",
+            "Only the campaign owner (brand) can access the review interface for their campaigns",
+            "Returns 403 for non-owner brands, 404 for non-existent submissions"
+          ]
+        },
+        {
+          "id": "US-4.2",
+          "story": "As a brand marketing manager, I want to approve or request revisions on submitted content so that creators can refine their work.",
+          "acceptance_criteria": [
+            "Brand can approve content → status changes from 'pending_brand_review' to 'brand_approved'",
+            "Brand can request revision with inline feedback: list of comments, each with a target (field name or line reference) and comment text (required, 5-1000 chars)",
+            "At least one feedback comment is required when requesting revision",
+            "On revision request → status changes to 'revision_requested', creator is notified with the feedback",
+            "Brand can reject content outright with a reason (required, 10-500 chars) → status becomes 'brand_rejected'",
+            "Brand cannot review content that is not in 'pending_brand_review' status (returns 409)",
+            "Returns 403 if user is not the campaign owner"
+          ]
+        },
+        {
+          "id": "US-4.3",
+          "story": "As a content creator, I want to see the brand's feedback and submit a revised version so that I can get my content approved.",
+          "acceptance_criteria": [
+            "Creator can view all feedback comments attached to their submission, with timestamps and reviewer identity",
+            "Creator can submit a new version referencing the previous version (version number auto-increments)",
+            "New version automatically enters 'pending_brand_review' status",
+            "Creator can see their full revision history (v1, v2, v3...) with status of each",
+            "Creator cannot submit a revision if the maximum revision count (3) has been reached → returns 422 with 'Maximum revisions reached. Please contact the brand directly.'",
+            "Creator cannot submit a revision if the content submission deadline has passed → returns 422 with 'Content submission deadline has passed'",
+            "Returns 403 if the creator is not the assigned creator for this submission"
+          ]
+        },
+        {
+          "id": "US-4.4",
+          "story": "As a platform compliance reviewer (admin), I want to review brand-approved content for policy compliance so that only safe content is published on the platform.",
+          "acceptance_criteria": [
+            "Compliance reviewer can view a queue of all content in 'pending_compliance' status, ordered by submission time (FIFO)",
+            "Compliance reviewer can approve → status changes to 'compliance_approved' (content is ready to publish)",
+            "Compliance reviewer can reject with a reason and policy violation category (required, from predefined list: 'prohibited_content', 'misleading_claims', 'missing_disclosure', 'brand_safety', 'other')",
+            "On compliance rejection → status becomes 'compliance_rejected', creator and brand are notified with the reason",
+            "Only users with 'admin' role can perform compliance reviews",
+            "Returns 403 for non-admin users"
+          ]
+        },
+        {
+          "id": "US-4.5",
+          "story": "As a content creator, I want to revise content that failed compliance review so that it can be re-reviewed.",
+          "acceptance_criteria": [
+            "Creator can submit a revised version after compliance rejection",
+            "Revised version re-enters the review pipeline at 'pending_brand_review' (brand must re-approve before compliance re-review)",
+            "Compliance rejection revision counts toward the same max-revision limit (3 total across all revision cycles)",
+            "Creator can see the compliance rejection reason and policy category alongside their submission"
+          ]
+        },
+        {
+          "id": "US-4.6",
+          "story": "As a brand marketing manager or admin, I want to view the full audit trail of a content review so that I can trace all decisions.",
+          "acceptance_criteria": [
+            "Audit trail shows every status transition: timestamp, actor (user ID + role), previous status, new status, and action details (feedback comments, rejection reason, etc.)",
+            "Audit trail is append-only and immutable — entries cannot be edited or deleted",
+            "Brand can view audit trail for their own campaign submissions",
+            "Admin can view audit trail for any submission",
+            "Audit trail is returned as part of the submission detail endpoint"
+          ]
+        },
+        {
+          "id": "US-4.7",
+          "story": "As a platform operator, I want the system to automatically handle review deadlines so that stale reviews don't block the pipeline.",
+          "acceptance_criteria": [
+            "If brand does not review within 48 hours of submission, a reminder notification is sent",
+            "If brand does not review within 7 days, content is auto-escalated: status becomes 'escalated' and platform admin is notified",
+            "If compliance review is not completed within 24 hours, it is flagged as 'overdue' in the compliance queue",
+            "Deadline timers are paused when content is in 'revision_requested' status (waiting for creator)"
+          ]
+        }
+      ],
+      "state_machine": {
+        "states": [
+          "pending_brand_review",
+          "revision_requested",
+          "brand_approved",
+          "brand_rejected",
+          "pending_compliance",
+          "compliance_approved",
+          "compliance_rejected",
+          "ready_to_publish",
+          "escalated",
+          "cancelled"
+        ],
+        "transitions": [
+          {
+            "from": "pending_brand_review",
+            "to": "brand_approved",
+            "trigger": "brand approves",
+            "actor": "brand"
+          },
+          {
+            "from": "pending_brand_review",
+            "to": "revision_requested",
+            "trigger": "brand requests revision",
+            "actor": "brand",
+            "guard": "at least one feedback comment provided"
+          },
+          {
+            "from": "pending_brand_review",
+            "to": "brand_rejected",
+            "trigger": "brand rejects",
+            "actor": "brand",
+            "guard": "rejection reason provided"
+          },
+          {
+            "from": "pending_brand_review",
+            "to": "escalated",
+            "trigger": "auto-escalation after 7 days",
+            "actor": "system"
+          },
+          {
+            "from": "revision_requested",
+            "to": "pending_brand_review",
+            "trigger": "creator submits revised version",
+            "actor": "creator",
+            "guard": "revision count <= 3 AND within deadline"
+          },
+          {
+            "from": "brand_approved",
+            "to": "pending_compliance",
+            "trigger": "auto-transition on brand approval",
+            "actor": "system"
+          },
+          {
+            "from": "pending_compliance",
+            "to": "compliance_approved",
+            "trigger": "compliance reviewer approves",
+            "actor": "admin"
+          },
+          {
+            "from": "pending_compliance",
+            "to": "compliance_rejected",
+            "trigger": "compliance reviewer rejects",
+            "actor": "admin",
+            "guard": "reason and violation category provided"
+          },
+          {
+            "from": "compliance_approved",
+            "to": "ready_to_publish",
+            "trigger": "auto-transition on compliance approval",
+            "actor": "system"
+          },
+          {
+            "from": "compliance_rejected",
+            "to": "pending_brand_review",
+            "trigger": "creator submits revised version after compliance failure",
+            "actor": "creator",
+            "guard": "revision count <= 3 AND within deadline"
+          },
+          {
+            "from": [
+              "pending_brand_review",
+              "revision_requested",
+              "brand_approved",
+              "pending_compliance",
+              "escalated"
+            ],
+            "to": "cancelled",
+            "trigger": "campaign cancelled or content withdrawn",
+            "actor": "brand|system"
+          }
+        ],
+        "notes": [
+          "brand_approved → pending_compliance is an automatic system transition, not a user action",
+          "compliance_approved → ready_to_publish is an automatic system transition",
+          "brand_rejected is a terminal state — creator cannot revise (the brand has decided this content is unsuitable)",
+          "Revision count is tracked cumulatively across all revision cycles (brand revisions + compliance rejections)"
+        ]
+      },
+      "edge_cases": [
+        {
+          "id": "EC-4.1",
+          "scenario": "Brand and compliance reviewer attempt to review the same content simultaneously (e.g., compliance reviewer acts on content still in pending_brand_review)",
+          "handling": "Enforce state preconditions strictly: compliance review endpoints only accept content in 'pending_compliance' status. Return 409 with 'Content is not ready for compliance review — current status: pending_brand_review'. Use row-level locking (SELECT FOR UPDATE) on status transitions to prevent TOCTOU races."
+        },
+        {
+          "id": "EC-4.2",
+          "scenario": "Creator submits a 4th revision after reaching the maximum of 3 revisions",
+          "handling": "Return 422 with 'Maximum revision limit (3) reached. Please contact the brand to discuss next steps.' The submission remains in its current status (revision_requested or compliance_rejected). Brand or admin can manually override the limit if needed (separate admin endpoint)."
+        },
+        {
+          "id": "EC-4.3",
+          "scenario": "Brand approves content, but before compliance can review, the creator modifies the content outside the workflow",
+          "handling": "Once content enters 'pending_brand_review' or later, the submission record is immutable. Any 'edit' by the creator creates a new version that must go through the full review cycle. The version under review is locked and cannot be altered. Direct content modification via the Content Service is blocked for submissions in active review states."
+        },
+        {
+          "id": "EC-4.4",
+          "scenario": "Compliance reviewer rejects content, but the campaign has since been cancelled",
+          "handling": "Allow the compliance rejection to proceed (for audit purposes) but set the submission's effective status to 'cancelled'. Do not notify the creator to resubmit. Log the rejection reason in the audit trail."
+        },
+        {
+          "id": "EC-4.5",
+          "scenario": "Content submission deadline expires while content is in 'revision_requested' status",
+          "handling": "Content remains in 'revision_requested' but creator cannot submit a new version (deadline guard). After 48 hours past deadline, system auto-transitions to 'cancelled' with reason 'Content submission deadline expired'. Brand is notified."
+        },
+        {
+          "id": "EC-4.6",
+          "scenario": "Brand reviewer leaves feedback referencing a specific version, but creator has already submitted a newer version",
+          "handling": "Feedback is always attached to a specific version number. When a new version is submitted, previous feedback is archived but remains visible in the audit trail. Brand reviews the latest version only — the review queue shows the most recent pending version."
+        },
+        {
+          "id": "EC-4.7",
+          "scenario": "Two compliance reviewers attempt to review the same content simultaneously",
+          "handling": "Use pessimistic locking: first reviewer to open the review acquires a lock (with 30-minute expiry). Second reviewer sees 'This content is currently being reviewed by another compliance reviewer' and cannot submit a decision. Lock auto-releases after 30 minutes if no decision is made."
+        },
+        {
+          "id": "EC-4.8",
+          "scenario": "Brand approves content that contains a compliance violation the brand didn't catch (e.g., undisclosed sponsorship)",
+          "handling": "This is the normal flow — compliance review exists precisely for this case. Compliance reviewer rejects with category 'missing_disclosure'. Content loops back to creator for revision. Brand approval does not bypass compliance."
+        },
+        {
+          "id": "EC-4.9",
+          "scenario": "Compliance reviewer approves content, but the brand later wants to retract approval",
+          "handling": "Once content reaches 'ready_to_publish', brand cannot retract unilaterally. Brand must contact platform support (admin) to manually revert to 'pending_brand_review' with an audit trail entry. This is a rare escalation path, not a self-service feature."
+        }
+      ],
+      "clarifying_questions": [
+        {
+          "id": "CQ-4.1",
+          "question": "Should the brand review and compliance review happen sequentially (brand first, then compliance), or can they run in parallel?",
+          "impact": "Parallel review is faster but creates conflict resolution complexity (what if brand approves but compliance rejects?). Sequential is simpler and ensures brand is satisfied before platform resources are spent on compliance.",
+          "assumption_if_unanswered": "Sequential: brand review first, then compliance review."
+        },
+        {
+          "id": "CQ-4.2",
+          "question": "What is the maximum number of revision cycles allowed before the submission is terminated?",
+          "impact": "Unlimited revisions could create indefinite loops; too few may frustrate creators with near-acceptable content.",
+          "assumption_if_unanswered": "Maximum 3 revision submissions (across all review cycles combined)."
+        },
+        {
+          "id": "CQ-4.3",
+          "question": "When content fails compliance and the creator revises, does the revised version need brand re-approval, or can it skip directly to compliance?",
+          "impact": "Re-requiring brand approval is safer (brand sees all changes) but slower. Skipping is faster but the brand may not agree with the compliance-driven changes.",
+          "assumption_if_unanswered": "Revised version after compliance rejection re-enters at 'pending_brand_review' (brand must re-approve)."
+        },
+        {
+          "id": "CQ-4.4",
+          "question": "Should the compliance review queue be assigned (specific reviewers get specific submissions) or pooled (any admin can pick up any review)?",
+          "impact": "Assignment enables specialization (some reviewers for beauty content, others for food) but creates bottlenecks if a reviewer is unavailable. Pool is simpler but may lead to uneven workload.",
+          "assumption_if_unanswered": "Pooled queue for v1. Any admin can review any pending submission. Assignment can be added in v2."
+        },
+        {
+          "id": "CQ-4.5",
+          "question": "Should brand feedback be structured (checkboxes for common issues like 'wrong tone', 'missing product shot') or free-form text only?",
+          "impact": "Structured feedback enables analytics on common rejection reasons and helps creators understand issues faster. Free-form is simpler but harder to analyze.",
+          "assumption_if_unanswered": "Free-form text comments with optional field targeting for v1. Structured categories can be added in v2."
+        },
+        {
+          "id": "CQ-4.6",
+          "question": "Is there an SLA for review turnaround time, and should the system enforce it?",
+          "impact": "SLA enforcement requires background job infrastructure (timers, escalation logic, notifications). Without SLA, reviews may stall indefinitely.",
+          "assumption_if_unanswered": "Soft SLA: 48-hour reminder for brand review, 7-day auto-escalation. 24-hour overdue flag for compliance. No hard enforcement (no auto-approve)."
+        }
+      ],
+      "non_functional_requirements": [
+        {
+          "id": "NFR-4.1",
+          "category": "Auditability",
+          "requirement": "Every review action (approve, reject, request revision, escalate) must produce an immutable audit trail entry with: timestamp (UTC), actor user ID, actor role, previous status, new status, action type, and action payload (feedback comments, rejection reason, etc.)",
+          "rationale": "Required for dispute resolution between brands and creators, and for platform compliance reporting"
+        },
+        {
+          "id": "NFR-4.2",
+          "category": "Performance",
+          "requirement": "Review queue endpoints (list pending reviews) must respond within 300ms (p95) for up to 1,000 pending items per brand or compliance reviewer",
+          "rationale": "Reviewers need responsive queue to maintain high throughput"
+        },
+        {
+          "id": "NFR-4.3",
+          "category": "Concurrency",
+          "requirement": "Status transitions must be protected against race conditions using database-level locking (SELECT FOR UPDATE or optimistic locking with version field). No two actors should be able to transition the same submission simultaneously.",
+          "rationale": "Prevent data corruption from concurrent brand and compliance actions"
+        },
+        {
+          "id": "NFR-4.4",
+          "category": "Notification",
+          "requirement": "All status transitions must trigger an asynchronous notification to the affected party (creator on revision request/rejection/approval, brand on creator resubmission, admin on escalation) via the existing Notification Service",
+          "rationale": "Timely notification keeps the review pipeline moving and reduces stale reviews"
+        },
+        {
+          "id": "NFR-4.5",
+          "category": "Data Integrity",
+          "requirement": "Content versions under review must be immutable. Once a version enters the review pipeline, its text, images, and metadata cannot be modified. Changes require a new version.",
+          "rationale": "Prevents bait-and-switch where content is modified after brand approval but before compliance review"
+        }
+      ],
+      "priority_classification": {
+        "P0_must_have": [
+          "US-4.1 (Brand views submissions)",
+          "US-4.2 (Brand approve/revision/reject)",
+          "US-4.3 (Creator revises content)",
+          "US-4.4 (Compliance review)",
+          "US-4.6 (Audit trail)",
+          "Review state machine with guards",
+          "Concurrency protection on transitions"
+        ],
+        "P1_should_have": [
+          "US-4.5 (Revision after compliance rejection)",
+          "US-4.7 (Auto-escalation and deadline handling)",
+          "Revision count limit enforcement",
+          "Compliance reviewer locking"
+        ],
+        "P2_nice_to_have": [
+          "Structured feedback categories for brand reviews",
+          "Compliance reviewer assignment/specialization",
+          "Review turnaround time analytics dashboard",
+          "Bulk compliance review (approve multiple low-risk items)"
+        ]
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c1_requirements.json"
+}

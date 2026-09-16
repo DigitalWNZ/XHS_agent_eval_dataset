@@ -1,0 +1,750 @@
+{
+  "instance_id": "C2-05",
+  "category": "C2",
+  "category_name": "技术方案设计",
+  "maps_to_journey": "Journey 5: Settlement & Analytics",
+  "input": {
+    "requirements_spec": "Enable post-publish performance tracking, automated payment calculation (base_fee + performance bonus), weekly batch settlement via the existing Payment Service, and analytics dashboards for both brands (campaign ROI) and creators (earnings detail). Key requirements: 7-day tracking window, Celery periodic metric sync, bonus calculated from campaign-defined threshold rules, idempotent settlement, all monetary math in Decimal. See full spec C1-05 for 7 user stories, 10 edge cases, and 5 NFRs.",
+    "system_context": "Existing FastAPI microservice (xhs-campaign-service) with layered architecture: Model → Repository → Service → API. Existing entities: User (with roles creator/brand/admin), Campaign, Application (with negotiated base_fee as Numeric), ContentSubmission, ContentVersion, Review. External services: Payment Service (transfer API with idempotency_key support), Content Service (provides note metrics: views, likes, comments, shares, clicks), Notification Service. Infrastructure: PostgreSQL, Redis, Celery with beat scheduler. Auth via X-User-Id header + role checks through require_role dependency.",
+    "constraints": "All monetary values use Numeric(10,2) in DB and Python Decimal in code — float is prohibited. Settlement must be idempotent (crash-safe restartable batches). Analytics queries must respond within 500ms p95 for campaigns with up to 500 creators. Batch settlement runs weekly (Monday 02:00 UTC)."
+  },
+  "gold_standard_output": {
+    "module_design": {
+      "new_files": [
+        {
+          "path": "app/models/performance_metric.py",
+          "responsibility": "PerformanceMetric SQLAlchemy model — stores periodic metric snapshots for tracked content"
+        },
+        {
+          "path": "app/models/settlement.py",
+          "responsibility": "Settlement and PaymentRecord SQLAlchemy models — financial records for calculated and settled payments"
+        },
+        {
+          "path": "app/schemas/settlement.py",
+          "responsibility": "Pydantic schemas: PublishConfirmation, SettlementResponse, PaymentRecordResponse, EarningsSummaryResponse, SettlementBatchRequest/Response"
+        },
+        {
+          "path": "app/schemas/analytics.py",
+          "responsibility": "Pydantic schemas: CampaignAnalyticsResponse, CreatorPerformanceBreakdown, PerformanceMetricResponse"
+        },
+        {
+          "path": "app/repositories/settlement_repo.py",
+          "responsibility": "SettlementRepository — CRUD and query methods for Settlement, PaymentRecord, PerformanceMetric"
+        },
+        {
+          "path": "app/services/settlement_service.py",
+          "responsibility": "SettlementService — publish confirmation handling, payment calculation, batch settlement orchestration"
+        },
+        {
+          "path": "app/services/analytics_service.py",
+          "responsibility": "AnalyticsService — campaign-level and creator-level analytics aggregation"
+        },
+        {
+          "path": "app/utils/bonus_calculator.py",
+          "responsibility": "BonusCalculator — pure function: given metrics + bonus rules, returns bonus breakdown using Decimal arithmetic"
+        },
+        {
+          "path": "app/api/v1/settlements.py",
+          "responsibility": "Settlement API router — publish confirmation, earnings view, settlement detail, admin batch trigger"
+        },
+        {
+          "path": "app/api/v1/analytics.py",
+          "responsibility": "Analytics API router — campaign analytics for brands, performance metrics for creators"
+        },
+        {
+          "path": "app/tasks/settlement_tasks.py",
+          "responsibility": "Celery tasks — sync_performance_metrics (every 4h), close_tracking_windows (daily), calculate_payments (daily), run_settlement_batch (weekly Monday 02:00 UTC)"
+        }
+      ],
+      "modified_files": [
+        {
+          "path": "app/models/__init__.py",
+          "change": "Add imports for PerformanceMetric, Settlement, PaymentRecord"
+        },
+        {
+          "path": "app/api/v1/router.py",
+          "change": "Include settlements and analytics routers"
+        }
+      ],
+      "dependency_graph": "API routers → Services → Repositories → Models. BonusCalculator is a pure utility used by SettlementService. Celery tasks call SettlementService methods. AnalyticsService reads from SettlementRepository + PerformanceMetric data. No circular dependencies."
+    },
+    "api_design": {
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/submissions/{submission_id}/publish-confirmation",
+          "description": "Creator confirms content is published on XHS and provides the live post URL. Starts the 7-day performance tracking window.",
+          "auth": "Creator only (must own the submission)",
+          "request_body": {
+            "post_url": {
+              "type": "str",
+              "required": true,
+              "description": "URL of the published note on XHS",
+              "validation": "Must be a valid HTTPS URL matching xiaohongshu.com or xhslink.com domain"
+            },
+            "published_at": {
+              "type": "datetime | None",
+              "required": false,
+              "description": "Actual publish time. Defaults to server UTC now if omitted."
+            }
+          },
+          "response": {
+            "status_200": {
+              "schema": {
+                "submission_id": "str",
+                "post_url": "str",
+                "published_at": "datetime",
+                "tracking_window_end": "datetime",
+                "status": "str (tracking)"
+              }
+            }
+          },
+          "error_responses": {
+            "404": "Submission not found",
+            "403": "User is not the submission owner",
+            "409": "Submission is not in 'approved' status or tracking already started",
+            "422": "Invalid post_url format"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/campaigns/{campaign_id}/analytics",
+          "description": "Brand views campaign-level analytics dashboard: reach, engagement, spend, ROI, per-creator breakdown.",
+          "auth": "Brand only (must own the campaign)",
+          "query_params": {
+            "include_creator_breakdown": {
+              "type": "bool",
+              "default": false,
+              "description": "Include per-creator performance detail"
+            }
+          },
+          "response": {
+            "status_200": {
+              "schema": {
+                "campaign_id": "str",
+                "campaign_title": "str",
+                "total_creators": "int",
+                "total_reach": "int (sum of views)",
+                "total_engagement": "int (likes + comments + shares)",
+                "total_clicks": "int",
+                "total_spend": "Decimal (string-serialized)",
+                "average_cost_per_engagement": "Decimal (string-serialized)",
+                "roi_ratio": "Decimal (total_engagement / total_spend, string-serialized)",
+                "creator_breakdown": "[CreatorPerformanceBreakdown] (optional, if include_creator_breakdown=true)"
+              }
+            }
+          },
+          "error_responses": {
+            "404": "Campaign not found",
+            "403": "User is not the campaign owner"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/creators/me/earnings",
+          "description": "Creator views their own earnings summary and per-campaign payment records.",
+          "auth": "Creator only",
+          "query_params": {
+            "campaign_id": {
+              "type": "str | None",
+              "description": "Filter by campaign"
+            },
+            "status": {
+              "type": "str | None",
+              "description": "Filter by payment status"
+            },
+            "page": {
+              "type": "int",
+              "default": 1,
+              "ge": 1
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20,
+              "ge": 1,
+              "le": 100
+            }
+          },
+          "response": {
+            "status_200": {
+              "schema": {
+                "summary": {
+                  "total_earned": "Decimal (string-serialized, sum of settled payments)",
+                  "total_pending": "Decimal (string-serialized, calculated but not yet settled)",
+                  "total_campaigns": "int"
+                },
+                "payments": "PaginatedResponse[PaymentRecordResponse]"
+              }
+            }
+          },
+          "error_responses": {
+            "403": "User is not a creator"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/settlements/{settlement_id}",
+          "description": "View settlement detail including bonus breakdown.",
+          "auth": "Creator (own settlement) or Admin",
+          "response": {
+            "status_200": {
+              "schema": {
+                "id": "str",
+                "application_id": "str",
+                "campaign_id": "str",
+                "campaign_title": "str",
+                "creator_id": "str",
+                "base_fee": "Decimal (string-serialized)",
+                "performance_bonus": "Decimal (string-serialized)",
+                "bonus_breakdown": "[{metric: str, threshold: int, achieved: int, bonus_amount: Decimal}]",
+                "total_amount": "Decimal (string-serialized)",
+                "status": "str",
+                "calculated_at": "datetime",
+                "settled_at": "datetime | null"
+              }
+            }
+          },
+          "error_responses": {
+            "404": "Settlement not found",
+            "403": "User is not the settlement's creator and not an admin"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/admin/settlements/batch",
+          "description": "Admin triggers a manual settlement batch run for all 'calculated' payment records up to a given cutoff date.",
+          "auth": "Admin only",
+          "request_body": {
+            "cutoff_date": {
+              "type": "date | None",
+              "required": false,
+              "description": "Process records calculated on or before this date. Defaults to yesterday."
+            },
+            "dry_run": {
+              "type": "bool",
+              "default": false,
+              "description": "If true, return what would be settled without executing transfers."
+            }
+          },
+          "response": {
+            "status_200": {
+              "schema": {
+                "batch_id": "str",
+                "total_records": "int",
+                "total_amount": "Decimal (string-serialized)",
+                "dry_run": "bool",
+                "status": "str (processing | completed | dry_run_complete)"
+              }
+            }
+          },
+          "error_responses": {
+            "403": "User is not an admin",
+            "409": "A settlement batch is already running"
+          }
+        }
+      ]
+    },
+    "data_model": {
+      "tables": [
+        {
+          "name": "performance_metrics",
+          "description": "Periodic snapshots of content performance from the Content Service",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "primary_key": true,
+              "default": "generate_uuid()"
+            },
+            {
+              "name": "submission_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "content_submissions.id"
+            },
+            {
+              "name": "views",
+              "type": "BigInteger",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "likes",
+              "type": "BigInteger",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "comments",
+              "type": "BigInteger",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "shares",
+              "type": "BigInteger",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "clicks",
+              "type": "BigInteger",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "tracked_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": false,
+              "description": "Timestamp when this snapshot was captured"
+            },
+            {
+              "name": "tracking_window_end",
+              "type": "DateTime(timezone=True)",
+              "nullable": false,
+              "description": "When the 7-day window closes"
+            },
+            {
+              "name": "is_final",
+              "type": "Boolean",
+              "nullable": false,
+              "default": false,
+              "description": "True when this is the last snapshot after window closure"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_perf_metrics_submission_final",
+              "columns": [
+                "submission_id",
+                "is_final"
+              ]
+            },
+            {
+              "name": "ix_perf_metrics_submission_tracked",
+              "columns": [
+                "submission_id",
+                "tracked_at"
+              ]
+            }
+          ],
+          "mixins": [
+            "TimestampMixin"
+          ],
+          "notes": "No SoftDeleteMixin — metric snapshots are immutable audit records."
+        },
+        {
+          "name": "settlements",
+          "description": "Calculated payment records linking applications to financial outcomes",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "primary_key": true,
+              "default": "generate_uuid()"
+            },
+            {
+              "name": "application_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "applications.id"
+            },
+            {
+              "name": "creator_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "users.id"
+            },
+            {
+              "name": "campaign_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "campaigns.id"
+            },
+            {
+              "name": "base_fee",
+              "type": "Numeric(10, 2)",
+              "nullable": false,
+              "description": "MUST use Numeric, never Float"
+            },
+            {
+              "name": "performance_bonus",
+              "type": "Numeric(10, 2)",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "total_amount",
+              "type": "Numeric(10, 2)",
+              "nullable": false,
+              "description": "base_fee + performance_bonus"
+            },
+            {
+              "name": "bonus_breakdown",
+              "type": "JSON",
+              "nullable": true,
+              "description": "List of {metric, threshold, achieved, bonus_amount} dicts"
+            },
+            {
+              "name": "status",
+              "type": "Enum(SettlementStatus)",
+              "nullable": false,
+              "default": "pending_calculation"
+            },
+            {
+              "name": "idempotency_key",
+              "type": "String(255)",
+              "unique": true,
+              "nullable": false,
+              "description": "Format: {application_id}:{campaign_id}:{window_end_iso}"
+            },
+            {
+              "name": "calculated_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": true
+            },
+            {
+              "name": "settled_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": true
+            },
+            {
+              "name": "settlement_batch_id",
+              "type": "String(36)",
+              "nullable": true
+            },
+            {
+              "name": "error_message",
+              "type": "String(500)",
+              "nullable": true
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_settlements_campaign_status",
+              "columns": [
+                "campaign_id",
+                "status"
+              ]
+            },
+            {
+              "name": "ix_settlements_creator",
+              "columns": [
+                "creator_id"
+              ]
+            },
+            {
+              "name": "ix_settlements_status",
+              "columns": [
+                "status"
+              ]
+            },
+            {
+              "name": "ix_settlements_batch",
+              "columns": [
+                "settlement_batch_id"
+              ]
+            }
+          ],
+          "unique_constraints": [
+            {
+              "name": "uq_settlements_idempotency",
+              "columns": [
+                "idempotency_key"
+              ]
+            }
+          ],
+          "enums": {
+            "SettlementStatus": [
+              "pending_calculation",
+              "calculated",
+              "pending_settlement",
+              "settled",
+              "settlement_failed"
+            ]
+          },
+          "mixins": [
+            "TimestampMixin"
+          ],
+          "notes": "No SoftDeleteMixin — financial records are never deleted. CRITICAL: base_fee, performance_bonus, total_amount all use Numeric(10, 2), never Float."
+        },
+        {
+          "name": "payment_records",
+          "description": "External payment transfer records linking settlements to the Payment Service",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "primary_key": true,
+              "default": "generate_uuid()"
+            },
+            {
+              "name": "settlement_id",
+              "type": "String(36)",
+              "nullable": false,
+              "foreign_key": "settlements.id"
+            },
+            {
+              "name": "amount",
+              "type": "Numeric(10, 2)",
+              "nullable": false,
+              "description": "MUST use Numeric, never Float"
+            },
+            {
+              "name": "status",
+              "type": "Enum(PaymentStatus)",
+              "nullable": false,
+              "default": "pending"
+            },
+            {
+              "name": "external_payment_id",
+              "type": "String(255)",
+              "nullable": true,
+              "description": "ID returned by the Payment Service on success"
+            },
+            {
+              "name": "idempotency_key",
+              "type": "String(255)",
+              "unique": true,
+              "nullable": false,
+              "description": "Derived from settlement_id to prevent duplicate transfers"
+            },
+            {
+              "name": "error_message",
+              "type": "String(500)",
+              "nullable": true
+            },
+            {
+              "name": "attempted_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": true
+            },
+            {
+              "name": "completed_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": true
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_payment_records_settlement",
+              "columns": [
+                "settlement_id"
+              ]
+            },
+            {
+              "name": "ix_payment_records_status",
+              "columns": [
+                "status"
+              ]
+            }
+          ],
+          "enums": {
+            "PaymentStatus": [
+              "pending",
+              "processing",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "mixins": [
+            "TimestampMixin"
+          ],
+          "notes": "No SoftDeleteMixin — payment records are immutable financial audit logs."
+        },
+        {
+          "name": "settlement_batches",
+          "description": "Audit record for each settlement batch run",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "primary_key": true,
+              "default": "generate_uuid()"
+            },
+            {
+              "name": "total_records",
+              "type": "Integer",
+              "nullable": false
+            },
+            {
+              "name": "total_amount",
+              "type": "Numeric(12, 2)",
+              "nullable": false
+            },
+            {
+              "name": "success_count",
+              "type": "Integer",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "failure_count",
+              "type": "Integer",
+              "nullable": false,
+              "default": 0
+            },
+            {
+              "name": "status",
+              "type": "Enum(BatchStatus)",
+              "nullable": false,
+              "default": "processing"
+            },
+            {
+              "name": "triggered_by",
+              "type": "String(36)",
+              "nullable": true,
+              "description": "Admin user ID if manually triggered, null if automatic"
+            },
+            {
+              "name": "started_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": false
+            },
+            {
+              "name": "completed_at",
+              "type": "DateTime(timezone=True)",
+              "nullable": true
+            }
+          ],
+          "enums": {
+            "BatchStatus": [
+              "processing",
+              "completed",
+              "partially_failed",
+              "failed"
+            ]
+          },
+          "mixins": [
+            "TimestampMixin"
+          ]
+        }
+      ]
+    },
+    "integration_points": [
+      {
+        "service": "Content Service",
+        "purpose": "Fetch performance metrics (views, likes, comments, shares, clicks) for published notes",
+        "interface": "HTTP GET /api/internal/notes/{post_id}/metrics",
+        "called_by": "Celery task sync_performance_metrics (every 4 hours)",
+        "error_handling": "Retry with exponential backoff (4h → 8h → 16h). Log warning if no successful sync for 48h. If zero snapshots exist at window close, flag for admin review.",
+        "notes": "post_id extracted from post_url. Content Service is the source of truth for metrics."
+      },
+      {
+        "service": "Payment Service",
+        "purpose": "Execute monetary transfers to creator wallets",
+        "interface": "HTTP POST /api/internal/transfers with {creator_id, amount, currency: 'CNY', idempotency_key}",
+        "called_by": "SettlementService.process_batch() during weekly settlement",
+        "error_handling": "Per-record error handling. On transfer failure: mark PaymentRecord as failed with error_message, continue with next record. On platform_balance_insufficient: halt batch, alert admin.",
+        "notes": "Payment Service guarantees idempotency via idempotency_key. Safe to retry."
+      },
+      {
+        "service": "Campaign Service (internal)",
+        "purpose": "Read campaign bonus rules and trigger campaign completion",
+        "interface": "Internal method calls within the same codebase (Campaign model has bonus_rules JSON field)",
+        "called_by": "BonusCalculator reads campaign.bonus_rules. SettlementService triggers campaign status → 'completed' when all settlements for a campaign are settled.",
+        "error_handling": "Transactional — campaign status update is in the same DB transaction as settlement status update."
+      },
+      {
+        "service": "Notification Service",
+        "purpose": "Notify creators of payment calculation and settlement events",
+        "interface": "HTTP POST /api/internal/notifications with {user_id, type, payload}",
+        "called_by": "SettlementService after payment calculation (notify creator of amount) and after settlement (notify creator of payout)",
+        "error_handling": "Fire-and-forget with async retry. Notification failure must not block settlement."
+      }
+    ],
+    "technical_decisions": [
+      {
+        "decision": "Use Python Decimal with Numeric(10,2) for all monetary values",
+        "justification": "Float arithmetic produces rounding errors (e.g., 0.1 + 0.2 = 0.30000000000000004) that are unacceptable for financial calculations. Even 0.01 CNY discrepancy at scale causes reconciliation nightmares.",
+        "alternatives_considered": [
+          "Integer cents (store 10000 for 100.00 CNY): more performant but harder to read in DB queries and API responses, higher risk of conversion bugs at boundaries.",
+          "Float with rounding at output: fragile — rounding must be applied at every intermediate step, easy to miss one and accumulate errors."
+        ],
+        "implementation": "DB columns: Numeric(10, 2). Python: from decimal import Decimal, ROUND_HALF_UP. Pydantic schemas: condecimal(max_digits=10, decimal_places=2). JSON serialization: string representation to avoid JavaScript float coercion."
+      },
+      {
+        "decision": "Idempotent settlement using composite idempotency_key with unique constraint",
+        "justification": "Celery tasks can be retried on failure. Settlement batch jobs can crash mid-processing and restart. Without idempotency, creators could receive duplicate payments — a critical financial risk.",
+        "alternatives_considered": [
+          "Database transaction with SELECT FOR UPDATE: prevents duplicates but doesn't help with cross-service idempotency (Payment Service needs its own idempotency_key).",
+          "Distributed lock (Redis): adds infrastructure dependency and doesn't survive Redis restart."
+        ],
+        "implementation": "Settlement.idempotency_key = f'{application_id}:{campaign_id}:{window_end.isoformat()}' with UNIQUE constraint. PaymentRecord.idempotency_key = f'pay:{settlement_id}' passed to Payment Service transfer API. If IntegrityError on insert, skip (already processed)."
+      },
+      {
+        "decision": "Configurable bonus rules stored as JSON on Campaign model, evaluated by a pure BonusCalculator utility",
+        "justification": "Different campaigns have different bonus structures. Storing rules as structured JSON on the campaign allows brands to define custom thresholds without schema changes. A pure calculator function (no side effects, no DB access) is trivially testable.",
+        "alternatives_considered": [
+          "Separate BonusRule table with FK to Campaign: more normalized but adds query complexity and JOIN overhead for a field that's always read with the campaign.",
+          "Hardcoded formula: inflexible, requires code changes for each new bonus structure."
+        ],
+        "implementation": "Campaign.bonus_rules: JSON field containing [{metric: str, threshold: int, bonus_amount: str (Decimal-serialized)}]. BonusCalculator.calculate(metrics: PerformanceMetric, rules: list[BonusRule]) -> BonusBreakdown. Returns list of triggered bonuses with individual amounts, capped at (max_fee - base_fee)."
+      },
+      {
+        "decision": "Batch settlement via Celery periodic task processing in chunks of 100",
+        "justification": "Processing all calculated payments in one go risks timeout and memory issues. Chunking with per-record error handling ensures one failure doesn't block the entire batch. Celery beat provides reliable scheduling with visibility into task state.",
+        "alternatives_considered": [
+          "Real-time settlement (pay immediately on calculation): higher infrastructure load, harder to audit, harder to implement batch-level error handling.",
+          "Database-driven job queue (pg_cron): fewer moving parts but less visibility and harder to monitor than Celery."
+        ],
+        "implementation": "Celery beat schedule: run_settlement_batch every Monday 02:00 UTC. Task queries Settlement WHERE status='calculated' AND calculated_at < cutoff, ordered by calculated_at ASC. Processes in chunks of 100. Each chunk is a separate DB transaction. Failed records remain in 'settlement_failed' and are retried in the next batch."
+      }
+    ],
+    "data_flow": {
+      "publish_to_payment_flow": {
+        "description": "End-to-end flow from content publication to creator payout",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Creator calls POST /submissions/{id}/publish-confirmation with post_url",
+            "system_behavior": "Validate submission is in 'approved' status. Create PerformanceMetric record with is_final=false. Set submission status to 'published'. Calculate tracking_window_end = now + 7 days. Return tracking info.",
+            "data_written": "PerformanceMetric (initial, all counts 0), Submission.status → published"
+          },
+          {
+            "step": 2,
+            "action": "Celery task sync_performance_metrics runs every 4 hours",
+            "system_behavior": "Query all PerformanceMetric records where is_final=false AND tracking_window_end > now. For each, call Content Service to fetch current metrics. Create new PerformanceMetric snapshot row.",
+            "data_written": "New PerformanceMetric row per tracked submission"
+          },
+          {
+            "step": 3,
+            "action": "Celery task close_tracking_windows runs daily",
+            "system_behavior": "Query PerformanceMetric records where is_final=false AND tracking_window_end <= now. For each, mark the latest snapshot as is_final=true. These are now ready for payment calculation.",
+            "data_written": "PerformanceMetric.is_final → true on latest snapshot"
+          },
+          {
+            "step": 4,
+            "action": "Celery task calculate_payments runs daily (after close_tracking_windows)",
+            "system_behavior": "Query final PerformanceMetric records that have no corresponding Settlement. For each: (a) Load the application to get base_fee, (b) Load campaign to get bonus_rules, (c) Call BonusCalculator.calculate(metrics, rules), (d) Create Settlement record with idempotency_key. All monetary math uses Decimal.",
+            "data_written": "Settlement (status=calculated, with bonus_breakdown JSON)"
+          },
+          {
+            "step": 5,
+            "action": "Celery task run_settlement_batch runs Monday 02:00 UTC",
+            "system_behavior": "Create SettlementBatch record. Query Settlements WHERE status='calculated'. Process in chunks of 100. For each: (a) Set status → pending_settlement, (b) Create PaymentRecord, (c) Call Payment Service transfer API with idempotency_key, (d) On success: PaymentRecord.status → succeeded, Settlement.status → settled. On failure: PaymentRecord.status → failed, Settlement.status → settlement_failed with error_message. Update SettlementBatch counters.",
+            "data_written": "PaymentRecord, Settlement.status updated, SettlementBatch summary"
+          },
+          {
+            "step": 6,
+            "action": "Creator calls GET /creators/me/earnings",
+            "system_behavior": "Query Settlements for creator_id. Aggregate totals. Return paginated list with bonus_breakdown detail.",
+            "data_read": "Settlements, PaymentRecords"
+          }
+        ]
+      },
+      "analytics_query_flow": {
+        "description": "Brand analytics dashboard query path",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Brand calls GET /campaigns/{id}/analytics",
+            "system_behavior": "Verify brand owns the campaign. Query final PerformanceMetric records for all submissions in this campaign. Aggregate: sum(views) → total_reach, sum(likes+comments+shares) → total_engagement, sum(clicks) → total_clicks. Query Settlements for total_spend. Compute cost_per_engagement and roi_ratio using Decimal.",
+            "optimization": "For v1, compute on-the-fly with indexed queries. Cache results in Redis for 5 minutes. For scale: migrate to materialized view refreshed hourly."
+          }
+        ]
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c2_design.json"
+}

@@ -1,0 +1,54 @@
+{
+  "instance_id": "C4-08",
+  "category": "C4",
+  "category_name": "代码评审",
+  "maps_to_journey": "Journey 3: Content Submission & Review",
+  "base_commit": "07968bf",
+  "input": {
+    "pr_title": "feat: add rate limiting to content submission endpoint",
+    "pr_description": "Adds sliding-window rate limiting to prevent spam content submissions.\n\n## Changes\n- New RateLimiter utility class with in-memory sliding window\n- Rate limit dependency injected into content creation endpoint\n- Returns 429 with Retry-After header when limit exceeded\n- Default: 5 submissions per 60 seconds per user",
+    "bugged_diff": "diff --git a/app/utils/rate_limiter.py b/app/utils/rate_limiter.py\nnew file mode 100644\n--- /dev/null\n+++ b/app/utils/rate_limiter.py\n@@ -0,0 +1,35 @@\n+import time\n+\n+\n+class RateLimiter:\n+    def __init__(self, max_requests: int = 5, window_seconds: int = 60):\n+        self.max_requests = max_requests\n+        self.window_seconds = window_seconds\n+        self._requests: dict[str, list[float]] = {}\n+\n+    def is_allowed(self, key: str) -> tuple[bool, dict]:\n+        now = time.time()\n+        if key not in self._requests:\n+            self._requests[key] = []\n+\n+        # Filter expired timestamps\n+        self._requests[key] = [\n+            ts for ts in self._requests[key] if now - ts < self.window_seconds\n+        ]\n+\n+        remaining = self.max_requests - len(self._requests[key])\n+        if remaining > 0:\n+            self._requests[key].append(now)\n+            return True, {\n+                \"limit\": self.max_requests,\n+                \"remaining\": remaining - 1,\n+                \"retry_after\": 0,\n+            }\n+        else:\n+            oldest = self._requests[key][0]\n+            retry_after = self.window_seconds - (now - oldest)\n+            return False, {\n+                \"limit\": self.max_requests,\n+                \"remaining\": 0,\n+                \"retry_after\": round(retry_after),\n+            }\n+\ndiff --git a/app/api/deps.py b/app/api/deps.py\n--- a/app/api/deps.py\n+++ b/app/api/deps.py\n@@ -1,5 +1,6 @@\n from app.utils.rate_limiter import RateLimiter\n+\n+_rate_limiter = RateLimiter(max_requests=5, window_seconds=60)\n \n-# ... existing deps code ...\n+def get_rate_limiter() -> RateLimiter:\n+    return _rate_limiter\ndiff --git a/app/api/v1/contents.py b/app/api/v1/contents.py\n--- a/app/api/v1/contents.py\n+++ b/app/api/v1/contents.py\n@@ -10,6 +10,15 @@\n async def create_content(\n     db: DBSession, current_user: CurrentUser, data: ContentCreate\n ):\n+    # Rate limiting\n+    from app.api.deps import get_rate_limiter\n+    limiter = get_rate_limiter()\n+    allowed, info = limiter.is_allowed(current_user.id)\n+    if not allowed:\n+        raise HTTPException(\n+            status_code=429,\n+            detail=\"Rate limit exceeded\",\n+        )\n     service = _get_service(db)\n     return await service.create_content(current_user, data)\n"
+  },
+  "planted_defects": [
+    {
+      "id": "D-C4-08-1",
+      "file": "app/api/v1/contents.py",
+      "category": "Defect",
+      "severity": "Major",
+      "title": "Rate limit key uses only user_id — all endpoints share one counter",
+      "description": "The rate limit key is `current_user.id`, which means ALL rate-limited endpoints share a single counter per user. If the user hits the content creation limit (5 requests), they'll also be blocked from other rate-limited endpoints. The key should include the endpoint path to isolate counters per endpoint, e.g., `f'content_create:{current_user.id}'`.",
+      "root_cause": "The call `limiter.is_allowed(current_user.id)` uses a bare user ID without endpoint-specific scoping.",
+      "expected_location": {
+        "file": "app/api/v1/contents.py",
+        "function": "create_content",
+        "line_hint": "is_allowed() call"
+      },
+      "suggested_fix": "Change to `limiter.is_allowed(f'content_create:{current_user.id}')` to scope the counter to this specific endpoint."
+    },
+    {
+      "id": "D-C4-08-2",
+      "file": "app/api/v1/contents.py",
+      "category": "Defect",
+      "severity": "Major",
+      "title": "Rate limiter failure crashes the request instead of graceful degradation",
+      "description": "The rate limiting code has no try/except around the limiter call. If the rate limiter throws any exception (KeyError, AttributeError, or in production a Redis ConnectionError), the entire request fails with a 500 error. Rate limiting is a secondary concern — if it fails, the request should proceed without rate limiting (fail-open) rather than blocking the user entirely.",
+      "root_cause": "No exception handling around `limiter.is_allowed()`. In production with Redis, network failures would crash every request that has rate limiting.",
+      "expected_location": {
+        "file": "app/api/v1/contents.py",
+        "function": "create_content",
+        "line_hint": "Rate limiting block"
+      },
+      "suggested_fix": "Wrap the rate limit check in try/except: `try: allowed, info = limiter.is_allowed(...) except Exception: allowed = True`. Log the error for monitoring."
+    }
+  ],
+  "evaluation_config": {
+    "total_planted_defects": 2,
+    "defect_categories": {
+      "Defect": 2
+    },
+    "defect_severities": {
+      "Major": 2
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c4_review.json"
+}

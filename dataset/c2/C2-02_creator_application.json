@@ -1,0 +1,648 @@
+{
+  "instance_id": "C2-02",
+  "category": "C2",
+  "category_name": "技术方案设计",
+  "maps_to_journey": "Journey 2: Creator Discovery & Application",
+  "input": {
+    "requirements_spec": "Enable creators to discover active campaigns in a marketplace, check their eligibility, and submit applications. Enable brands to view, rank, and accept or reject applications. Key requirements: (1) Campaign marketplace with filters (category, fee range, deadline) and relevance sorting. (2) Per-criterion eligibility check (follower count, engagement rate, content category, region). (3) Application submission with content outline, estimated delivery date, and requested fee. (4) Fit-score ranking for brands reviewing applications (weighted: category 40%, follower 20%, engagement 20%, history 10%, fee competitiveness 10%). (5) Budget reservation on acceptance using pessimistic locking to prevent race conditions. (6) Application state machine: submitted → accepted/rejected/withdrawn. (7) Unique constraint: one active application per creator per campaign.",
+    "system_context": "Existing xhs-campaign-service (FastAPI + SQLAlchemy async). Established patterns: Repository for data access, Service for business logic, Pydantic schemas for request/response, custom exceptions (NotFoundError, ConflictError, ForbiddenError). Auth via X-User-Id header → CurrentUser dependency. User model exists with: id (UUID str), username, email, display_name, role (creator/brand/admin), follower_count, bio. Campaign model is assumed to exist (from C2-01) with: id, brand_id FK, title, description, status enum, total_budget (Decimal), remaining_budget (Decimal), min_fee, max_fee, application_deadline, content_deadline, publish_deadline, eligibility criteria fields (min_follower_count, min_engagement_rate, required_categories JSON, region_restrictions JSON). Tech stack: Python 3.11, FastAPI, SQLAlchemy 2.0 async, PostgreSQL, Redis, Celery.",
+    "constraints": "Performance: marketplace listing < 300ms p95 for 5K campaigns. Concurrency: budget reservation must use SELECT FOR UPDATE. Security: creators see only own applications, brands see only their campaign applications, fit score weights not exposed. Data integrity: budget operations must be transactional."
+  },
+  "gold_standard_output": {
+    "module_design": {
+      "new_files": [
+        {
+          "path": "app/models/application.py",
+          "purpose": "Application SQLAlchemy model and ApplicationStatus enum",
+          "depends_on": [
+            "app/models/base.py"
+          ]
+        },
+        {
+          "path": "app/schemas/application.py",
+          "purpose": "Pydantic schemas: ApplicationCreate, ApplicationResponse, ApplicationListParams, EligibilityCheckResponse",
+          "depends_on": [
+            "app/schemas/common.py"
+          ]
+        },
+        {
+          "path": "app/repositories/application_repo.py",
+          "purpose": "ApplicationRepository — all DB access for applications",
+          "depends_on": [
+            "app/models/application.py"
+          ]
+        },
+        {
+          "path": "app/services/application_service.py",
+          "purpose": "ApplicationService — business logic for apply, accept, reject, withdraw, list",
+          "depends_on": [
+            "app/repositories/application_repo.py",
+            "app/services/eligibility_engine.py"
+          ]
+        },
+        {
+          "path": "app/services/eligibility_engine.py",
+          "purpose": "EligibilityEngine — evaluates creator eligibility against campaign criteria and computes fit score",
+          "depends_on": []
+        },
+        {
+          "path": "app/api/v1/applications.py",
+          "purpose": "FastAPI router for application endpoints",
+          "depends_on": [
+            "app/services/application_service.py",
+            "app/api/deps.py"
+          ]
+        }
+      ],
+      "modified_files": [
+        {
+          "path": "app/models/__init__.py",
+          "change": "Add Application import"
+        },
+        {
+          "path": "app/api/v1/router.py",
+          "change": "Register applications router under /campaigns/{campaign_id}/applications and /applications"
+        }
+      ],
+      "dependency_graph": "api/v1/applications.py → services/application_service.py → repositories/application_repo.py → models/application.py\n                                                   ↘ services/eligibility_engine.py"
+    },
+    "api_design": {
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/campaigns/marketplace",
+          "description": "Browse active campaigns as a creator with filters and relevance sorting",
+          "auth": "CurrentUser (role: creator)",
+          "query_params": {
+            "category": {
+              "type": "str | None",
+              "description": "Filter by content category"
+            },
+            "min_fee": {
+              "type": "float | None",
+              "description": "Minimum per-creator fee"
+            },
+            "max_fee": {
+              "type": "float | None",
+              "description": "Maximum per-creator fee"
+            },
+            "deadline_within_days": {
+              "type": "int | None",
+              "description": "Application deadline within N days"
+            },
+            "brand_name": {
+              "type": "str | None",
+              "description": "Brand name substring search"
+            },
+            "sort_by": {
+              "type": "str",
+              "default": "relevance",
+              "enum": [
+                "relevance",
+                "newest",
+                "highest_fee",
+                "deadline_soonest"
+              ]
+            },
+            "page": {
+              "type": "int",
+              "default": 1,
+              "ge": 1
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20,
+              "ge": 1,
+              "le": 100
+            }
+          },
+          "response_200": {
+            "schema": "PaginatedResponse[CampaignMarketplaceItem]",
+            "example_item": {
+              "id": "uuid",
+              "title": "Summer Fashion Campaign",
+              "brand_display_name": "Brand Co.",
+              "min_fee": 500.0,
+              "max_fee": 2000.0,
+              "application_deadline": "2025-03-15T00:00:00Z",
+              "accepted_count": 3,
+              "slots_remaining": 7,
+              "eligibility_status": "eligible",
+              "content_categories": [
+                "fashion",
+                "lifestyle"
+              ]
+            }
+          },
+          "errors": [
+            "403 if not a creator role"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/campaigns/{campaign_id}/eligibility",
+          "description": "Check current creator's eligibility for a specific campaign",
+          "auth": "CurrentUser (role: creator)",
+          "response_200": {
+            "schema": "EligibilityCheckResponse",
+            "fields": {
+              "is_eligible": "bool",
+              "criteria": [
+                {
+                  "criterion": "follower_count",
+                  "required": 10000,
+                  "actual": 15000,
+                  "passed": true
+                },
+                {
+                  "criterion": "engagement_rate",
+                  "required": 0.03,
+                  "actual": 0.045,
+                  "passed": true
+                },
+                {
+                  "criterion": "content_category",
+                  "required": [
+                    "fashion"
+                  ],
+                  "actual": [
+                    "fashion",
+                    "beauty"
+                  ],
+                  "passed": true
+                },
+                {
+                  "criterion": "region",
+                  "required": [
+                    "CN-BJ",
+                    "CN-SH"
+                  ],
+                  "actual": "CN-SH",
+                  "passed": true
+                }
+              ],
+              "already_applied": false,
+              "existing_application_status": null
+            }
+          },
+          "errors": [
+            "404 if campaign not found or not active",
+            "403 if not a creator"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/campaigns/{campaign_id}/applications",
+          "description": "Submit an application to a campaign",
+          "auth": "CurrentUser (role: creator)",
+          "request_body": {
+            "schema": "ApplicationCreate",
+            "fields": {
+              "content_outline": {
+                "type": "str",
+                "min_length": 50,
+                "max_length": 1000,
+                "required": true
+              },
+              "estimated_delivery_date": {
+                "type": "date",
+                "required": true,
+                "validation": "must be before campaign content_deadline"
+              },
+              "requested_fee": {
+                "type": "Decimal",
+                "required": true,
+                "validation": "must be between campaign min_fee and max_fee"
+              }
+            }
+          },
+          "response_201": {
+            "schema": "ApplicationResponse",
+            "fields": {
+              "id": "str (uuid)",
+              "campaign_id": "str",
+              "creator_id": "str",
+              "status": "submitted",
+              "content_outline": "str",
+              "estimated_delivery_date": "date",
+              "requested_fee": "Decimal",
+              "fit_score": "float | null",
+              "created_at": "datetime",
+              "updated_at": "datetime"
+            }
+          },
+          "errors": [
+            "403 if not a creator or if creator is ineligible",
+            "404 if campaign not found or not active",
+            "409 if creator already has an active application for this campaign",
+            "422 if application_deadline has passed, or requested_fee outside range, or delivery_date after content_deadline"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/campaigns/{campaign_id}/applications",
+          "description": "Brand views all applications for their campaign, ranked by fit score",
+          "auth": "CurrentUser (role: brand, must own campaign)",
+          "query_params": {
+            "status": {
+              "type": "str | None",
+              "enum": [
+                "submitted",
+                "accepted",
+                "rejected",
+                "withdrawn"
+              ]
+            },
+            "min_fit_score": {
+              "type": "float | None"
+            },
+            "sort_by": {
+              "type": "str",
+              "default": "fit_score_desc",
+              "enum": [
+                "fit_score_desc",
+                "newest",
+                "fee_asc"
+              ]
+            },
+            "page": {
+              "type": "int",
+              "default": 1
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20
+            }
+          },
+          "response_200": {
+            "schema": "PaginatedResponse[ApplicationDetailResponse]",
+            "extra_fields_per_item": {
+              "creator_display_name": "str",
+              "creator_follower_count": "int",
+              "creator_engagement_rate": "float",
+              "creator_content_categories": "list[str]"
+            }
+          },
+          "errors": [
+            "403 if not the campaign owner",
+            "404 if campaign not found"
+          ]
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/v1/applications/{application_id}",
+          "description": "Brand accepts or rejects an application",
+          "auth": "CurrentUser (role: brand, must own the campaign)",
+          "request_body": {
+            "schema": "ApplicationDecision",
+            "fields": {
+              "action": {
+                "type": "str",
+                "enum": [
+                  "accept",
+                  "reject"
+                ],
+                "required": true
+              },
+              "rejection_reason": {
+                "type": "str | None",
+                "max_length": 500,
+                "description": "Required context when rejecting, optional"
+              }
+            }
+          },
+          "response_200": {
+            "schema": "ApplicationResponse",
+            "notes": "Returns updated application with new status"
+          },
+          "errors": [
+            "403 if brand does not own the campaign",
+            "404 if application not found",
+            "409 if application not in 'submitted' status",
+            "409 if action=accept and insufficient campaign budget (after SELECT FOR UPDATE check)"
+          ]
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/v1/applications/{application_id}",
+          "description": "Creator withdraws their own application",
+          "auth": "CurrentUser (role: creator, must own the application)",
+          "response_204": "No content",
+          "errors": [
+            "403 if not the application owner",
+            "404 if application not found",
+            "409 if application is not in 'submitted' status (cannot withdraw accepted/rejected)"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/applications/me",
+          "description": "Creator views their own application history across all campaigns",
+          "auth": "CurrentUser (role: creator)",
+          "query_params": {
+            "status": {
+              "type": "str | None"
+            },
+            "page": {
+              "type": "int",
+              "default": 1
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20
+            }
+          },
+          "response_200": {
+            "schema": "PaginatedResponse[MyApplicationResponse]",
+            "extra_fields_per_item": {
+              "campaign_title": "str",
+              "brand_display_name": "str",
+              "rejection_reason": "str | None",
+              "responded_at": "datetime | None"
+            }
+          }
+        }
+      ]
+    },
+    "data_model": {
+      "tables": [
+        {
+          "name": "applications",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "constraints": "PRIMARY KEY, default=generate_uuid"
+            },
+            {
+              "name": "campaign_id",
+              "type": "String(36)",
+              "constraints": "NOT NULL, FK → campaigns.id"
+            },
+            {
+              "name": "creator_id",
+              "type": "String(36)",
+              "constraints": "NOT NULL, FK → users.id"
+            },
+            {
+              "name": "status",
+              "type": "Enum(ApplicationStatus)",
+              "constraints": "NOT NULL, default='submitted'"
+            },
+            {
+              "name": "content_outline",
+              "type": "String(1000)",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "estimated_delivery_date",
+              "type": "Date",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "requested_fee",
+              "type": "Numeric(12,2)",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "fit_score",
+              "type": "Float",
+              "constraints": "nullable, computed on submission"
+            },
+            {
+              "name": "rejection_reason",
+              "type": "String(500)",
+              "constraints": "nullable"
+            },
+            {
+              "name": "responded_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "nullable, set when accepted/rejected"
+            },
+            {
+              "name": "version",
+              "type": "Integer",
+              "constraints": "NOT NULL, default=1, for optimistic locking"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now()"
+            },
+            {
+              "name": "updated_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now(), onupdate=now()"
+            },
+            {
+              "name": "is_deleted",
+              "type": "Boolean",
+              "constraints": "NOT NULL, default=False"
+            },
+            {
+              "name": "deleted_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "nullable"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_applications_campaign_id",
+              "columns": [
+                "campaign_id"
+              ]
+            },
+            {
+              "name": "ix_applications_creator_id",
+              "columns": [
+                "creator_id"
+              ]
+            },
+            {
+              "name": "ix_applications_status",
+              "columns": [
+                "status"
+              ]
+            },
+            {
+              "name": "ix_applications_fit_score",
+              "columns": [
+                "campaign_id",
+                "fit_score"
+              ],
+              "description": "Composite for ranked listing by brand"
+            }
+          ],
+          "unique_constraints": [
+            {
+              "name": "uq_active_application_per_creator",
+              "columns": [
+                "campaign_id",
+                "creator_id"
+              ],
+              "condition": "WHERE status NOT IN ('withdrawn') AND is_deleted = FALSE",
+              "description": "One active application per creator per campaign. Partial unique index allows re-application after withdrawal."
+            }
+          ],
+          "enum_definition": {
+            "name": "ApplicationStatus",
+            "values": [
+              "submitted",
+              "accepted",
+              "rejected",
+              "withdrawn"
+            ]
+          },
+          "model_code_sketch": "class Application(Base, TimestampMixin, SoftDeleteMixin):\n    __tablename__ = 'applications'\n\n    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)\n    campaign_id: Mapped[str] = mapped_column(String(36), ForeignKey('campaigns.id'), nullable=False)\n    creator_id: Mapped[str] = mapped_column(String(36), ForeignKey('users.id'), nullable=False)\n    status: Mapped[ApplicationStatus] = mapped_column(nullable=False, default=ApplicationStatus.SUBMITTED)\n    content_outline: Mapped[str] = mapped_column(String(1000), nullable=False)\n    estimated_delivery_date: Mapped[date] = mapped_column(Date, nullable=False)\n    requested_fee: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)\n    fit_score: Mapped[float | None] = mapped_column(Float, nullable=True)\n    rejection_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)\n    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)\n    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)"
+        }
+      ]
+    },
+    "integration_points": [
+      {
+        "service": "Campaign Service (internal module)",
+        "interaction": "Read campaign details (eligibility criteria, budget, deadlines, status). On accept: lock campaign row (SELECT FOR UPDATE), deduct requested_fee from remaining_budget, flush.",
+        "interface": "Direct repository access via CampaignRepository within the same DB transaction",
+        "failure_handling": "If campaign not found or not active, raise NotFoundError/ValidationError before any state change"
+      },
+      {
+        "service": "User Service (internal module)",
+        "interaction": "Read creator profile (follower_count, engagement_rate, content_categories, region) for eligibility check and fit score calculation.",
+        "interface": "Direct repository access via UserRepository within the same DB session",
+        "failure_handling": "If user not found, raise NotFoundError (should not happen as user is authenticated)"
+      },
+      {
+        "service": "Notification Service (external)",
+        "interaction": "Send notifications on: application submitted (to brand), application accepted/rejected (to creator), application withdrawn (to brand).",
+        "interface": "Async Celery task: send_notification.delay(user_id, notification_type, payload)",
+        "failure_handling": "Fire-and-forget via Celery. Notification failure must not block the application operation. Log errors for monitoring."
+      }
+    ],
+    "technical_decisions": [
+      {
+        "decision": "Use pessimistic locking (SELECT FOR UPDATE) for budget reservation on acceptance",
+        "alternatives_considered": [
+          "Optimistic locking with version check on campaign row — rejected because under high concurrency, retries add latency and complexity",
+          "Application-level mutex via Redis SETNX — rejected because it doesn't guarantee DB consistency if the app crashes between lock and commit"
+        ],
+        "justification": "SELECT FOR UPDATE within a single DB transaction is the simplest correct solution. The lock scope is narrow (one campaign row), contention is low (acceptance is a low-frequency operation per campaign), and PostgreSQL handles deadlock detection natively.",
+        "trade_off": "Slightly higher latency on concurrent acceptances for the same campaign (serialized), but correctness is non-negotiable for financial operations."
+      },
+      {
+        "decision": "Compute fit_score at application submission time and store it, not compute on-read",
+        "alternatives_considered": [
+          "Compute on every list request — rejected because score calculation requires joining creator profile data, which adds query complexity and latency on a frequently-accessed brand endpoint"
+        ],
+        "justification": "Fit score depends on creator profile at application time (which we've decided is the evaluation snapshot). Pre-computing and storing allows simple ORDER BY fit_score DESC queries. Stored score can be re-computed in bulk if weights change.",
+        "trade_off": "Stored scores become stale if creator profile changes, but per requirement EC-2.4, eligibility is snapshot-at-application-time."
+      },
+      {
+        "decision": "Evaluate eligibility at query time (not cached) for the eligibility check endpoint, but snapshot at application time",
+        "alternatives_considered": [
+          "Cache eligibility in Redis for 5 minutes — considered but deferred to P2 since eligibility check is a simple in-memory comparison once the campaign and user data are loaded"
+        ],
+        "justification": "Eligibility check is a lightweight comparison of user fields against campaign criteria — no external API calls. Two DB reads (user + campaign) are sufficient. Caching adds complexity for marginal gain at current scale.",
+        "trade_off": "Each eligibility check hits the DB. If marketplace browsing loads increase, add Redis caching as a P2 optimization."
+      },
+      {
+        "decision": "Use Decimal(12,2) for monetary fields (requested_fee), not Float",
+        "alternatives_considered": [
+          "Float — rejected due to floating-point precision errors in financial calculations"
+        ],
+        "justification": "Monetary values must be exact. Decimal(12,2) supports values up to 9,999,999,999.99 which is well beyond campaign budget ranges. Matches the campaign model's budget field type.",
+        "trade_off": "Decimal operations are slightly slower than float, negligible at this scale."
+      },
+      {
+        "decision": "Partial unique index for one-active-application-per-creator constraint instead of application-level check",
+        "alternatives_considered": [
+          "Check-then-insert in application code — rejected because it is vulnerable to race conditions between the check and insert"
+        ],
+        "justification": "A partial unique index WHERE status NOT IN ('withdrawn') AND is_deleted = FALSE enforces the constraint at the database level, which is race-condition-proof. Creators who withdraw can re-apply because their withdrawn application is excluded from the index.",
+        "trade_off": "Partial unique indexes are PostgreSQL-specific (not portable to MySQL). Acceptable since PostgreSQL is our chosen database."
+      }
+    ],
+    "data_flow": {
+      "application_submission": {
+        "title": "Application Submission Flow",
+        "steps": [
+          "1. Creator calls POST /api/v1/campaigns/{id}/applications with ApplicationCreate body",
+          "2. API layer extracts CurrentUser (must be creator role)",
+          "3. ApplicationService.submit_application(campaign_id, creator, data) is called",
+          "4. Service loads Campaign via CampaignRepository.get_by_id(campaign_id)",
+          "5. Validate: campaign.status == 'active' AND campaign.application_deadline > now(UTC)",
+          "6. Service loads Creator profile via UserRepository.get_by_id(creator.id)",
+          "7. EligibilityEngine.check(creator, campaign) → raises ForbiddenError if ineligible",
+          "8. Validate: requested_fee between campaign.min_fee and campaign.max_fee",
+          "9. Validate: estimated_delivery_date < campaign.content_deadline",
+          "10. EligibilityEngine.compute_fit_score(creator, campaign) → float",
+          "11. Create Application(campaign_id, creator_id, status=SUBMITTED, fit_score=score, ...)",
+          "12. ApplicationRepository.create(application) — DB unique constraint handles duplicate check",
+          "13. Celery: send_notification.delay(campaign.brand_id, 'new_application', {...})",
+          "14. Return ApplicationResponse (201)"
+        ],
+        "error_paths": [
+          "Step 4: campaign not found → 404",
+          "Step 5: campaign not active or deadline passed → 422 ValidationError",
+          "Step 7: creator ineligible → 403 ForbiddenError with per-criterion details",
+          "Step 8-9: fee or date out of range → 422 ValidationError",
+          "Step 12: unique constraint violation → 409 ConflictError 'Already applied'"
+        ]
+      },
+      "acceptance_with_budget_lock": {
+        "title": "Application Acceptance with Budget Reservation (Race Condition Handling)",
+        "steps": [
+          "1. Brand calls PATCH /api/v1/applications/{id} with {action: 'accept'}",
+          "2. API layer extracts CurrentUser (must be brand role)",
+          "3. ApplicationService.decide(application_id, brand_user, action='accept')",
+          "4. Load Application via repo — validate status == 'submitted'",
+          "5. Load Campaign — validate brand_user.id == campaign.brand_id (ownership check)",
+          "6. Validate campaign.status == 'active'",
+          "7. BEGIN TRANSACTION (already in DB session context)",
+          "8. CampaignRepository.get_by_id_for_update(campaign_id) — executes SELECT ... FOR UPDATE on campaigns row → acquires row-level exclusive lock",
+          "9. Check: campaign.remaining_budget >= application.requested_fee",
+          "10. If insufficient: raise ConflictError('Insufficient campaign budget'). Lock released on rollback.",
+          "11. campaign.remaining_budget -= application.requested_fee",
+          "12. application.status = ApplicationStatus.ACCEPTED",
+          "13. application.responded_at = now(UTC)",
+          "14. Flush both changes in same transaction",
+          "15. COMMIT → row lock released",
+          "16. Celery: send_notification.delay(application.creator_id, 'application_accepted', {...})",
+          "17. Return ApplicationResponse (200)"
+        ],
+        "concurrency_note": "If two concurrent accept requests target the same campaign: Request A acquires the row lock at step 8. Request B blocks at step 8 until A commits or rolls back. After A commits, B sees the updated remaining_budget and may fail at step 9 if budget is now insufficient. This guarantees budget is never over-allocated."
+      }
+    },
+    "fit_score_algorithm": {
+      "formula": "fit_score = category_match × 0.4 + follower_score × 0.2 + engagement_score × 0.2 + history_score × 0.1 + fee_competitiveness × 0.1",
+      "components": [
+        {
+          "name": "category_match",
+          "range": "0.0 – 1.0",
+          "calculation": "len(intersection(creator.categories, campaign.required_categories)) / len(campaign.required_categories). If campaign has no required categories, default 1.0."
+        },
+        {
+          "name": "follower_score",
+          "range": "0.0 – 1.0",
+          "calculation": "min(creator.follower_count / campaign.min_follower_count, 1.0) if min_follower_count > 0 else 1.0. Guards: if creator.follower_count == 0, score = 0.0."
+        },
+        {
+          "name": "engagement_score",
+          "range": "0.0 – 1.0",
+          "calculation": "min(creator.engagement_rate / campaign.min_engagement_rate, 1.0) if min_engagement_rate > 0 else 1.0."
+        },
+        {
+          "name": "history_score",
+          "range": "0.0 – 1.0",
+          "calculation": "For v1, all creators get a neutral 0.5 (no historical campaign data yet). Future: completed_campaigns / total_accepted_campaigns."
+        },
+        {
+          "name": "fee_competitiveness",
+          "range": "0.0 – 1.0",
+          "calculation": "1.0 - ((requested_fee - campaign.min_fee) / (campaign.max_fee - campaign.min_fee)). Lower fee = higher score. If min_fee == max_fee, default 1.0."
+        }
+      ],
+      "output_range": "0.0 – 1.0 (stored as Float, displayed as percentage to brand)",
+      "config_location": "Weights defined as constants in eligibility_engine.py. Configurable via environment variables for tuning without code changes."
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c2_design.json"
+}

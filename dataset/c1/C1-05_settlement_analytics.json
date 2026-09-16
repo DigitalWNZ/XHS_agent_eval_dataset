@@ -1,0 +1,313 @@
+{
+  "instance_id": "C1-05",
+  "category": "C1",
+  "category_name": "需求理解与预评审",
+  "maps_to_journey": "Journey 5: Settlement & Analytics",
+  "input": {
+    "role": "Product Manager",
+    "requirement_description": "After content goes live, we need to track how it performs and pay creators accordingly. Creators get a base fee plus bonus based on performance. Brands want to see campaign analytics — how much reach, engagement, ROI. Payments should be batched weekly. We have an existing payment service.",
+    "context": "The system is a FastAPI microservice called campaign-service. We have existing User, Content, Payment, and Notification services. Tech stack: Python, PostgreSQL, Redis, Celery. Campaigns, applications, content submissions, and review workflows already exist. Each accepted creator has a negotiated base_fee stored on the application record. Content has a published_at timestamp and a post_url linking to the live note on XHS."
+  },
+  "gold_standard_output": {
+    "structured_spec": {
+      "overview": "After a creator's content is published on XHS, the platform tracks its performance over a 7-day observation window, calculates final payment (base fee + performance bonus), batches payments into a weekly settlement cycle, and surfaces analytics dashboards for both brands and creators.",
+      "user_stories": [
+        {
+          "id": "US-5.1",
+          "story": "As the system, I want to automatically begin tracking performance metrics when a creator confirms their content is published, so that settlement can be calculated based on real data.",
+          "acceptance_criteria": [
+            "When a content submission enters 'published' status (creator provides post_url and confirms), a performance tracking record is created with status 'tracking'",
+            "The tracking window is 7 calendar days from published_at (inclusive of publication day)",
+            "A periodic Celery task (every 4 hours) syncs metrics from the Content Service for all actively tracked posts: views, likes, comments, shares, link_clicks",
+            "Each sync creates a timestamped metric snapshot; the latest snapshot is treated as the authoritative metric set",
+            "After the 7-day window closes, the tracking record transitions to 'pending_calculation'"
+          ]
+        },
+        {
+          "id": "US-5.2",
+          "story": "As the system, I want to calculate final payment amounts when the tracking window closes, so that creators are paid accurately.",
+          "acceptance_criteria": [
+            "A Celery task runs daily, selects all tracking records in 'pending_calculation' status, and computes payment for each",
+            "Payment = base_fee (from application) + performance_bonus",
+            "Performance bonus is computed from campaign-level bonus rules: a list of (metric_name, threshold, bonus_amount) tuples. If the creator's metric meets or exceeds the threshold, the corresponding bonus_amount is added. Multiple bonuses can stack.",
+            "All monetary calculations use Python Decimal with ROUND_HALF_UP and 2 decimal places",
+            "A PaymentRecord is created with: creator_id, campaign_id, application_id, base_fee, bonus_breakdown (JSON list of applied bonuses), total_amount, status='calculated'",
+            "The tracking record transitions to 'calculated'",
+            "If a PaymentRecord already exists for the same application_id, skip (idempotency guard)"
+          ]
+        },
+        {
+          "id": "US-5.3",
+          "story": "As the system, I want to batch-process calculated payments weekly so that creators receive timely payouts.",
+          "acceptance_criteria": [
+            "A Celery beat task runs every Monday at 02:00 UTC",
+            "It selects all PaymentRecords with status='calculated' created before the current batch cutoff (Sunday 23:59 UTC)",
+            "For each record, it calls the Payment Service's transfer API with: creator_id, amount, idempotency_key (derived from payment_record_id)",
+            "On success: PaymentRecord status → 'settled', settlement_batch_id recorded, settled_at timestamp set",
+            "On failure: PaymentRecord status → 'settlement_failed', error_message recorded, record remains eligible for the next batch retry",
+            "A settlement batch summary record is created: batch_id, total_records, total_amount, success_count, failure_count, batch_started_at, batch_completed_at"
+          ]
+        },
+        {
+          "id": "US-5.4",
+          "story": "As a content creator, I want to view my earnings for each campaign so that I understand how I was paid.",
+          "acceptance_criteria": [
+            "Creator can list their payment records with pagination, filtered by campaign_id or status",
+            "Each record shows: campaign title, base_fee, bonus_breakdown (which bonuses triggered and why), total_amount, status, settled_at",
+            "Creator can view a summary: total_earned, total_pending, total_campaigns_participated",
+            "Returns 403 if the requesting user is not the payment record's creator"
+          ]
+        },
+        {
+          "id": "US-5.5",
+          "story": "As a brand marketing manager, I want to view campaign analytics so that I can measure ROI and compare creator performance.",
+          "acceptance_criteria": [
+            "Brand can view per-campaign analytics: total_reach (sum of views), total_engagement (sum of likes + comments + shares), total_clicks, total_spend, average_cost_per_engagement, ROI_ratio (total_engagement / total_spend)",
+            "Brand can view per-creator breakdown within a campaign: creator name, post metrics, payment amount, cost_per_engagement",
+            "Brand can view an aggregate dashboard across all campaigns: total_spend, total_reach, average_engagement_rate, top-performing campaigns",
+            "Analytics data is served from pre-aggregated materialized views or cache, not computed on-the-fly",
+            "Returns 403 if the requesting user is not the campaign owner"
+          ]
+        },
+        {
+          "id": "US-5.6",
+          "story": "As a content creator, I want to see my performance metrics for published content so that I can track how my content is doing before settlement.",
+          "acceptance_criteria": [
+            "Creator can view the current metric snapshot for each of their published content pieces",
+            "Shows: views, likes, comments, shares, clicks, last_synced_at, days_remaining in tracking window",
+            "Shows estimated bonus (based on current metrics vs. campaign bonus thresholds) clearly labeled as 'estimated — final amount calculated after tracking window closes'",
+            "Returns 403 if the requesting user is not the content's creator"
+          ]
+        },
+        {
+          "id": "US-5.7",
+          "story": "As a platform admin, I want to view settlement batch history and retry failed payments so that I can ensure all creators are paid.",
+          "acceptance_criteria": [
+            "Admin can list settlement batches with: batch_id, date, total_records, total_amount, success/failure counts",
+            "Admin can view failed payment records within a batch with error details",
+            "Admin can trigger a manual retry for individual failed payment records or an entire failed batch",
+            "Admin can view a system-wide settlement health dashboard: total_unsettled, oldest_unsettled_days, failure_rate_trend",
+            "Returns 403 if user is not an admin"
+          ]
+        }
+      ],
+      "state_machine": {
+        "entity": "PerformanceTracking + PaymentRecord (two linked state machines)",
+        "tracking_states": [
+          "tracking",
+          "pending_calculation",
+          "calculated",
+          "cancelled"
+        ],
+        "payment_states": [
+          "calculated",
+          "pending_settlement",
+          "settled",
+          "settlement_failed",
+          "disputed",
+          "refunded"
+        ],
+        "tracking_transitions": [
+          {
+            "from": "tracking",
+            "to": "pending_calculation",
+            "trigger": "7-day window closes (system cron)",
+            "guard": "at least 1 metric snapshot exists"
+          },
+          {
+            "from": "tracking",
+            "to": "cancelled",
+            "trigger": "campaign cancelled or content deleted during tracking window"
+          },
+          {
+            "from": "pending_calculation",
+            "to": "calculated",
+            "trigger": "payment calculation task completes successfully"
+          }
+        ],
+        "payment_transitions": [
+          {
+            "from": "calculated",
+            "to": "pending_settlement",
+            "trigger": "included in settlement batch"
+          },
+          {
+            "from": "pending_settlement",
+            "to": "settled",
+            "trigger": "Payment Service transfer succeeds"
+          },
+          {
+            "from": "pending_settlement",
+            "to": "settlement_failed",
+            "trigger": "Payment Service transfer fails"
+          },
+          {
+            "from": "settlement_failed",
+            "to": "pending_settlement",
+            "trigger": "admin retries or next weekly batch"
+          },
+          {
+            "from": "settled",
+            "to": "disputed",
+            "trigger": "creator raises dispute within 30 days"
+          },
+          {
+            "from": "disputed",
+            "to": "settled",
+            "trigger": "dispute resolved in favor of original amount"
+          },
+          {
+            "from": "disputed",
+            "to": "refunded",
+            "trigger": "dispute resolved with adjustment, difference refunded to brand"
+          }
+        ]
+      },
+      "edge_cases": [
+        {
+          "id": "EC-5.1",
+          "scenario": "Creator deletes their published post during the 7-day tracking window",
+          "handling": "Tracking record transitions to 'cancelled'. Creator forfeits performance bonus but still receives base_fee. A PaymentRecord is created with bonus_amount=0. Notify brand that content was removed."
+        },
+        {
+          "id": "EC-5.2",
+          "scenario": "Performance data sync fails for multiple consecutive cycles (Content Service downtime)",
+          "handling": "Metric sync task logs warning and retries with exponential backoff (4h → 8h → 16h). If no successful sync occurs within the 7-day window, use the last available snapshot. If zero snapshots exist, flag for manual admin review and hold settlement. Do NOT auto-calculate with zero metrics."
+        },
+        {
+          "id": "EC-5.3",
+          "scenario": "Settlement batch job crashes mid-processing — some payments transferred, others not",
+          "handling": "Each payment transfer uses an idempotency_key derived from payment_record_id. On restart, the batch resumes from where it left off. Already-settled records are skipped (idempotent). Batch summary reflects actual outcomes."
+        },
+        {
+          "id": "EC-5.4",
+          "scenario": "Creator's performance metric exactly equals the bonus threshold (e.g., threshold is 10,000 views, creator gets exactly 10,000)",
+          "handling": "Bonus IS awarded — threshold comparison uses >= (greater than or equal to). This must be explicitly documented in the bonus rules and consistently applied."
+        },
+        {
+          "id": "EC-5.5",
+          "scenario": "Campaign is cancelled by brand after content is published but before the tracking window closes",
+          "handling": "Tracking continues for already-published content. Creator receives base_fee + any earned bonus as if the campaign completed normally. Brand is still charged. Rationale: creator fulfilled their obligation."
+        },
+        {
+          "id": "EC-5.6",
+          "scenario": "Metric data is corrected by Content Service after settlement was already calculated (e.g., bot traffic removed, view count adjusted downward)",
+          "handling": "If PaymentRecord status is 'calculated' (not yet settled): recalculate and update. If status is 'settled' or later: do NOT auto-adjust. Flag for admin review and potential manual dispute resolution. Never claw back from creator automatically."
+        },
+        {
+          "id": "EC-5.7",
+          "scenario": "Partial payment failure in a batch — Payment Service returns insufficient_balance for the platform wallet",
+          "handling": "Stop processing remaining records in the batch. Mark all unprocessed records as 'settlement_failed' with reason='platform_balance_insufficient'. Alert platform admin immediately. Already-settled records in this batch are NOT rolled back."
+        },
+        {
+          "id": "EC-5.8",
+          "scenario": "Brand's campaign had total_spend > total_engagement_value — negative ROI",
+          "handling": "Display negative ROI honestly in analytics. Do not hide or mask it. Show it as a red metric with context: 'Campaign spend exceeded estimated engagement value.' Do not affect settlement — creators are still paid regardless of brand ROI."
+        },
+        {
+          "id": "EC-5.9",
+          "scenario": "Two tracking windows for the same creator on the same campaign (creator had revision → resubmit → re-publish)",
+          "handling": "Only the latest published version is tracked. Previous tracking records for superseded content versions are cancelled. Payment is calculated based on the final published content only."
+        },
+        {
+          "id": "EC-5.10",
+          "scenario": "Floating-point arithmetic produces a payment of 99.999999999 instead of 100.00",
+          "handling": "All monetary calculations MUST use Python Decimal type with explicit ROUND_HALF_UP rounding to 2 decimal places. Never use float for monetary values. This is enforced by code review and a linting rule on the PaymentRecord model."
+        }
+      ],
+      "clarifying_questions": [
+        {
+          "id": "CQ-5.1",
+          "question": "What is the exact bonus formula? Is it a fixed amount per threshold, a percentage of base_fee, or a tiered/progressive structure?",
+          "impact": "A tiered structure (e.g., 10K views = +200 CNY, 50K views = +800 CNY, 100K views = +2000 CNY) behaves very differently from a per-unit structure (e.g., +0.01 CNY per view above 10K). Affects calculation complexity and payment predictability.",
+          "assumption_if_unanswered": "Fixed amount per threshold (simplest). Campaign defines a list of {metric, threshold, bonus_amount} rules. Each rule is independently evaluated."
+        },
+        {
+          "id": "CQ-5.2",
+          "question": "Is there a cap on total bonus per creator, or can a viral post earn unlimited bonus?",
+          "impact": "Uncapped bonus could exceed campaign budget. Capped bonus is safer but may feel unfair to high-performing creators.",
+          "assumption_if_unanswered": "Total payment (base + bonus) is capped at the campaign's max_fee. This protects budget while allowing bonus earning."
+        },
+        {
+          "id": "CQ-5.3",
+          "question": "How should tax withholding be handled? Does the platform deduct individual income tax before paying out, or is the creator responsible?",
+          "impact": "If platform withholds tax, we need tax rate configuration, tax certificate generation, and a more complex settlement pipeline. If creator is responsible, the payout is gross amount.",
+          "assumption_if_unanswered": "Platform pays gross amount to creator. Tax is the creator's responsibility. (Simplification for v1, but flag for legal review.)"
+        },
+        {
+          "id": "CQ-5.4",
+          "question": "What is the dispute resolution process if a creator disagrees with their payment amount?",
+          "impact": "Requires dispute state in payment lifecycle, admin tools for investigation, potential manual payment adjustment.",
+          "assumption_if_unanswered": "Creators can raise a dispute within 30 days of settlement. Admin reviews and can either confirm or adjust the amount. Adjustments create a supplementary payment record."
+        },
+        {
+          "id": "CQ-5.5",
+          "question": "Should the 7-day tracking window be configurable per campaign, or is it a platform-wide constant?",
+          "impact": "Configurable windows add flexibility (brand can set 3-day or 14-day tracking) but complicate batch scheduling and comparability of analytics across campaigns.",
+          "assumption_if_unanswered": "Platform-wide constant of 7 days for v1. Make it a configuration constant (not hardcoded) so it can be changed or made per-campaign later."
+        },
+        {
+          "id": "CQ-5.6",
+          "question": "What is the refund policy if a brand wants money back for underperforming content?",
+          "impact": "If brands can request refunds, we need a refund workflow, budget reconciliation, and creator notification. This significantly increases complexity.",
+          "assumption_if_unanswered": "No refunds for v1. The brand accepted the creator and approved the content — payment is guaranteed once content is published. Analytics help brands make better decisions on future campaigns."
+        }
+      ],
+      "non_functional_requirements": [
+        {
+          "id": "NFR-5.1",
+          "category": "Data Accuracy",
+          "requirement": "All monetary calculations MUST use Python Decimal type with ROUND_HALF_UP rounding to 2 decimal places. Float types are prohibited in any model, schema, or function that handles money.",
+          "rationale": "Floating-point arithmetic errors (e.g., 0.1 + 0.2 = 0.30000000000000004) are unacceptable for financial calculations. Even 0.01 CNY discrepancy at scale becomes a reconciliation nightmare."
+        },
+        {
+          "id": "NFR-5.2",
+          "category": "Idempotency",
+          "requirement": "Payment calculation and settlement transfer operations must be idempotent. Repeated execution with the same input must produce the same result without side effects (no duplicate payments).",
+          "rationale": "Celery tasks can be retried on failure. Settlement batch jobs can crash and restart. Without idempotency, creators could be paid twice — a critical financial risk."
+        },
+        {
+          "id": "NFR-5.3",
+          "category": "Data Consistency",
+          "requirement": "PaymentRecord creation must be transactional with tracking record status update. If payment record creation fails, tracking status must not advance to 'calculated'.",
+          "rationale": "Inconsistent state (tracking says 'calculated' but no PaymentRecord exists) would cause the settlement batch to miss the payment."
+        },
+        {
+          "id": "NFR-5.4",
+          "category": "Analytics Performance",
+          "requirement": "Campaign analytics dashboard queries must respond within 500ms (p95) for campaigns with up to 500 creators and 7 days of metric history.",
+          "rationale": "Analytics is a frequently accessed page by brand managers. Slow dashboards lead to user frustration and repeated page refreshes that compound load."
+        },
+        {
+          "id": "NFR-5.5",
+          "category": "Observability",
+          "requirement": "Settlement batch jobs must emit structured logs with: batch_id, records_processed, records_succeeded, records_failed, total_amount_settled, duration_ms. Failed records must include error_code and error_message.",
+          "rationale": "Financial operations require auditable trails. When a payment fails, the on-call engineer needs to diagnose and retry within the same business day."
+        }
+      ],
+      "priority_classification": {
+        "P0_must_have": [
+          "US-5.1 (Performance tracking)",
+          "US-5.2 (Payment calculation)",
+          "US-5.3 (Settlement batch)",
+          "US-5.4 (Creator earnings view)",
+          "Decimal arithmetic for money",
+          "Idempotency on all payment operations"
+        ],
+        "P1_should_have": [
+          "US-5.5 (Brand analytics dashboard)",
+          "US-5.6 (Creator live metrics)",
+          "US-5.7 (Admin settlement tools)",
+          "Settlement retry mechanism"
+        ],
+        "P2_nice_to_have": [
+          "Real-time metric streaming (replace polling)",
+          "Analytics export to CSV/PDF",
+          "Dispute workflow (US-5.7 dispute states)",
+          "Configurable tracking window per campaign"
+        ]
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c1_requirements.json"
+}
