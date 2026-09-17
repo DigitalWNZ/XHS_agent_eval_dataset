@@ -90,7 +90,8 @@ def invoke_agent(
 
     if agent == "agy":
         cmd = [
-            "agy", "-p", prompt,
+            "agy",
+            "--input-format", "text",
             "--model", model,
             "--output-format", "stream-json",
             "--dangerously-skip-permissions",
@@ -100,7 +101,7 @@ def invoke_agent(
             cmd.extend(["--mode", "accept-edits", "--add-dir", str(work_dir)])
     elif agent == "claude":
         cmd = [
-            "claude", "--print", prompt,
+            "claude", "--print", "-",
             "--model", model,
             "--output-format", "stream-json",
             "--dangerously-skip-permissions",
@@ -113,7 +114,7 @@ def invoke_agent(
 
     result = subprocess.run(
         cmd, cwd=work_dir, capture_output=True, text=True,
-        timeout=timeout_secs,
+        input=prompt, timeout=timeout_secs,
         env={**os.environ, "AGY_ADC_AUTH": "true"},
     )
 
@@ -202,7 +203,10 @@ def capture_agent_patch(work_dir: Path) -> str:
     for f in new_files:
         file_path = work_dir / f
         if file_path.is_file():
-            content = file_path.read_text()
+            try:
+                content = file_path.read_text()
+            except (UnicodeDecodeError, ValueError):
+                continue
             lines = content.splitlines()
             untracked_diff += f"diff --git a/{f} b/{f}\nnew file mode 100644\n--- /dev/null\n+++ b/{f}\n@@ -0,0 +1,{len(lines)} @@\n"
             for line in lines:
@@ -265,7 +269,7 @@ def build_prompt_c2(entry: dict) -> str:
         f"## System Context\n"
         f"{inp['system_context']}\n\n"
         f"## Constraints\n"
-        f"{json.dumps(inp['constraints'], indent=2, ensure_ascii=False)}\n\n"
+        f"{json.dumps(inp.get('constraints', {}), indent=2, ensure_ascii=False)}\n\n"
         f"## Task\n"
         f"Produce a technical design document that includes:\n"
         f"1. Module design (components, responsibilities, dependencies)\n"
@@ -388,7 +392,8 @@ def run_judge_scoring(judge_prompt: str, agent: str, model: str, timeout_minutes
 
     if agent == "agy":
         cmd = [
-            "agy", "-p", judge_prompt,
+            "agy",
+            "--input-format", "text",
             "--model", model,
             "--output-format", "json",
             "--dangerously-skip-permissions",
@@ -396,7 +401,7 @@ def run_judge_scoring(judge_prompt: str, agent: str, model: str, timeout_minutes
         ]
     elif agent == "claude":
         cmd = [
-            "claude", "--print", judge_prompt,
+            "claude", "--print", "-",
             "--model", model,
             "--output-format", "json",
             "--dangerously-skip-permissions",
@@ -405,10 +410,15 @@ def run_judge_scoring(judge_prompt: str, agent: str, model: str, timeout_minutes
         return {"error": f"Unknown agent: {agent}"}
 
     print(f"  Running LLM-as-judge ({model})...")
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout_secs,
-        env={**os.environ, "AGY_ADC_AUTH": "true"},
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, input=judge_prompt,
+            timeout=timeout_secs,
+            env={**os.environ, "AGY_ADC_AUTH": "true"},
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  Judge scoring timed out after {timeout_minutes}m")
+        return {"error": f"Judge timeout after {timeout_minutes}m", "raw_response": "", "parsed_scores": None, "judge_usage": {}}
 
     response_text = result.stdout
     try:
