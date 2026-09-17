@@ -797,6 +797,21 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
         patch_lines = len(agent_patch.splitlines())
         print(f"  Agent patch: {patch_lines} lines")
 
+        # Apply test_patch if present (injects FAIL_TO_PASS test functions)
+        test_patch = entry.get("test_patch", "")
+        if test_patch:
+            for line in test_patch.splitlines():
+                if line.startswith("+++ b/"):
+                    conflict_file = work_dir / line[6:]
+                    if conflict_file.exists():
+                        pass  # appending to existing file, git apply handles it
+            tp_result = subprocess.run(
+                ["git", "apply", "--allow-empty"],
+                input=test_patch, text=True, cwd=work_dir, capture_output=True,
+            )
+            if tp_result.returncode != 0:
+                print(f"  Test patch failed to apply: {tp_result.stderr[:200]}")
+
         f2p = gold.get("FAIL_TO_PASS", [])
         p2p = gold.get("PASS_TO_PASS", [])
 
