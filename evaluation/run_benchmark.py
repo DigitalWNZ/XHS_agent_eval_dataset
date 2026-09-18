@@ -506,8 +506,9 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
         findings = parse_findings(agent_response)
         print(f"  Agent findings: {len(findings)}")
 
-        scores = score_c4(planted, findings)
-        print(f"  Recall: {scores['recall']:.0%} | Precision: {scores['precision']:.0%}")
+        rubric = load_rubric("c4")
+        scores = score_c4(planted, findings, rubric=rubric, agent=agent, model=model)
+        print(f"  Recall: {scores['recall']:.0%} (D1: {scores['D1']['score']}/25) | Precision: {scores['precision']:.0%} (D2: {scores['D2']['score']}/25) | Match: {scores['match_method']}")
 
         result = {
             "instance_id": instance_id,
@@ -523,7 +524,6 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
             "scores": scores,
         }
 
-        rubric = load_rubric("c4")
         judge_result = build_judge_payload("c4", rubric, entry, agent_response,
             extra_replacements={
                 "code_diff": entry["input"]["bugged_diff"],
@@ -532,7 +532,7 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
             },
             judge_dims_only=True)
         if judge_result.get("judge_prompt"):
-            print(f"  Running LLM-as-judge for explanation quality (D5)...")
+            print(f"  Running LLM-as-judge for D3 (localization), D4 (category/severity), D5 (explanation)...")
             judge_scores = run_judge_scoring(judge_result["judge_prompt"], agent, model)
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
@@ -568,10 +568,42 @@ def parse_findings(response: str) -> list[dict]:
     return []
 
 
-def score_c4(planted: list[dict], findings: list[dict]) -> dict:
+def _score_c4_d1(recall: float) -> int:
+    """D1 Detection Recall (25 pts): tier score from recall ratio."""
+    if recall >= 0.9:
+        return 25
+    if recall >= 0.7:
+        return 20
+    if recall >= 0.5:
+        return 15
+    if recall >= 0.3:
+        return 10
+    return 5
+
+
+def _score_c4_d2(precision: float) -> int:
+    """D2 Detection Precision (25 pts): tier score from precision ratio."""
+    if precision >= 0.8:
+        return 25
+    if precision >= 0.6:
+        return 20
+    if precision >= 0.4:
+        return 15
+    if precision >= 0.2:
+        return 10
+    return 5
+
+
+def score_c4(planted: list[dict], findings: list[dict],
+             rubric: dict = None, agent: str = None, model: str = None) -> dict:
     matched = set()
     true_positives = []
     false_positives = []
+
+    semantic_prompt = rubric.get("semantic_match_prompt", "") if rubric else ""
+    use_llm = bool(semantic_prompt and agent and model)
+    if use_llm:
+        print(f"  Using LLM semantic matching for finding-defect pairing...")
 
     for finding in findings:
         agent_file = finding.get("file", "")
@@ -579,12 +611,39 @@ def score_c4(planted: list[dict], findings: list[dict]) -> dict:
         best_match = None
         best_score = 0
 
+        file_matched_candidates = []
         for i, defect in enumerate(planted):
             if i in matched:
                 continue
             planted_file = defect.get("file", "")
             if not _file_match(agent_file, planted_file):
                 continue
+            file_matched_candidates.append(i)
+
+        if use_llm and file_matched_candidates:
+            llm_best_match = None
+            llm_best_conf = 0
+            for i in file_matched_candidates:
+                defect = planted[i]
+                result = _semantic_match_llm(finding, defect, semantic_prompt, agent, model)
+                if result["is_same_issue"]:
+                    conf = {"high": 3, "medium": 2, "low": 1}.get(result["confidence"], 0)
+                    if conf > llm_best_conf:
+                        llm_best_conf = conf
+                        llm_best_match = i
+
+            if llm_best_match is not None:
+                matched.add(llm_best_match)
+                true_positives.append({
+                    "finding": finding,
+                    "matched_defect_id": planted[llm_best_match]["id"],
+                    "match_method": "semantic_llm",
+                    "confidence": ["low", "low", "medium", "high"][llm_best_conf],
+                })
+                continue
+
+        for i in file_matched_candidates:
+            defect = planted[i]
             score = _keyword_overlap(agent_desc, f"{defect.get('title', '')} {defect.get('description', '')} {defect.get('root_cause', '')}")
             if score > best_score:
                 best_score = score
@@ -592,7 +651,12 @@ def score_c4(planted: list[dict], findings: list[dict]) -> dict:
 
         if best_match is not None and best_score >= 0.25:
             matched.add(best_match)
-            true_positives.append({"finding": finding, "matched_defect_id": planted[best_match]["id"], "confidence": round(best_score, 3)})
+            true_positives.append({
+                "finding": finding,
+                "matched_defect_id": planted[best_match]["id"],
+                "match_method": "keyword_overlap",
+                "confidence": round(best_score, 3),
+            })
         else:
             false_positives.append(finding)
 
@@ -603,10 +667,13 @@ def score_c4(planted: list[dict], findings: list[dict]) -> dict:
     return {
         "recall": round(recall, 3),
         "precision": round(precision, 3),
+        "D1": {"score": _score_c4_d1(recall)},
+        "D2": {"score": _score_c4_d2(precision)},
         "detected": len(matched),
         "total_planted": total,
         "true_positives": len(true_positives),
         "false_positives": len(false_positives),
+        "match_method": "semantic_llm" if use_llm else "keyword_overlap",
         "undetected": [planted[i]["id"] for i in range(total) if i not in matched],
     }
 
@@ -622,6 +689,60 @@ def _keyword_overlap(text_a: str, text_b: str) -> float:
     if not words_b:
         return 0.0
     return sum(1 for w in words_b if w in text_a.lower()) / len(words_b)
+
+
+def _semantic_match_llm(finding: dict, defect: dict, prompt_template: str,
+                        agent: str, model: str) -> dict:
+    """Call LLM to determine if a finding and planted defect describe the same issue."""
+    filled = prompt_template
+    replacements = {
+        "planted_file": defect.get("file", ""),
+        "planted_lines": defect.get("line_range_in_diff", ""),
+        "planted_category": defect.get("category", ""),
+        "planted_description": f"{defect.get('title', '')}. {defect.get('description', '')}",
+        "agent_file": finding.get("file", ""),
+        "agent_lines": str(finding.get("line_range", finding.get("line", ""))),
+        "agent_category": finding.get("category", ""),
+        "agent_description": f"{finding.get('title', '')}. {finding.get('description', '')}",
+    }
+    for key, val in replacements.items():
+        filled = filled.replace("{" + key + "}", str(val))
+
+    if agent == "agy":
+        cmd = ["agy", "--input-format", "text", "--model", model,
+               "--output-format", "json", "--dangerously-skip-permissions",
+               "--print-timeout", "2m"]
+    elif agent == "claude":
+        cmd = ["claude", "--print", "-", "--model", model,
+               "--output-format", "json", "--dangerously-skip-permissions"]
+    else:
+        return {"is_same_issue": False, "confidence": "low", "reasoning": "unknown agent"}
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, input=filled, timeout=120,
+            env={**os.environ, "AGY_ADC_AUTH": "true"},
+        )
+        response_text = result.stdout
+        try:
+            data = json.loads(response_text)
+            response_text = data.get("response", response_text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        import re
+        m = re.search(r'\{[\s\S]*"is_same_issue"[\s\S]*\}', response_text)
+        if m:
+            parsed = json.loads(m.group())
+            return {
+                "is_same_issue": bool(parsed.get("is_same_issue", False)),
+                "confidence": parsed.get("confidence", "low"),
+                "reasoning": parsed.get("reasoning", ""),
+            }
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+        print(f"    Semantic match LLM error: {e}")
+
+    return {"is_same_issue": False, "confidence": "low", "reasoning": "LLM call failed"}
 
 
 # ── C5a: Test Generation ─────────────────────────────────────────────────
@@ -653,6 +774,22 @@ def build_prompt_c5a(entry: dict, work_dir: Path) -> str:
         f"5. Each test should be independent and self-contained\n\n"
         f"Write the test file directly."
     )
+
+
+def _score_c5a_d1(pass_count: int, test_count: int, gold_test_count: int) -> int:
+    """D1 Coverage (30 pts): tier score from test pass rate and count."""
+    if test_count == 0:
+        return 6
+    pass_rate = pass_count / test_count
+    if pass_rate == 1.0 and test_count >= gold_test_count and gold_test_count > 0:
+        return 30
+    if pass_rate == 1.0:
+        return 24
+    if pass_rate >= 0.8:
+        return 18
+    if pass_rate >= 0.5:
+        return 12
+    return 6
 
 
 def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
@@ -700,11 +837,14 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
                     test_count += 1
             print(f"  Tests: {pass_count}/{test_count} passed")
 
-        gold_test_count = entry.get("evaluation_config", {}).get("min_test_count", 0)
+        gold_test_count = entry.get("gold_standard_tests", {}).get("test_count", 0)
 
         test_code = ""
         if test_file.exists():
             test_code = test_file.read_text()
+
+        d1_score = _score_c5a_d1(pass_count, test_count, gold_test_count)
+        print(f"  D1 (Coverage): {d1_score}/30")
 
         result = {
             "instance_id": instance_id,
@@ -721,6 +861,7 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
                 "tests_passed": pass_count,
                 "gold_test_count": gold_test_count,
                 "pass_rate": round(pass_count / test_count, 3) if test_count > 0 else 0,
+                "D1": {"score": d1_score},
             },
         }
 
@@ -733,7 +874,7 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
             },
             judge_dims_only=True)
         if judge_result.get("judge_prompt"):
-            print(f"  Running LLM-as-judge for test quality (D2-D4)...")
+            print(f"  Running LLM-as-judge for test quality (D2-D5)...")
             judge_scores = run_judge_scoring(judge_result["judge_prompt"], agent, model)
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
@@ -750,6 +891,48 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
 
 # ── C5b: Debugging ───────────────────────────────────────────────────────
+
+def _score_c5b_d2(f2p_passed: int, f2p_total: int, p2p_passed: int, p2p_total: int) -> int:
+    """D2 Fix Correctness (35 pts): tier score from test results."""
+    if f2p_total == 0:
+        return 7
+    if f2p_passed == f2p_total and p2p_passed == p2p_total:
+        return 35
+    if f2p_passed == f2p_total and p2p_total > 0 and p2p_passed >= p2p_total - 1:
+        return 28
+    if f2p_passed / f2p_total >= 0.7:
+        return 21
+    if f2p_passed > 0:
+        return 14
+    return 7
+
+
+def _count_change_lines(patch: str) -> int:
+    """Count added/removed lines in a diff, excluding diff metadata."""
+    count = 0
+    for line in patch.splitlines():
+        if (line.startswith('+') or line.startswith('-')) and not line.startswith('+++') and not line.startswith('---'):
+            count += 1
+    return count
+
+
+def _score_c5b_d3(agent_patch: str, gold_fix_diff: str) -> int:
+    """D3 Fix Minimality (15 pts): tier score from patch size vs gold fix."""
+    agent_changes = _count_change_lines(agent_patch)
+    gold_changes = _count_change_lines(gold_fix_diff)
+    if gold_changes == 0:
+        gold_changes = 1
+    ratio = agent_changes / gold_changes
+    if ratio <= 2:
+        return 15
+    if ratio <= 4:
+        return 12
+    if ratio <= 8:
+        return 9
+    if ratio <= 15:
+        return 6
+    return 3
+
 
 def build_prompt_c5b(entry: dict) -> str:
     inp = entry["input"]
@@ -826,6 +1009,15 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
         resolved = f2p_passed == len(f2p) and p2p_passed == len(p2p) if f2p else False
 
+        # D2: Fix Correctness (35 pts) — tier scoring from test results
+        d2_score = _score_c5b_d2(f2p_passed, len(f2p), p2p_passed, len(p2p))
+
+        # D3: Fix Minimality (15 pts) — tier scoring from patch size vs gold fix
+        gold_fix_diff = gold.get("fix_diff", "")
+        d3_score = _score_c5b_d3(agent_patch, gold_fix_diff)
+
+        print(f"  D2 (Fix Correctness): {d2_score}/35 | D3 (Fix Minimality): {d3_score}/15")
+
         agent_response = extract_agent_response(agent_result)
 
         result = {
@@ -843,7 +1035,11 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
                 "f2p_passed": f2p_passed, "f2p_total": len(f2p),
                 "p2p_passed": p2p_passed, "p2p_total": len(p2p),
             },
-            "scores": {"resolved": resolved},
+            "scores": {
+                "resolved": resolved,
+                "D2": {"score": d2_score},
+                "D3": {"score": d3_score},
+            },
         }
 
         rubric = load_rubric("c5b")
@@ -874,6 +1070,36 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
 
 # ── C3: Code Generation (reuse from run_c3.py) ───────────────────────────
+
+def _score_c3_d1(f2p_passed: int, f2p_total: int) -> int:
+    """D1 Functional Correctness (25 pts): tier score from FAIL_TO_PASS results."""
+    if f2p_total == 0:
+        return 0
+    rate = f2p_passed / f2p_total
+    if rate == 1.0:
+        return 25
+    if rate >= 0.8:
+        return 20
+    if rate >= 0.6:
+        return 15
+    if rate >= 0.3:
+        return 10
+    return 0
+
+
+def _score_c3_d2(p2p_passed: int, p2p_total: int) -> int:
+    """D2 Regression Safety (10 pts): tier score from PASS_TO_PASS results."""
+    if p2p_total == 0:
+        return 10
+    rate = p2p_passed / p2p_total
+    if rate == 1.0:
+        return 10
+    if rate >= 0.9:
+        return 7
+    if rate >= 0.7:
+        return 3
+    return 0
+
 
 def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
     instance_id = entry["instance_id"]
@@ -918,7 +1144,7 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
             print(f"  Test patch failed to apply: {result.stderr[:200]}")
             return {
                 "instance_id": instance_id, "error": "test_patch conflict",
-                "scores": {"resolved": False, "D1_functional_correctness": 0, "D2_regression_safety": 0},
+                "scores": {"resolved": False, "D1": {"score": 0}, "D2": {"score": 0}},
             }
 
         f2p = run_tests(work_dir, entry["FAIL_TO_PASS"])
@@ -933,6 +1159,10 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
         print(f"  PASS_TO_PASS: {p2p_passed}/{p2p_total}")
 
         resolved = f2p_passed == f2p_total and p2p_passed == p2p_total
+
+        d1_score = _score_c3_d1(f2p_passed, f2p_total)
+        d2_score = _score_c3_d2(p2p_passed, p2p_total)
+        print(f"  D1 (Functional Correctness): {d1_score}/25 | D2 (Regression Safety): {d2_score}/10")
 
         result = {
             "instance_id": instance_id,
@@ -951,8 +1181,8 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
             },
             "scores": {
                 "resolved": resolved,
-                "D1_functional_correctness": f2p_passed / f2p_total if f2p_total else 0,
-                "D2_regression_safety": p2p_passed / p2p_total if p2p_total else 0,
+                "D1": {"score": d1_score},
+                "D2": {"score": d2_score},
             },
         }
 
