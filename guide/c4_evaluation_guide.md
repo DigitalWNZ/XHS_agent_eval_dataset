@@ -308,11 +308,15 @@ recall = detected / total_planted           # raw ratio
 precision = true_positives / total_findings  # raw ratio
 
 # D1 tier scoring — _score_c4_d1(recall)
-# ≥90% → 25, ≥70% → 20, ≥50% → 15, ≥30% → 10, <30% → 5
+# Tier scores are read from c4_review.json rubric via _get_tiers("c4", "D1")
+# Thresholds: ≥90% → tier[0], ≥70% → tier[1], ≥50% → tier[2], ≥30% → tier[3], <30% → tier[4]
 
 # D2 tier scoring — _score_c4_d2(precision)
-# ≥80% → 25, ≥60% → 20, ≥40% → 15, ≥20% → 10, <20% → 5
+# Tier scores are read from c4_review.json rubric via _get_tiers("c4", "D2")
+# Thresholds: ≥80% → tier[0], ≥60% → tier[1], ≥40% → tier[2], ≥20% → tier[3], <20% → tier[4]
 ```
+
+**Single source of truth:** All tier scores (both automated and judge-scored) are defined in `evaluation/rubrics/c4_review.json`. Automated scoring functions read tier values via `_get_tiers()`. Judge-returned scores are validated and snapped to the nearest valid rubric tier via `validate_judge_scores()`.
 
 **Example — C4-01 with 3 planted defects:**
 
@@ -624,7 +628,7 @@ Respond in JSON:
 | `{code_diff}` | `entry["input"]["bugged_diff"]` | The full PR diff the agent reviewed |
 | `{agent_findings}` | `json.dumps(findings)` | The agent's review findings (parsed JSON array) |
 | `{planted_defects}` | `json.dumps(planted)` | The ground truth defects with full metadata |
-| `{calibration_persona}` | `rubric["calibration_persona"]` | Grading instructions (same as C3's — no specific role assumed) |
+| `{calibration_persona}` | `rubric["calibration_persona"]` | Senior software engineer grading persona — avoid leniency for vague findings, avoid paranoia for minor localization imprecision |
 | `{dimensions_text}` | Formatted from D3, D4, D5 (`judge_dims_only=True` filters out D1, D2 which have `method="automated"`) | Tier tables for the 3 LLM-judged dimensions |
 
 ---

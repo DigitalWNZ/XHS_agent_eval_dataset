@@ -2,7 +2,7 @@
 
 ## Overview
 
-C3 tests whether a coding agent can take a **technical specification** and produce **working, production-quality code** within an existing codebase. It is the most heavily weighted category in the benchmark (30% of the composite score) and uses a **hybrid evaluation**: automated test execution (D1–D2) + LLM-as-Judge code quality review (D3–D7).
+C3 tests whether a coding agent can take a **technical specification** and produce **working, production-quality code** within an existing codebase. It is the most heavily weighted category in the benchmark (30% of the composite score) and uses a **hybrid evaluation**: automated test execution (D1–D2, 70%) + LLM-as-Judge code quality review (D3–D7, 30%).
 
 C3 follows the **SWE-bench** evaluation pattern:
 1. Set up a clean worktree at a known commit
@@ -327,8 +327,8 @@ If the agent names the field `budget_remaining` instead of `remaining_budget`, t
 
 | List | Purpose | Contains | Scoring |
 |------|---------|----------|---------|
-| `FAIL_TO_PASS` | Does the agent's code implement the feature correctly? | Tests from the test_patch (tests that don't exist before the agent runs) | D1: 25 × (passed / total) |
-| `PASS_TO_PASS` | Did the agent break any existing functionality? | Tests that already exist in the repo at base_commit | D2: 10 × (passed / total) |
+| `FAIL_TO_PASS` | Does the agent's code implement the feature correctly? | Tests from the test_patch (tests that don't exist before the agent runs) | D1: tier-based (max 50) |
+| `PASS_TO_PASS` | Did the agent break any existing functionality? | Tests that already exist in the repo at base_commit | D2: tier-based (max 20) |
 
 **Resolved = ALL FAIL_TO_PASS pass AND ALL PASS_TO_PASS pass.** Missing even 1 test means the entry is NOT resolved.
 
@@ -451,14 +451,18 @@ C3 is unique in using **both** automated testing and LLM judging:
 ### Automated Scoring (D1–D2)
 
 ```python
-# D1: Functional Correctness (25 pts) — _score_c3_d1()
+# D1: Functional Correctness (50 pts) — _score_c3_d1()
+# Tier scores are read from c3_codegen.json rubric via _get_tiers("c3", "D1")
 rate = f2p_passed / f2p_total
-# 100% → 25, ≥80% → 20, ≥60% → 15, ≥30% → 10, <30% → 0
+# 100% → tier[0], ≥80% → tier[1], ≥60% → tier[2], ≥30% → tier[3], <30% → tier[4]
 
-# D2: Regression Safety (10 pts) — _score_c3_d2()
+# D2: Regression Safety (20 pts) — _score_c3_d2()
+# Tier scores are read from c3_codegen.json rubric via _get_tiers("c3", "D2")
 rate = p2p_passed / p2p_total
-# 100% → 10, ≥90% → 7, ≥70% → 3, <70% → 0
+# 100% → tier[0], ≥90% → tier[1], ≥70% → tier[2], <70% → tier[3]
 ```
+
+**Single source of truth:** All tier scores (both automated and judge-scored) are defined in `evaluation/rubrics/c3_codegen.json`. Automated scoring functions read tier values via `_get_tiers()`. Judge-returned scores for D3–D7 are validated and snapped to the nearest valid rubric tier via `validate_judge_scores()`.
 
 ### Gatekeeper Rules
 
@@ -467,7 +471,7 @@ The rubric defines gatekeeper rules for score capping:
 | Condition | Effect |
 |-----------|--------|
 | D1 scores 0 (zero F2P tests pass) | Overall capped at 20 regardless of other dimensions |
-| D2 scores 0 (zero P2P tests pass) | Overall capped at 30 |
+| D2 scores 0 (zero P2P tests pass) | Overall capped at 20 |
 
 > **Note:** These gatekeeper rules are defined in the rubric (`score_synthesis.gatekeeper_rules`) but are **not yet enforced** in the current `run_c3()` code. The harness stores D1/D2 tier scores and judge scores independently; capping must be applied during score aggregation.
 
@@ -525,14 +529,14 @@ dimensions only:
 
 ### `dimensions` Array — All 7 Dimensions
 
-#### D1: Functional Correctness / FAIL_TO_PASS (新功能正确性) — 25 points
+#### D1: Functional Correctness / FAIL_TO_PASS (新功能正确性) — 50 points
 
 | Score | Criteria |
 |-------|----------|
-| **25** | 100% of FAIL_TO_PASS tests pass. |
-| **20** | 80-99% of FAIL_TO_PASS tests pass. Core feature works, minor edge cases missed. |
-| **15** | 60-79% of FAIL_TO_PASS tests pass. Main flow works but significant gaps. |
-| **10** | 30-59% of FAIL_TO_PASS tests pass. Partial implementation. |
+| **50** | 100% of FAIL_TO_PASS tests pass. |
+| **40** | 80-99% of FAIL_TO_PASS tests pass. Core feature works, minor edge cases missed. |
+| **30** | 60-79% of FAIL_TO_PASS tests pass. Main flow works but significant gaps. |
+| **20** | 30-59% of FAIL_TO_PASS tests pass. Partial implementation. |
 | **0** | < 30% of FAIL_TO_PASS tests pass, or code doesn't parse. |
 
 - **Method:** `automated`
@@ -540,13 +544,13 @@ dimensions only:
 
 D1 is the primary gating dimension. The rubric defines a gatekeeper rule: D1=0 → overall capped at 20 (not yet enforced in code).
 
-#### D2: Regression Safety / PASS_TO_PASS (回归安全性) — 10 points
+#### D2: Regression Safety / PASS_TO_PASS (回归安全性) — 20 points
 
 | Score | Criteria |
 |-------|----------|
-| **10** | 100% of PASS_TO_PASS tests still pass. Zero regressions. |
-| **7** | 90-99% of PASS_TO_PASS tests pass. 1-2 minor regressions. |
-| **3** | 70-89% of PASS_TO_PASS tests pass. Several regressions. |
+| **20** | 100% of PASS_TO_PASS tests still pass. Zero regressions. |
+| **14** | 90-99% of PASS_TO_PASS tests pass. 1-2 minor regressions. |
+| **6** | 70-89% of PASS_TO_PASS tests pass. Several regressions. |
 | **0** | < 70% of PASS_TO_PASS tests pass. Agent broke existing functionality. |
 
 - **Method:** `automated`
@@ -554,73 +558,73 @@ D1 is the primary gating dimension. The rubric defines a gatekeeper rule: D1=0 �
 
 D2 catches agents that implement the new feature by accidentally breaking existing modules — e.g., modifying a shared base class, breaking imports, or altering database schema in ways that break existing queries.
 
-#### D3: Readability (可读性) — 15 points
+#### D3: Readability (可读性) — 7 points
 
 | Score | Criteria |
 |-------|----------|
-| **15** | Intent-revealing naming that reads like natural language. Consistent formatting matching existing codebase. Docstrings on all public interfaces. Complex logic has inline comments. |
-| **12** | Highly readable, consistent formatting, clear naming. Minor gaps in documentation of non-obvious logic. |
-| **9** | Mostly readable but some cryptic names (temp, data1, v), or complex algorithms lack inline comments. |
-| **6** | Inconsistent naming/casing, large undocumented blocks, confusing layout. |
-| **3** | Completely cryptic naming throughout, no comments, messy indentation. |
+| **7** | Intent-revealing naming that reads like natural language. Consistent formatting matching existing codebase. Docstrings on all public interfaces. Complex logic has inline comments. |
+| **5** | Highly readable, consistent formatting, clear naming. Minor gaps in documentation of non-obvious logic. |
+| **4** | Mostly readable but some cryptic names (temp, data1, v), or complex algorithms lack inline comments. |
+| **2** | Inconsistent naming/casing, large undocumented blocks, confusing layout. |
+| **1** | Completely cryptic naming throughout, no comments, messy indentation. |
 
 - **Method:** `llm_as_judge`
-- **Hard cap:** Agent uses single-letter variable names in business logic (not loop counters) → `D3 <= 9`
+- **Hard cap:** Agent uses single-letter variable names in business logic (not loop counters) → `D3 <= 4`
 
-#### D4: Maintainability (可维护性) — 15 points
-
-| Score | Criteria |
-|-------|----------|
-| **15** | Flawless separation of concerns. Single-responsibility functions (mostly < 20 lines). Clean dependency injection. Loose coupling. Zero copy-pasted logic. |
-| **12** | Strong modularity, clear layer boundaries, short functions (mostly < 30 lines), mockable dependencies. |
-| **9** | Standard structure but some implementation details leak across layers; a few functions are monolithic or contain duplicate logic blocks. |
-| **6** | Monolithic functions (> 80 lines), high cyclomatic complexity (> 15), deep nesting (4+), or systemic copy-pasted code. |
-| **3** | Extreme debt: gigantic functions (> 150 lines), God Classes, global mutable state, tight coupling. |
-
-- **Method:** `llm_as_judge`
-- **Hard caps:**
-  - Any single new file exceeds 500 lines → `D4 <= 9`
-  - A single function exceeds 100 lines → `D4 <= 6`
-  - Business logic placed directly in API route handlers (bypassing service layer) → `D4 <= 9`
-
-#### D5: Robustness (健壮性) — 15 points
+#### D4: Maintainability (可维护性) — 7 points
 
 | Score | Criteria |
 |-------|----------|
-| **15** | Defensive programming throughout. Specific exceptions handled. Safe resource management. No magic constants. Input validation at boundaries. Concurrent safety where applicable. |
-| **12** | Strong defensive coding. Specific exceptions handled. Clean resource lifetimes. Minor magic constants (< 2). |
-| **9** | Errors handled but generic catch-all blocks common. Some magic constants. Missing validation on 1-2 edge cases. |
-| **6** | Silent error swallowing. Manual resource management with leak risks. Bare except: pass in business logic. |
-| **3** | Silently swallowed exceptions in critical paths. No input validation. Hardcoded credentials. |
+| **7** | Flawless separation of concerns. Single-responsibility functions (mostly < 20 lines). Clean dependency injection. Loose coupling. Zero copy-pasted logic. |
+| **5** | Strong modularity, clear layer boundaries, short functions (mostly < 30 lines), mockable dependencies. |
+| **4** | Standard structure but some implementation details leak across layers; a few functions are monolithic or contain duplicate logic blocks. |
+| **2** | Monolithic functions (> 80 lines), high cyclomatic complexity (> 15), deep nesting (4+), or systemic copy-pasted code. |
+| **1** | Extreme debt: gigantic functions (> 150 lines), God Classes, global mutable state, tight coupling. |
 
 - **Method:** `llm_as_judge`
 - **Hard caps:**
-  - Bare `except:` or `except Exception: pass` in business logic → `D5 <= 9`
-  - Errors in payment/settlement/data-mutation paths silently swallowed → `D5 <= 6`
-  - Hardcoded secrets/credentials introduced → `D5 <= 3`
+  - Any single new file exceeds 500 lines → `D4 <= 4`
+  - A single function exceeds 100 lines → `D4 <= 2`
+  - Business logic placed directly in API route handlers (bypassing service layer) → `D4 <= 4`
 
-#### D6: Convention Adherence (规范遵循) — 10 points
+#### D5: Robustness (健壮性) — 7 points
 
 | Score | Criteria |
 |-------|----------|
-| **10** | Follows all established repo patterns: repository pattern, service layer, Pydantic schemas, consistent naming (snake_case), proper file placement, imports organized per existing style. New code is indistinguishable from existing code. |
-| **8** | Follows most patterns. 1-2 minor deviations. |
-| **6** | Follows general structure but notable deviations: putting business logic in API layer, or skipping repository pattern. |
-| **4** | Partially follows conventions. Mix of patterns used inconsistently. |
-| **2** | Ignores repo conventions entirely. Code works but doesn't fit the codebase. |
+| **7** | Defensive programming throughout. Specific exceptions handled. Safe resource management. No magic constants. Input validation at boundaries. Concurrent safety where applicable. |
+| **5** | Strong defensive coding. Specific exceptions handled. Clean resource lifetimes. Minor magic constants (< 2). |
+| **4** | Errors handled but generic catch-all blocks common. Some magic constants. Missing validation on 1-2 edge cases. |
+| **2** | Silent error swallowing. Manual resource management with leak risks. Bare except: pass in business logic. |
+| **1** | Silently swallowed exceptions in critical paths. No input validation. Hardcoded credentials. |
 
 - **Method:** `llm_as_judge`
-- **Hard cap:** Agent skips the repository pattern entirely (direct DB queries in service or API layer) → `D6 <= 6`
+- **Hard caps:**
+  - Bare `except:` or `except Exception: pass` in business logic → `D5 <= 4`
+  - Errors in payment/settlement/data-mutation paths silently swallowed → `D5 <= 2`
+  - Hardcoded secrets/credentials introduced → `D5 <= 1`
 
-#### D7: Change Minimality (变更最小化) — 10 points
+#### D6: Convention Adherence (规范遵循) — 5 points
 
 | Score | Criteria |
 |-------|----------|
-| **10** | Changes are minimal and focused. Only touches files necessary for the task. No unnecessary refactoring, no unrelated changes, no dead code introduced. |
-| **8** | Mostly minimal. 1-2 minor unnecessary changes. |
-| **6** | Some unnecessary changes: touching files that didn't need modification, or adding unused imports/utilities. |
-| **4** | Significant unnecessary changes: refactoring unrelated code, adding helper functions never called. |
-| **2** | Massive unnecessary changes that obscure the actual feature implementation. |
+| **5** | Follows all established repo patterns: repository pattern, service layer, Pydantic schemas, consistent naming (snake_case), proper file placement, imports organized per existing style. New code is indistinguishable from existing code. |
+| **4** | Follows most patterns. 1-2 minor deviations. |
+| **3** | Follows general structure but notable deviations: putting business logic in API layer, or skipping repository pattern. |
+| **2** | Partially follows conventions. Mix of patterns used inconsistently. |
+| **1** | Ignores repo conventions entirely. Code works but doesn't fit the codebase. |
+
+- **Method:** `llm_as_judge`
+- **Hard cap:** Agent skips the repository pattern entirely (direct DB queries in service or API layer) → `D6 <= 3`
+
+#### D7: Change Minimality (变更最小化) — 4 points
+
+| Score | Criteria |
+|-------|----------|
+| **4** | Changes are minimal and focused. Only touches files necessary for the task. No unnecessary refactoring, no unrelated changes, no dead code introduced. |
+| **3** | Mostly minimal. 1-2 minor unnecessary changes. |
+| **2** | Some unnecessary changes: touching files that didn't need modification, or adding unused imports/utilities. |
+| **1** | Significant unnecessary changes: refactoring unrelated code, adding helper functions never called. |
+| **0** | Massive unnecessary changes that obscure the actual feature implementation. |
 
 - **Method:** `llm_as_judge`
 
@@ -637,7 +641,7 @@ D2 catches agents that implement the new feature by accidentally breaking existi
     },
     {
       "condition": "D2 (PASS_TO_PASS) scores 0",
-      "effect": "Overall capped at 30"
+      "effect": "Overall capped at 20"
     }
   ],
   "formula": "Sum of all 7 dimension scores (max 100). D1+D2 anchor the score while D3-D7 differentiate within the functional tier."
@@ -651,14 +655,16 @@ The gatekeeper rules define the intended priority: **correctness first, quality 
 ### `calibration_persona`
 
 ```
-"Grade based on the severity, frequency, and systemic nature of issues.
-Avoid leniency bias (being too generous or easily impressed by boilerplate
-scaffolding) AND paranoia (being overly punitive for isolated minor issues).
-An isolated infraction in an otherwise strong codebase should not drop a
+"You are a senior software engineer reviewing a pull request for a production
+FastAPI service. Grade based on the severity, frequency, and systemic nature
+of code quality issues. Avoid leniency bias (being too generous or easily
+impressed by boilerplate scaffolding that looks professional but lacks
+substance) AND paranoia (being overly punitive for isolated minor issues in
+an otherwise strong codebase). An isolated infraction should not drop a
 dimension score by more than one tier."
 ```
 
-**Key difference from C1/C2:** The C3 calibration persona is shorter and more focused. It doesn't adopt a specific role ("senior staff engineer") — it just gives grading instructions. This is because C3 is primarily scored by automated tests; the judge only handles D3-D7 (code quality), which is a narrower evaluation.
+**Consistent with other categories:** The C3 calibration persona adopts a senior SWE role reviewing production code, matching the pattern used across C1-C5b. The judge only handles D3-D7 (code quality) since D1-D2 are scored by automated tests.
 
 ---
 
@@ -734,12 +740,12 @@ Respond in JSON:
     {"rule": "Agent skips repository pattern entirely", "triggered": false},
     {"rule": "Single-letter variable names in business logic", "triggered": false}
   ],
-  "D3": {"score": 12, "justification": "Clear naming throughout. CampaignService methods are self-documenting. Missing docstrings on repository methods."},
-  "D4": {"score": 15, "justification": "Clean separation: Model → Repo → Service → Router. All functions under 30 lines. No copy-pasted logic."},
-  "D5": {"score": 12, "justification": "Custom exceptions used consistently (NotFoundError, ForbiddenError, ValidationError). Minor: no validation for empty rejection_reason string."},
-  "D6": {"score": 10, "justification": "Follows User module patterns exactly: same file structure, naming, dependency wiring, Pydantic schema style."},
-  "D7": {"score": 8, "justification": "Mostly minimal. Added an unused marketplace endpoint not in the spec."},
-  "total_score": 57,
+  "D3": {"score": 5, "justification": "Clear naming throughout. CampaignService methods are self-documenting. Missing docstrings on repository methods."},
+  "D4": {"score": 7, "justification": "Clean separation: Model → Repo → Service → Router. All functions under 30 lines. No copy-pasted logic."},
+  "D5": {"score": 5, "justification": "Custom exceptions used consistently (NotFoundError, ForbiddenError, ValidationError). Minor: no validation for empty rejection_reason string."},
+  "D6": {"score": 5, "justification": "Follows User module patterns exactly: same file structure, naming, dependency wiring, Pydantic schema style."},
+  "D7": {"score": 3, "justification": "Mostly minimal. Added an unused marketplace endpoint not in the spec."},
+  "total_score": 25,
   "overall_assessment": "Strong code quality with clean architecture matching existing patterns. Minor gaps in documentation and an unnecessary marketplace endpoint."
 }
 ```
@@ -781,8 +787,8 @@ HumanEval tests isolated function generation (write `is_palindrome`). Real engin
 ### Why 7 dimensions instead of just "tests pass/fail"?
 Two agents can both pass all tests with very different code quality. One writes clean, maintainable code following patterns. Another writes a 300-line god function with bare except blocks. D3-D7 differentiate between them.
 
-### Why is D1 (Functional Correctness) only 25/100?
-Because "does it work" is a binary gate, not a spectrum. Either the agent passes the tests or it doesn't. The rubric defines gatekeeper rules (D1=0 → overall ≤ 20) to enforce this priority (not yet applied in current code — intended for score aggregation). The remaining 75 points measure HOW it works — code quality is the differentiator between agents that all pass the tests.
+### Why is D1 (Functional Correctness) 50/100?
+Functional correctness is the most important dimension — code that doesn't work has no value regardless of quality. The 50-point weight (combined with D2's 20 points = 70% automated) ensures that test results dominate the score. The remaining 30 points (D3-D7) differentiate code quality among agents that pass the tests. Gatekeeper rules (D1=0 → overall ≤ 20) further enforce correctness-first priority.
 
 ### Why test_patch and not pre-existing tests?
 If tests existed in the repo, the agent could read them. SWE-bench's insight: hidden tests force the agent to implement from the SPEC, not reverse-engineer from tests. This measures specification comprehension, not test-driven development.

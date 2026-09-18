@@ -247,9 +247,9 @@ Score the agent's output on each of the following 5 dimensions.
 Respond in JSON: { dimension_1: {score, justification}, ... }
 ```
 
-### Step 2–3: Submit and Parse
+### Step 2–3: Submit, Parse, and Validate
 
-Identical to C1. The judge prompt goes to the same agent/model, returns structured JSON with per-dimension scores and justifications, and the harness extracts the total (max 100).
+Identical to C1. The judge prompt goes to the same agent/model, returns structured JSON with per-dimension scores and justifications. The harness then validates scores via `validate_judge_scores()` — each score is snapped to the nearest valid rubric tier defined in `evaluation/rubrics/c2_design.json` (e.g., if the judge returns D2=18, it snaps to 16). The validated scores are summed for the total (max 100).
 
 ---
 
@@ -587,8 +587,8 @@ The judge returns the same JSON structure as C1:
 │ 6. JUDGE: Send judge prompt to same agent/model                 │
 │    Judge returns JSON: {D1: {score, justification}, ...}        │
 │                                                                 │
-│ 7. SCORE: Parse JSON, extract D1-D5 scores, sum total           │
-│    Store in results file with metadata                          │
+│ 7. SCORE: Parse JSON, validate via validate_judge_scores()       │
+│    (snap to nearest rubric tier), sum total, store results      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

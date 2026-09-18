@@ -79,6 +79,53 @@ def get_rubric_suffix(category: str) -> str:
     }[category]
 
 
+# ── Rubric Tier Loading ───────────────────────────────────────────────────
+
+_rubric_cache: dict[str, dict] = {}
+
+def _get_rubric(category: str) -> dict:
+    if category not in _rubric_cache:
+        _rubric_cache[category] = load_rubric(category)
+    return _rubric_cache[category]
+
+def _get_tiers(category: str, dim_id: str) -> list[int]:
+    """Return tier scores for a dimension, ordered highest to lowest."""
+    rubric = _get_rubric(category)
+    for d in rubric.get("dimensions", []):
+        if d["id"] == dim_id:
+            return [t["score"] for t in d["tiers"]]
+    raise ValueError(f"Dimension {dim_id} not found in {category} rubric")
+
+
+def _snap_to_tier(score: int, tiers: list[int]) -> int:
+    """Snap a score to the nearest valid tier value."""
+    return min(tiers, key=lambda t: abs(t - score))
+
+
+def validate_judge_scores(parsed_scores: dict, category: str) -> dict:
+    """Validate and snap judge-returned scores to valid rubric tier values."""
+    if not parsed_scores:
+        return parsed_scores
+    rubric = _get_rubric(category)
+    dim_map = {d["id"]: d for d in rubric.get("dimensions", [])}
+
+    for key in list(parsed_scores.keys()):
+        if not isinstance(parsed_scores[key], dict) or "score" not in parsed_scores[key]:
+            continue
+        dim_id = key
+        if dim_id.startswith("dimension_"):
+            dim_id = f"D{key.split('_')[1]}"
+        if dim_id not in dim_map:
+            continue
+        tiers = [t["score"] for t in dim_map[dim_id]["tiers"]]
+        raw = parsed_scores[key]["score"]
+        snapped = _snap_to_tier(raw, tiers)
+        if raw != snapped:
+            parsed_scores[key]["score"] = snapped
+            parsed_scores[key]["pre_snap_score"] = raw
+    return parsed_scores
+
+
 # ── Agent Invocation ──────────────────────────────────────────────────────
 
 def invoke_agent(
@@ -325,7 +372,8 @@ def run_c1_c2(entry: dict, category: str, agent: str, model: str, timeout: int) 
             judge_scores = run_judge_scoring(judge_result["judge_prompt"], agent, model, timeout_minutes=5)
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
-            result["scores"] = judge_scores.get("parsed_scores") or {"note": "Judge response could not be parsed as JSON"}
+            parsed = judge_scores.get("parsed_scores")
+            result["scores"] = validate_judge_scores(parsed, category) if parsed else {"note": "Judge response could not be parsed as JSON"}
             print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
         else:
             result["scores"] = {"error": "No judge prompt template available"}
@@ -508,7 +556,7 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
         rubric = load_rubric("c4")
         scores = score_c4(planted, findings, rubric=rubric, agent=agent, model=model)
-        print(f"  Recall: {scores['recall']:.0%} (D1: {scores['D1']['score']}/25) | Precision: {scores['precision']:.0%} (D2: {scores['D2']['score']}/25) | Match: {scores['match_method']}")
+        print(f"  Recall: {scores['recall']:.0%} (D1: {scores['D1']['score']}/{_get_tiers('c4', 'D1')[0]}) | Precision: {scores['precision']:.0%} (D2: {scores['D2']['score']}/{_get_tiers('c4', 'D2')[0]}) | Match: {scores['match_method']}")
 
         result = {
             "instance_id": instance_id,
@@ -537,7 +585,7 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
-                result["scores"].update(judge_scores["parsed_scores"])
+                result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c4"))
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -569,29 +617,31 @@ def parse_findings(response: str) -> list[dict]:
 
 
 def _score_c4_d1(recall: float) -> int:
-    """D1 Detection Recall (25 pts): tier score from recall ratio."""
+    """D1 Detection Recall: tier score from recall ratio."""
+    t = _get_tiers("c4", "D1")
     if recall >= 0.9:
-        return 25
+        return t[0]
     if recall >= 0.7:
-        return 20
+        return t[1]
     if recall >= 0.5:
-        return 15
+        return t[2]
     if recall >= 0.3:
-        return 10
-    return 5
+        return t[3]
+    return t[4]
 
 
 def _score_c4_d2(precision: float) -> int:
-    """D2 Detection Precision (25 pts): tier score from precision ratio."""
+    """D2 Detection Precision: tier score from precision ratio."""
+    t = _get_tiers("c4", "D2")
     if precision >= 0.8:
-        return 25
+        return t[0]
     if precision >= 0.6:
-        return 20
+        return t[1]
     if precision >= 0.4:
-        return 15
+        return t[2]
     if precision >= 0.2:
-        return 10
-    return 5
+        return t[3]
+    return t[4]
 
 
 def score_c4(planted: list[dict], findings: list[dict],
@@ -777,19 +827,20 @@ def build_prompt_c5a(entry: dict, work_dir: Path) -> str:
 
 
 def _score_c5a_d1(pass_count: int, test_count: int, gold_test_count: int) -> int:
-    """D1 Coverage (30 pts): tier score from test pass rate and count."""
+    """D1 Coverage: tier score from test pass rate and count."""
+    t = _get_tiers("c5a", "D1")
     if test_count == 0:
-        return 6
+        return t[4]
     pass_rate = pass_count / test_count
     if pass_rate == 1.0 and test_count >= gold_test_count and gold_test_count > 0:
-        return 30
+        return t[0]
     if pass_rate == 1.0:
-        return 24
+        return t[1]
     if pass_rate >= 0.8:
-        return 18
+        return t[2]
     if pass_rate >= 0.5:
-        return 12
-    return 6
+        return t[3]
+    return t[4]
 
 
 def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
@@ -844,7 +895,7 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
             test_code = test_file.read_text()
 
         d1_score = _score_c5a_d1(pass_count, test_count, gold_test_count)
-        print(f"  D1 (Coverage): {d1_score}/30")
+        print(f"  D1 (Coverage): {d1_score}/{_get_tiers('c5a', 'D1')[0]}")
 
         result = {
             "instance_id": instance_id,
@@ -879,7 +930,7 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
-                result["scores"].update(judge_scores["parsed_scores"])
+                result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c5a"))
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -893,18 +944,19 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
 # ── C5b: Debugging ───────────────────────────────────────────────────────
 
 def _score_c5b_d2(f2p_passed: int, f2p_total: int, p2p_passed: int, p2p_total: int) -> int:
-    """D2 Fix Correctness (35 pts): tier score from test results."""
+    """D2 Fix Correctness: tier score from test results."""
+    t = _get_tiers("c5b", "D2")
     if f2p_total == 0:
-        return 7
+        return t[4]
     if f2p_passed == f2p_total and p2p_passed == p2p_total:
-        return 35
+        return t[0]
     if f2p_passed == f2p_total and p2p_total > 0 and p2p_passed >= p2p_total - 1:
-        return 28
+        return t[1]
     if f2p_passed / f2p_total >= 0.7:
-        return 21
+        return t[2]
     if f2p_passed > 0:
-        return 14
-    return 7
+        return t[3]
+    return t[4]
 
 
 def _count_change_lines(patch: str) -> int:
@@ -917,21 +969,22 @@ def _count_change_lines(patch: str) -> int:
 
 
 def _score_c5b_d3(agent_patch: str, gold_fix_diff: str) -> int:
-    """D3 Fix Minimality (15 pts): tier score from patch size vs gold fix."""
+    """D3 Fix Minimality: tier score from patch size vs gold fix."""
+    t = _get_tiers("c5b", "D3")
     agent_changes = _count_change_lines(agent_patch)
     gold_changes = _count_change_lines(gold_fix_diff)
     if gold_changes == 0:
         gold_changes = 1
     ratio = agent_changes / gold_changes
     if ratio <= 2:
-        return 15
+        return t[0]
     if ratio <= 4:
-        return 12
+        return t[1]
     if ratio <= 8:
-        return 9
+        return t[2]
     if ratio <= 15:
-        return 6
-    return 3
+        return t[3]
+    return t[4]
 
 
 def build_prompt_c5b(entry: dict) -> str:
@@ -1016,7 +1069,7 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
         gold_fix_diff = gold.get("fix_diff", "")
         d3_score = _score_c5b_d3(agent_patch, gold_fix_diff)
 
-        print(f"  D2 (Fix Correctness): {d2_score}/35 | D3 (Fix Minimality): {d3_score}/15")
+        print(f"  D2 (Fix Correctness): {d2_score}/{_get_tiers('c5b', 'D2')[0]} | D3 (Fix Minimality): {d3_score}/{_get_tiers('c5b', 'D3')[0]}")
 
         agent_response = extract_agent_response(agent_result)
 
@@ -1058,7 +1111,7 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
-                result["scores"].update(judge_scores["parsed_scores"])
+                result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c5b"))
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -1072,33 +1125,35 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
 # ── C3: Code Generation (reuse from run_c3.py) ───────────────────────────
 
 def _score_c3_d1(f2p_passed: int, f2p_total: int) -> int:
-    """D1 Functional Correctness (25 pts): tier score from FAIL_TO_PASS results."""
+    """D1 Functional Correctness: tier score from FAIL_TO_PASS results."""
+    t = _get_tiers("c3", "D1")
     if f2p_total == 0:
-        return 0
+        return t[4]
     rate = f2p_passed / f2p_total
     if rate == 1.0:
-        return 25
+        return t[0]
     if rate >= 0.8:
-        return 20
+        return t[1]
     if rate >= 0.6:
-        return 15
+        return t[2]
     if rate >= 0.3:
-        return 10
-    return 0
+        return t[3]
+    return t[4]
 
 
 def _score_c3_d2(p2p_passed: int, p2p_total: int) -> int:
-    """D2 Regression Safety (10 pts): tier score from PASS_TO_PASS results."""
+    """D2 Regression Safety: tier score from PASS_TO_PASS results."""
+    t = _get_tiers("c3", "D2")
     if p2p_total == 0:
-        return 10
+        return t[0]
     rate = p2p_passed / p2p_total
     if rate == 1.0:
-        return 10
+        return t[0]
     if rate >= 0.9:
-        return 7
+        return t[1]
     if rate >= 0.7:
-        return 3
-    return 0
+        return t[2]
+    return t[3]
 
 
 def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
@@ -1162,7 +1217,7 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
         d1_score = _score_c3_d1(f2p_passed, f2p_total)
         d2_score = _score_c3_d2(p2p_passed, p2p_total)
-        print(f"  D1 (Functional Correctness): {d1_score}/25 | D2 (Regression Safety): {d2_score}/10")
+        print(f"  D1 (Functional Correctness): {d1_score}/{_get_tiers('c3', 'D1')[0]} | D2 (Regression Safety): {d2_score}/{_get_tiers('c3', 'D2')[0]}")
 
         result = {
             "instance_id": instance_id,
@@ -1199,7 +1254,7 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_raw_response"] = judge_scores.get("raw_response", "")[:2000]
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
-                result["scores"].update(judge_scores["parsed_scores"])
+                result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c3"))
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result

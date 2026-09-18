@@ -258,9 +258,9 @@ agy --input-format text \
 
 The judge returns structured JSON with per-dimension scores and justifications.
 
-### Step 3: Parse Scores
+### Step 3: Parse and Validate Scores
 
-The harness parses the JSON response, extracts scores for D1-D5, sums them for the total (max 100), and stores everything in the results file.
+The harness parses the JSON response, extracts scores for D1-D5, and validates them via `validate_judge_scores()` — each score is snapped to the nearest valid rubric tier (e.g., if the judge returns D1=22, it snaps to 20). This ensures all scores align with the tier values defined in `evaluation/rubrics/c1_requirements.json`. The validated scores are summed for the total (max 100) and stored in the results file.
 
 ---
 
@@ -596,8 +596,8 @@ The harness extracts `total_score` as the final C1 score for this entry (0–100
 │ 6. JUDGE: Send judge prompt to same agent/model                 │
 │    Judge returns JSON: {D1: {score, justification}, ...}        │
 │                                                                 │
-│ 7. SCORE: Parse JSON, extract D1-D5 scores, sum total           │
-│    Store in results file with metadata                          │
+│ 7. SCORE: Parse JSON, validate via validate_judge_scores()       │
+│    (snap to nearest rubric tier), sum total, store results      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

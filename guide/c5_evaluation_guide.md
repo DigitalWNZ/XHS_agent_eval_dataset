@@ -228,74 +228,76 @@ judge_result = build_judge_payload("c5a", rubric, entry, test_code,
 
 ### `dimensions` Array — All 5 Dimensions
 
-#### D1: Coverage (测试覆盖率) — 30 points
+#### D1: Coverage (测试覆盖率) — 50 points
 
 | Score | Criteria |
 |-------|----------|
-| **30** | 100% pass rate AND test count >= gold_test_count. All agent-written tests pass and the suite is comprehensive. |
-| **24** | 100% pass rate but test count < gold_test_count. All tests pass but coverage is incomplete. |
-| **18** | Pass rate >= 80%. Most tests pass, a few failures. |
-| **12** | Pass rate 50-79%. Significant test failures. |
-| **6** | Pass rate < 50%, or no tests written. |
+| **50** | 100% pass rate AND test count >= gold_test_count. All agent-written tests pass and the suite is comprehensive. |
+| **40** | 100% pass rate but test count < gold_test_count. All tests pass but coverage is incomplete. |
+| **30** | Pass rate >= 80%. Most tests pass, a few failures. |
+| **20** | Pass rate 50-79%. Significant test failures. |
+| **10** | Pass rate < 50%, or no tests written. |
 
 - **Method:** `automated` (via `pytest`)
 - **Tool:** pytest
 
-**How it works:** The harness runs `pytest <test_file> -v --tb=short`, counts PASSED vs FAILED/ERROR, and calls `_score_c5a_d1(pass_count, test_count, gold_test_count)` to compute the tier score. The `gold_test_count` is read from `gold_standard_tests.test_count` in the data file — if the agent writes significantly fewer tests than the gold standard, it scores 24 instead of 30 even with 100% pass rate.
+**How it works:** The harness runs `pytest <test_file> -v --tb=short`, counts PASSED vs FAILED/ERROR, and calls `_score_c5a_d1(pass_count, test_count, gold_test_count)` to compute the tier score. Tier scores are read from `c5a_testing.json` rubric via `_get_tiers("c5a", "D1")`. The `gold_test_count` is read from `gold_standard_tests.test_count` in the data file — if the agent writes significantly fewer tests than the gold standard, it scores 40 instead of 50 even with 100% pass rate.
+
+**Single source of truth:** All tier scores (both automated and judge-scored) are defined in `evaluation/rubrics/c5a_testing.json`. The automated scoring function reads tier values via `_get_tiers()`. Judge-returned scores for D2–D5 are validated and snapped to the nearest valid rubric tier via `validate_judge_scores()`.
 
 **What it measures:** Can the agent write tests that actually run? A test file full of import errors or assertion failures indicates the agent doesn't understand the code it's testing. Pass rate is the foundation — broken tests can't catch bugs.
 
-#### D2: Assertion Quality (断言质量) — 25 points
+#### D2: Assertion Quality (断言质量) — 18 points
 
 | Score | Criteria |
 |-------|----------|
-| **25** | Every test has specific, meaningful assertions (exact value checks, not just "no exception"). Asserts cover return values, state changes, side effects, AND error conditions. Uses appropriate assertion methods. |
-| **20** | Good assertions covering return values and error conditions. Minor gaps in side-effect verification. |
-| **15** | Assertions present but some are weak (assert result is not None instead of checking actual value). Error conditions partially tested. |
-| **10** | Many tests just check "no exception raised". Few meaningful value assertions. |
-| **5** | Trivial assertions only (assert True, assert response.status_code == 200 without body checks). |
+| **18** | Every test has specific, meaningful assertions (exact value checks, not just "no exception"). Asserts cover return values, state changes, side effects, AND error conditions. Uses appropriate assertion methods. |
+| **14** | Good assertions covering return values and error conditions. Minor gaps in side-effect verification. |
+| **10** | Assertions present but some are weak (assert result is not None instead of checking actual value). Error conditions partially tested. |
+| **7** | Many tests just check "no exception raised". Few meaningful value assertions. |
+| **3** | Trivial assertions only (assert True, assert response.status_code == 200 without body checks). |
 
 - **Method:** `llm_as_judge`
 
 **What it measures:** Are the tests actually checking the right things? A test that calls the endpoint but only asserts `status_code == 200` without checking the response body has no teeth — it won't catch data corruption bugs. Good assertions check specific values: `assert body["status"] == "draft"`, `assert body["remaining_budget"] == "10000.00"`.
 
-#### D3: Edge Case Coverage (边界场景覆盖) — 20 points
+#### D3: Edge Case Coverage (边界场景覆盖) — 14 points
 
 | Score | Criteria |
 |-------|----------|
-| **20** | Tests cover: empty inputs, boundary values (min/max), error conditions (invalid input, not found, permission denied), concurrent operations (if applicable), and at least 2 non-obvious edge cases specific to the business logic. |
-| **16** | Tests cover most common edge cases (empty input, not found, permission). 1 non-obvious case. |
-| **12** | Some edge cases covered but gaps in error conditions or boundary values. |
-| **8** | Only happy path + 1-2 obvious error cases (e.g., 404). |
-| **4** | Happy path only. No edge cases. |
+| **14** | Tests cover: empty inputs, boundary values (min/max), error conditions (invalid input, not found, permission denied), concurrent operations (if applicable), and at least 2 non-obvious edge cases specific to the business logic. |
+| **11** | Tests cover most common edge cases (empty input, not found, permission). 1 non-obvious case. |
+| **8** | Some edge cases covered but gaps in error conditions or boundary values. |
+| **5** | Only happy path + 1-2 obvious error cases (e.g., 404). |
+| **3** | Happy path only. No edge cases. |
 
 - **Method:** `llm_as_judge`
 
 **What it measures:** Does the agent think about what can go wrong? Testing `create_campaign_success` is easy. Testing `create_campaign_with_budget_less_than_min_fee` requires understanding the business rule. Testing `editing_pending_review_campaign_resets_status_to_draft` requires understanding the state machine's reset behavior — a non-obvious edge case.
 
-#### D4: Test Independence & Structure (测试独立性与结构) — 15 points
+#### D4: Test Independence & Structure (测试独立性与结构) — 11 points
 
 | Score | Criteria |
 |-------|----------|
-| **15** | All tests pass individually and in any order. Proper setup/teardown. Each test tests one thing. Clear naming pattern. Tests use existing conftest.py fixtures. |
-| **12** | Tests independent and structured. Minor issues. |
-| **9** | Mostly independent but some shared mutable state or order dependencies. |
-| **6** | Test isolation issues: shared state, order-dependent tests. |
-| **3** | Tests tightly coupled, can't run individually, or fragile. |
+| **11** | All tests pass individually and in any order. Proper setup/teardown. Each test tests one thing. Clear naming pattern. Tests use existing conftest.py fixtures. |
+| **9** | Tests independent and structured. Minor issues. |
+| **6** | Mostly independent but some shared mutable state or order dependencies. |
+| **4** | Test isolation issues: shared state, order-dependent tests. |
+| **2** | Tests tightly coupled, can't run individually, or fragile. |
 
 - **Method:** `llm_as_judge`
 
 **What it measures:** Can each test run in isolation? Order-dependent tests are the #1 cause of flaky CI. Each test should create its own data (via fixtures), assert its own expectations, and not depend on side effects from other tests.
 
-#### D5: Convention Adherence (规范遵循) — 10 points
+#### D5: Convention Adherence (规范遵循) — 7 points
 
 | Score | Criteria |
 |-------|----------|
-| **10** | Follows existing test patterns: uses pytest, uses conftest fixtures, follows file naming (test_<module>.py), uses existing test client and DB fixtures, consistent mock patterns. |
-| **8** | Mostly follows conventions. 1 minor deviation. |
-| **6** | Partially follows conventions. Uses pytest but doesn't leverage existing fixtures. |
-| **4** | Uses different testing patterns (e.g., unittest.TestCase when repo uses pytest functions). |
-| **2** | Completely different testing style. Ignores existing test infrastructure. |
+| **7** | Follows existing test patterns: uses pytest, uses conftest fixtures, follows file naming (test_<module>.py), uses existing test client and DB fixtures, consistent mock patterns. |
+| **5** | Mostly follows conventions. 1 minor deviation. |
+| **4** | Partially follows conventions. Uses pytest but doesn't leverage existing fixtures. |
+| **2** | Uses different testing patterns (e.g., unittest.TestCase when repo uses pytest functions). |
+| **1** | Completely different testing style. Ignores existing test infrastructure. |
 
 - **Method:** `llm_as_judge`
 
@@ -347,7 +349,7 @@ Respond in JSON:
 | `{module_under_test}` | `entry["input"]["module_under_test"]` | What the module does (business rules, responsibilities) |
 | `{agent_test_code}` | `test_file.read_text()` | The agent's full test file content |
 | `{test_results_summary}` | `f"{pass_count}/{test_count} tests passed"` | Execution results |
-| `{calibration_persona}` | `rubric["calibration_persona"]` | Grading instructions |
+| `{calibration_persona}` | `rubric["calibration_persona"]` | Senior QA engineer grading persona — avoid leniency for shallow assertions, avoid paranoia for minor style deviations |
 | `{dimensions_text}` | D2-D5 tier tables (judge_dims_only=True) | Only the LLM-judged dimensions |
 
 ---
@@ -592,8 +594,8 @@ The agent then has full repo access to read the bugged file, understand the code
    │ FAIL_TO_PASS: Does the fix resolve the bug?              │
    │ PASS_TO_PASS: Did the fix break anything else?           │
    │ resolved = all F2P pass AND all P2P pass                 │
-   │ D2 score = _score_c5b_d2(f2p, p2p) → /35                │
-   │ D3 score = _score_c5b_d3(agent_patch, gold_fix) → /15   │
+   │ D2 score = _score_c5b_d2(f2p, p2p) → /50                │
+   │ D3 score = _score_c5b_d3(agent_patch, gold_fix) → /20   │
    └──────────────────────────────────────────────────────────┘
                          ↓
 6. LLM JUDGE (D1 root cause, D4 explanation)
@@ -622,73 +624,75 @@ The agent then has full repo access to read the bugged file, understand the code
 
 ### `dimensions` Array — All 4 Dimensions
 
-#### D1: Root Cause Identification (根因定位) — 30 points
+#### D1: Root Cause Identification (根因定位) — 20 points
 
 | Score | Criteria |
 |-------|----------|
-| **30** | Correctly identifies the exact root cause: the specific line(s) of code, the nature of the bug (off-by-one, race condition, missing error handling), and why it produces the observed symptom. |
-| **24** | Identifies the correct area and type of bug but slightly imprecise about the exact mechanism. |
-| **18** | Identifies the correct file/function but mischaracterizes the bug type, or identifies the symptom but not the underlying cause. |
-| **12** | Partially correct: right area but wrong diagnosis. Would lead to a fix that might mask the bug but not truly resolve it. |
-| **6** | Incorrect root cause identification. Points to the wrong code or wrong type of issue. |
+| **20** | Correctly identifies the exact root cause: the specific line(s) of code, the nature of the bug (off-by-one, race condition, missing error handling), and why it produces the observed symptom. |
+| **16** | Identifies the correct area and type of bug but slightly imprecise about the exact mechanism. |
+| **12** | Identifies the correct file/function but mischaracterizes the bug type, or identifies the symptom but not the underlying cause. |
+| **8** | Partially correct: right area but wrong diagnosis. Would lead to a fix that might mask the bug but not truly resolve it. |
+| **4** | Incorrect root cause identification. Points to the wrong code or wrong type of issue. |
 
 - **Method:** `llm_as_judge`
 
-**What it measures:** Can the agent think like a debugger? Saying "the resume check is wrong" is 18/30. Saying "line 154: the comparison `campaign.application_deadline < now` uses strict less-than, which allows resume when deadline == now; this is an off-by-one boundary error that should use `<=`" is 30/30. The diagnosis must explain the mechanism, not just point to the area.
+**What it measures:** Can the agent think like a debugger? Saying "the resume check is wrong" is 12/20. Saying "line 154: the comparison `campaign.application_deadline < now` uses strict less-than, which allows resume when deadline == now; this is an off-by-one boundary error that should use `<=`" is 20/20. The diagnosis must explain the mechanism, not just point to the area.
 
-#### D2: Fix Correctness (修复正确性) — 35 points
+#### D2: Fix Correctness (修复正确性) — 50 points
 
 | Score | Criteria |
 |-------|----------|
-| **35** | All FAIL_TO_PASS tests pass AND all PASS_TO_PASS tests pass. Fix resolves the issue completely. |
-| **28** | FAIL_TO_PASS tests pass but 1 PASS_TO_PASS test regressed (minor side effect). |
-| **21** | Most FAIL_TO_PASS tests pass (70%+). Core issue resolved but edge cases may remain. |
-| **14** | Partial fix: immediate symptom addressed but underlying issue can still trigger under different conditions. |
-| **7** | Fix doesn't resolve the issue. Tests still fail, or new failures introduced. |
+| **50** | All FAIL_TO_PASS tests pass AND all PASS_TO_PASS tests pass. Fix resolves the issue completely. |
+| **40** | FAIL_TO_PASS tests pass but 1 PASS_TO_PASS test regressed (minor side effect). |
+| **30** | Most FAIL_TO_PASS tests pass (70%+). Core issue resolved but edge cases may remain. |
+| **20** | Partial fix: immediate symptom addressed but underlying issue can still trigger under different conditions. |
+| **10** | Fix doesn't resolve the issue. Tests still fail, or new failures introduced. |
 
 - **Method:** `automated`
 - **Scoring:** The harness computes D2 tier score from F2P/P2P test results using `_score_c5b_d2()`:
-  - 35 pts: All F2P pass AND all P2P pass
-  - 28 pts: All F2P pass, at most 1 P2P regression
-  - 21 pts: ≥70% F2P pass
-  - 14 pts: At least 1 F2P pass
-  - 7 pts: No F2P pass or no tests
+  - 50 pts: All F2P pass AND all P2P pass
+  - 40 pts: All F2P pass, at most 1 P2P regression
+  - 30 pts: ≥70% F2P pass
+  - 20 pts: At least 1 F2P pass
+  - 10 pts: No F2P pass or no tests
 
-**The highest-weighted dimension (35 pts).** In debugging, the fix either works or it doesn't. A beautiful diagnosis with a wrong fix is less valuable than a terse diagnosis with a correct fix. The 35-point weight reflects this priority.
+**The highest-weighted dimension (50 pts).** In debugging, the fix either works or it doesn't. A beautiful diagnosis with a wrong fix is less valuable than a terse diagnosis with a correct fix. The 50-point weight reflects this priority.
 
-#### D3: Fix Minimality (修复最小化) — 15 points
+#### D3: Fix Minimality (修复最小化) — 20 points
 
 | Score | Criteria |
 |-------|----------|
-| **15** | Fix is surgical: changes only the lines necessary. No refactoring, no unrelated changes, no "while I'm here" improvements. |
-| **12** | Fix is focused but includes 1-2 minor unnecessary changes. |
-| **9** | Fix is correct but includes some unnecessary refactoring or defensive coding beyond what's needed. |
-| **6** | Significant unnecessary changes that obscure the actual fix. |
-| **3** | Major rewrite instead of targeted fix. |
+| **20** | Fix is surgical: changes only the lines necessary. No refactoring, no unrelated changes, no "while I'm here" improvements. |
+| **16** | Fix is focused but includes 1-2 minor unnecessary changes. |
+| **12** | Fix is correct but includes some unnecessary refactoring or defensive coding beyond what's needed. |
+| **8** | Significant unnecessary changes that obscure the actual fix. |
+| **4** | Major rewrite instead of targeted fix. |
 
 - **Method:** `automated`
 - **Scoring:** The harness computes D3 tier score from patch size ratio using `_score_c5b_d3()`. It compares the number of changed lines in the agent's patch vs the gold fix diff:
-  - 15 pts: ratio ≤ 2× gold fix (surgical)
-  - 12 pts: ratio ≤ 4× (focused with minor extras)
-  - 9 pts: ratio ≤ 8× (some unnecessary changes)
-  - 6 pts: ratio ≤ 15× (significant extras)
-  - 3 pts: ratio > 15× (major rewrite)
+  - 20 pts: ratio ≤ 2× gold fix (surgical)
+  - 16 pts: ratio ≤ 4× (focused with minor extras)
+  - 12 pts: ratio ≤ 8× (some unnecessary changes)
+  - 8 pts: ratio ≤ 15× (significant extras)
+  - 4 pts: ratio > 15× (major rewrite)
 
 **What it measures:** Did the agent fix the bug, or did it rewrite the function? The ideal fix for C5b-01 is changing one character: `<` → `<=`. An agent that refactors the entire `transition_status` method to fix a one-character bug is over-engineering.
 
-#### D4: Explanation Quality (诊断解释质量) — 20 points
+**Single source of truth:** All tier scores (both automated and judge-scored) are defined in `evaluation/rubrics/c5b_debug.json`. Automated scoring functions read tier values via `_get_tiers()`. Judge-returned scores for D1 and D4 are validated and snapped to the nearest valid rubric tier via `validate_judge_scores()`.
+
+#### D4: Explanation Quality (诊断解释质量) — 10 points
 
 | Score | Criteria |
 |-------|----------|
-| **20** | Explanation clearly describes: (1) what the bug is, (2) why the current code produces the wrong behavior (step-by-step reasoning), (3) why the fix resolves it, and (4) whether similar patterns exist elsewhere. Demonstrates deep understanding. |
-| **16** | Clear explanation of the bug and fix. Missing either the step-by-step reasoning or the similar-pattern analysis. |
-| **12** | Explains what was changed but not deeply why the original code was wrong. Surface-level understanding. |
-| **8** | Minimal explanation. "Changed X to Y" without reasoning. |
-| **4** | No explanation or incorrect explanation that contradicts the actual fix. |
+| **10** | Explanation clearly describes: (1) what the bug is, (2) why the current code produces the wrong behavior (step-by-step reasoning), (3) why the fix resolves it, and (4) whether similar patterns exist elsewhere. Demonstrates deep understanding. |
+| **8** | Clear explanation of the bug and fix. Missing either the step-by-step reasoning or the similar-pattern analysis. |
+| **6** | Explains what was changed but not deeply why the original code was wrong. Surface-level understanding. |
+| **4** | Minimal explanation. "Changed X to Y" without reasoning. |
+| **2** | No explanation or incorrect explanation that contradicts the actual fix. |
 
 - **Method:** `llm_as_judge`
 
-**What it measures:** Can the agent communicate its diagnosis? The 20-point weight rewards agents that not only fix the bug but explain it clearly enough that a human reviewer can verify the fix is correct. The highest tier (20 pts) specifically looks for "whether similar patterns exist elsewhere" — demonstrating that the agent thinks beyond the immediate fix.
+**What it measures:** Can the agent communicate its diagnosis? The 10-point weight rewards agents that not only fix the bug but explain it clearly enough that a human reviewer can verify the fix is correct. The highest tier (10 pts) specifically looks for "whether similar patterns exist elsewhere" — demonstrating that the agent thinks beyond the immediate fix.
 
 ---
 
@@ -749,7 +753,7 @@ Respond in JSON:
 | `{agent_response}` | Agent's captured text response | The agent's diagnosis and explanation |
 | `{agent_patch}` | `capture_agent_patch(work_dir)` | The diff of the agent's fix |
 | `{gold_fix}` | `json.dumps(gold_standard)` | Expert root cause + fix diff + explanation |
-| `{calibration_persona}` | `rubric["calibration_persona"]` | Grading instructions |
+| `{calibration_persona}` | `rubric["calibration_persona"]` | Senior engineer grading persona — avoid leniency for shallow explanations, avoid paranoia for imprecise root cause descriptions |
 | `{dimensions_text}` | D1 + D4 tier tables (judge_dims_only=True) | Only the LLM-judged dimensions |
 
 ---
@@ -764,7 +768,7 @@ Respond in JSON:
 | **Dimensions** | 5 (Coverage, Assertions, Edge Cases, Independence, Conventions) | 4 (Root Cause, Fix Correctness, Minimality, Explanation) |
 | **Automated scoring** | D1 (coverage) | D2 (test pass/fail), D3 (patch size) |
 | **LLM-judged** | D2 (assertions), D3 (edge cases), D4 (structure), D5 (conventions) | D1 (root cause), D4 (explanation) |
-| **Highest-weighted dim** | D1: Coverage (30 pts) | D2: Fix Correctness (35 pts) |
+| **Highest-weighted dim** | D1: Coverage (50 pts) | D2: Fix Correctness (50 pts) |
 | **test_patch used?** | No — agent writes the tests | Yes — injects the failing test after agent fixes |
 | **Entries** | 5 (one per service module) | 3 (one per bug type) |
 | **Composite weight** | 12% | 8% |
@@ -783,8 +787,8 @@ The agent needs to know what the code does to test it. Unlike C3 where the agent
 ### Why only 3 C5b entries?
 Each C5b entry takes the agent 5-25 minutes to solve. More importantly, each entry tests a distinct debugging archetype (boundary condition, race condition, null reference) — adding more entries of the same type wouldn't add evaluation value. Three well-designed bugs cover the core debugging skill space.
 
-### Why is Fix Correctness (D2) the highest-weighted C5b dimension at 35 points?
-In debugging, the fix either works or it doesn't. A brilliantly articulated root cause analysis (D1) combined with a fix that doesn't actually resolve the bug is useless. The 35-point weight ensures that agents which produce correct fixes always outscore agents that produce beautiful explanations with wrong fixes.
+### Why is Fix Correctness (D2) the highest-weighted C5b dimension at 50 points?
+In debugging, the fix either works or it doesn't. A brilliantly articulated root cause analysis (D1) combined with a fix that doesn't actually resolve the bug is useless. The 50-point weight ensures that agents which produce correct fixes always outscore agents that produce beautiful explanations with wrong fixes.
 
 ### Why does C5b use test_patch like C3?
 The agent might "fix" the bug by deleting the test or modifying the test assertion. By injecting the test after the agent finishes (via test_patch), we ensure the fix is verified against a test the agent never saw and couldn't tamper with.

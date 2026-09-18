@@ -29,46 +29,45 @@
     {
       "id": "D-C4-02-2",
       "file": "app/services/application_service.py",
-      "line_range_in_diff": "submit_application method, duplicate check",
+      "line_range_in_diff": "decide_application method, budget deduction",
       "category": "Defect",
       "severity": "Critical",
-      "title": "Race condition: duplicate application check is not atomic (TOCTOU)",
-      "description": "The submit_application method performs a check-then-act pattern: it first queries for an existing active application, then creates a new one if none is found. Under concurrent requests, two simultaneous submissions from the same creator for the same campaign can both pass the duplicate check and both create applications, violating the business rule that only one active application per creator per campaign is allowed. The TODO comment acknowledges the issue but no fix is in place.",
-      "root_cause": "The get_active_by_creator_and_campaign check and the subsequent create operation are not wrapped in a transaction with a SELECT ... FOR UPDATE lock or enforced via a database-level unique constraint. This is a Time-of-Check-to-Time-of-Use (TOCTOU) race condition.",
+      "title": "Race condition in campaign budget deduction allows budget overspending",
+      "description": "In decide_application, the check `if campaign.remaining_budget < application.requested_fee` followed by `campaign.remaining_budget -= application.requested_fee` is a check-then-act race condition. The campaign record is retrieved without row-level locking (with_for_update). Concurrent requests accepting different applications simultaneously can read the same budget value, all pass the check, and drive remaining_budget below zero, overspending the campaign budget.",
+      "root_cause": "The campaign row is not locked with SELECT ... FOR UPDATE when reading remaining_budget. Without row-level locking, concurrent accept operations can all read the same pre-deduction budget, pass the sufficiency check, and each deduct the fee independently.",
       "expected_location": {
         "file": "app/services/application_service.py",
-        "function": "submit_application",
-        "line_hint": "# TODO: add locking to prevent duplicate applications"
+        "function": "decide_application",
+        "line_hint": "if campaign.remaining_budget < application.requested_fee"
       },
-      "suggested_fix": "Either add a unique database constraint on (campaign_id, creator_id) with a partial index excluding withdrawn applications, or use SELECT ... FOR UPDATE in the duplicate check query to serialize concurrent access."
+      "suggested_fix": "Lock the campaign row when reading it for decision updates using `select(Campaign).where(...).with_for_update()`, or execute an atomic database decrement: `UPDATE campaigns SET remaining_budget = remaining_budget - :fee WHERE id = :id AND remaining_budget >= :fee` and check affected rows."
     },
     {
       "id": "D-C4-02-3",
-      "file": "app/models/application.py",
-      "line_range_in_diff": "__table_args__ index definitions",
-      "category": "Performance",
-      "severity": "Minor",
-      "title": "Missing standalone index on campaign_id for application lookups",
-      "description": "The Application model defines indexes on creator_id, status, and a composite (campaign_id, fit_score), but lacks a standalone index on campaign_id. The list_by_campaign repository method filters by campaign_id as its primary predicate, but without a dedicated index, the database must either scan the full table or rely on the composite index which is less efficient for queries that don't also filter/sort by fit_score. This leads to degraded query performance as the applications table grows.",
-      "root_cause": "The `Index('ix_applications_campaign_id', 'campaign_id')` entry is missing from __table_args__. While a composite index on (campaign_id, fit_score) exists, it cannot serve queries that only filter by campaign_id as efficiently as a dedicated single-column index.",
+      "file": "app/repositories/application_repo.py",
+      "line_range_in_diff": "list_by_campaign method, count query",
+      "category": "Defect",
+      "severity": "Major",
+      "title": "Pagination total count ignores search_term filter in list_by_campaign",
+      "description": "In ApplicationRepository.list_by_campaign, `count_query` calculates `total` from `base` conditions before `search_term` is evaluated and applied to `query`. When a search term is provided, `total` reflects the unfiltered count (all applications matching campaign_id and status), while the returned items are filtered by the search term. This causes incorrect pagination metadata — the total and total_pages will be larger than the actual matching result set.",
+      "root_cause": "The count query is executed using only the `base` filter conditions. The search_term filter is applied to the data query after the count is already computed, so the two queries use different WHERE clauses.",
       "expected_location": {
-        "file": "app/models/application.py",
-        "function": "__table_args__ (class attribute)",
-        "line_hint": "Missing Index('ix_applications_campaign_id', 'campaign_id') in __table_args__"
+        "file": "app/repositories/application_repo.py",
+        "function": "list_by_campaign",
+        "line_hint": "count_query = select(func.count()).select_from(Application).where(*base)"
       },
-      "suggested_fix": "Add `Index('ix_applications_campaign_id', 'campaign_id')` to the __table_args__ tuple."
+      "suggested_fix": "Move the search_term filter application before the count query, or build the complete set of WHERE conditions first and apply them to both the count query and the data query."
     }
   ],
   "evaluation_config": {
     "total_planted_defects": 3,
     "defect_categories": {
       "Security": 1,
-      "Defect": 1,
-      "Performance": 1
+      "Defect": 2
     },
     "defect_severities": {
       "Critical": 2,
-      "Minor": 1
+      "Major": 1
     }
   },
   "evaluation_rubric": "evaluation/rubrics/c4_review.json"
