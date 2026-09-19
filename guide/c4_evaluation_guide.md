@@ -298,14 +298,15 @@ Each finding matches to AT MOST one planted defect. Each planted defect can only
 | Outcome | Definition | Impact |
 |---------|-----------|--------|
 | **True Positive** | Finding matches a planted defect (file match + LLM semantic match or keyword overlap ≥ 0.25) | Increases recall and precision |
-| **False Positive** | Finding doesn't match any planted defect | Decreases precision |
+| **Valid Non-Planted** | Unmatched finding classified by LLM as a real issue not in the planted defect list | Increases precision (counts as useful) |
+| **False Positive** | Unmatched finding classified by LLM as noise or not a real issue | Decreases precision |
 | **Undetected** | Planted defect with no matching finding | Decreases recall |
 
 ### Scoring Formulas
 
 ```python
-recall = detected / total_planted           # raw ratio
-precision = true_positives / total_findings  # raw ratio
+recall = detected / total_planted                              # raw ratio
+precision = (true_positives + valid_non_planted) / total_findings  # raw ratio
 
 # D1 tier scoring — _score_c4_d1(recall)
 # Tier scores are read from c4_review.json rubric via _get_tiers("c4", "D1")
@@ -360,7 +361,7 @@ The rubric defines a 3-step matching pipeline inspired by AACR-Bench. Steps 1 an
       {"step": 2, "name": "Line proximity",
        "description": "Line range overlaps or within ±5 lines of planted defect"},
       {"step": 3, "name": "Semantic match",
-       "description": "LLM-as-judge determines if finding addresses the same concern"}
+       "description": "LLM-as-judge determines if finding addresses the same concern as planted defect"}
     ],
     "outcomes": {
       "all_pass": "TRUE POSITIVE (matched to specific planted defect)",
@@ -471,7 +472,9 @@ This semantic match avoids penalizing agents that describe the same bug differen
 
 - **Method:** `automated`
 - **Scoring function:** `_score_c4_d2(precision)` — maps precision ratio to tier score
-- **Scoring formula:** `precision = true_positive_count / total_findings_count` → tier mapping
+- **Scoring formula:** `precision = (true_positive_count + valid_non_planted_count) / total_findings_count` → tier mapping
+
+**Valid non-planted findings:** Unmatched findings (those that don't match any planted defect) are classified by LLM as either "valid non-planted" (real issues not in the planted list) or true false positives. Valid non-planted findings count as useful, so they boost precision rather than penalizing the agent for finding real bugs beyond the planted set.
 
 **What it measures:** Is the agent signal or noise? An agent that reports 50 findings, only 3 of which are real bugs, wastes the reviewer's time. High precision means the developer can trust the review — if the agent flags something, it's probably real. Precision is equal-weighted with recall (both 25 pts) because both matter in practice.
 
@@ -661,8 +664,11 @@ Respond in JSON:
 │      a. File path match against planted defects                 │
 │      b. LLM semantic match (via semantic_match_prompt)          │
 │      c. Keyword overlap fallback (≥ 0.25 threshold)             │
-│    Result: true_positives, false_positives, undetected           │
+│    Result: true_positives, unmatched_findings, undetected        │
+│    Classify unmatched findings via LLM:                         │
+│      → valid_non_planted (real issues) or false_positives       │
 │    Compute: recall, precision                                   │
+│    precision = (TP + VNP) / total_findings                      │
 │                                                                 │
 │ 6. TIER SCORES: _score_c4_d1(recall), _score_c4_d2(precision)   │
 │                                                                 │

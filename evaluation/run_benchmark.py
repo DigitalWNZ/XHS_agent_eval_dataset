@@ -102,6 +102,18 @@ def _snap_to_tier(score: int, tiers: list[int]) -> int:
     return min(tiers, key=lambda t: abs(t - score))
 
 
+def _recompute_total_score(scores: dict, category: str) -> None:
+    """Recompute total_score from all dimension scores (auto + judge)."""
+    rubric = _get_rubric(category)
+    dims = [d["id"] for d in rubric.get("dimensions", [])]
+    total = 0
+    for d in dims:
+        v = scores.get(d)
+        if isinstance(v, dict) and v.get("score") is not None:
+            total += v["score"]
+    scores["total_score"] = total
+
+
 def validate_judge_scores(parsed_scores: dict, category: str) -> dict:
     """Validate and snap judge-returned scores to valid rubric tier values."""
     if not parsed_scores:
@@ -272,6 +284,8 @@ def run_tests(work_dir: Path, test_names: list[str]) -> dict[str, str]:
     results = {}
     for line in result.stdout.splitlines():
         line = line.strip()
+        if "::" not in line:
+            continue
         if " PASSED" in line:
             results[line.split(" PASSED")[0].strip()] = "passed"
         elif " FAILED" in line:
@@ -281,6 +295,9 @@ def run_tests(work_dir: Path, test_names: list[str]) -> dict[str, str]:
     for t in test_names:
         if t not in results:
             results[t] = "not_run"
+    # Store raw output for debugging failures
+    results["_stdout"] = result.stdout
+    results["_stderr"] = result.stderr
     return results
 
 
@@ -434,7 +451,8 @@ def build_judge_payload(category: str, rubric: dict, entry: dict, agent_output: 
     return {"judge_prompt": filled, "rubric_file": f"evaluation/rubrics/{category}_{get_rubric_suffix(category)}.json"}
 
 
-def run_judge_scoring(judge_prompt: str, agent: str, model: str, timeout_minutes: int = 5) -> dict:
+def run_judge_scoring(judge_prompt: str, agent: str, model: str,
+                      timeout_minutes: int = 5, max_retries: int = 3) -> dict:
     """Send the judge prompt to an LLM and parse the structured scoring response."""
     timeout_secs = timeout_minutes * 60
 
@@ -458,48 +476,68 @@ def run_judge_scoring(judge_prompt: str, agent: str, model: str, timeout_minutes
         return {"error": f"Unknown agent: {agent}"}
 
     print(f"  Running LLM-as-judge ({model})...")
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, input=judge_prompt,
-            timeout=timeout_secs,
-            env={**os.environ, "AGY_ADC_AUTH": "true"},
-        )
-    except subprocess.TimeoutExpired:
-        print(f"  Judge scoring timed out after {timeout_minutes}m")
-        return {"error": f"Judge timeout after {timeout_minutes}m", "raw_response": "", "parsed_scores": None, "judge_usage": {}}
 
-    response_text = result.stdout
-    try:
-        data = json.loads(response_text)
-        response_text = data.get("response", response_text)
-        judge_usage = data.get("usage", {})
-    except (json.JSONDecodeError, TypeError):
-        judge_usage = {}
-
-    import re
-    json_text = None
-    for pattern in [r'\{[\s\S]*"total_score"[\s\S]*\}', r'\{[\s\S]*"dimension_1"[\s\S]*\}',
-                    r'\{[\s\S]*"D1"[\s\S]*\}', r'\{[\s\S]*"dimensions"[\s\S]*\}']:
-        m = re.search(pattern, response_text)
-        if m:
-            json_text = m.group()
-            break
-    if json_text is None:
-        m = re.search(r'```json\s*([\s\S]*?)\s*```', response_text)
-        if m:
-            json_text = m.group(1)
-
-    parsed_scores = None
-    if json_text:
+    last_error = None
+    for attempt in range(1, max_retries + 1):
         try:
-            parsed_scores = json.loads(json_text)
-        except json.JSONDecodeError:
-            pass
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, input=judge_prompt,
+                timeout=timeout_secs,
+                env={**os.environ, "AGY_ADC_AUTH": "true"},
+            )
+        except subprocess.TimeoutExpired:
+            last_error = f"Judge timeout after {timeout_minutes}m"
+            if attempt < max_retries:
+                print(f"  Judge scoring timed out (attempt {attempt}/{max_retries}), retrying...")
+                continue
+            print(f"  Judge scoring timed out after {max_retries} attempts")
+            return {"error": last_error, "raw_response": "", "parsed_scores": None, "judge_usage": {}}
+
+        response_text = result.stdout
+        try:
+            data = json.loads(response_text)
+            response_text = data.get("response", response_text)
+            judge_usage = data.get("usage", {})
+        except (json.JSONDecodeError, TypeError):
+            judge_usage = {}
+
+        import re
+        json_text = None
+        for pattern in [r'\{[\s\S]*"total_score"[\s\S]*\}', r'\{[\s\S]*"dimension_1"[\s\S]*\}',
+                        r'\{[\s\S]*"D1"[\s\S]*\}', r'\{[\s\S]*"dimensions"[\s\S]*\}']:
+            m = re.search(pattern, response_text)
+            if m:
+                json_text = m.group()
+                break
+        if json_text is None:
+            m = re.search(r'```json\s*([\s\S]*?)\s*```', response_text)
+            if m:
+                json_text = m.group(1)
+
+        parsed_scores = None
+        if json_text:
+            try:
+                parsed_scores = json.loads(json_text)
+            except json.JSONDecodeError:
+                pass
+
+        if parsed_scores is not None:
+            return {
+                "raw_response": response_text,
+                "parsed_scores": parsed_scores,
+                "judge_usage": judge_usage,
+            }
+
+        last_error = "Could not parse judge response"
+        if attempt < max_retries:
+            print(f"  Judge response unparseable (attempt {attempt}/{max_retries}), retrying...")
+            continue
+        print(f"  Judge response unparseable after {max_retries} attempts")
 
     return {
-        "raw_response": response_text,
-        "parsed_scores": parsed_scores,
-        "judge_usage": judge_usage,
+        "raw_response": response_text if 'response_text' in locals() else "",
+        "parsed_scores": None,
+        "judge_usage": judge_usage if 'judge_usage' in locals() else {},
     }
 
 
@@ -555,8 +593,11 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
         print(f"  Agent findings: {len(findings)}")
 
         rubric = load_rubric("c4")
-        scores = score_c4(planted, findings, rubric=rubric, agent=agent, model=model)
-        print(f"  Recall: {scores['recall']:.0%} (D1: {scores['D1']['score']}/{_get_tiers('c4', 'D1')[0]}) | Precision: {scores['precision']:.0%} (D2: {scores['D2']['score']}/{_get_tiers('c4', 'D2')[0]}) | Match: {scores['match_method']}")
+        scores = score_c4(planted, findings, rubric=rubric, agent=agent, model=model,
+                         code_diff=entry["input"].get("bugged_diff", ""))
+        vnp = scores.get('valid_non_planted', 0)
+        vnp_str = f" | Valid non-planted: {vnp}" if vnp else ""
+        print(f"  Recall: {scores['recall']:.0%} (D1: {scores['D1']['score']}/{_get_tiers('c4', 'D1')[0]}) | Precision: {scores['precision']:.0%} (D2: {scores['D2']['score']}/{_get_tiers('c4', 'D2')[0]}){vnp_str} | Match: {scores['match_method']}")
 
         result = {
             "instance_id": instance_id,
@@ -586,6 +627,7 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
                 result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c4"))
+                _recompute_total_score(result["scores"], "c4")
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -645,10 +687,11 @@ def _score_c4_d2(precision: float) -> int:
 
 
 def score_c4(planted: list[dict], findings: list[dict],
-             rubric: dict = None, agent: str = None, model: str = None) -> dict:
+             rubric: dict = None, agent: str = None, model: str = None,
+             code_diff: str = "") -> dict:
     matched = set()
     true_positives = []
-    false_positives = []
+    unmatched_findings = []
 
     semantic_prompt = rubric.get("semantic_match_prompt", "") if rubric else ""
     use_llm = bool(semantic_prompt and agent and model)
@@ -708,11 +751,31 @@ def score_c4(planted: list[dict], findings: list[dict],
                 "confidence": round(best_score, 3),
             })
         else:
-            false_positives.append(finding)
+            unmatched_findings.append(finding)
+
+    valid_non_planted = []
+    false_positives = []
+    if unmatched_findings and use_llm and code_diff:
+        print(f"  Classifying {len(unmatched_findings)} unmatched findings (valid non-planted vs false positive)...")
+        for finding in unmatched_findings:
+            result = _validate_non_planted_finding(finding, code_diff, agent, model)
+            if result["is_valid"]:
+                valid_non_planted.append({
+                    "finding": finding,
+                    "classification": "valid_non_planted",
+                    "confidence": result["confidence"],
+                    "reasoning": result["reasoning"],
+                })
+            else:
+                false_positives.append(finding)
+        print(f"  Valid non-planted: {len(valid_non_planted)} | False positives: {len(false_positives)}")
+    else:
+        false_positives = unmatched_findings
 
     total = len(planted)
     recall = len(matched) / total if total > 0 else 0
-    precision = len(true_positives) / len(findings) if findings else 0
+    useful_findings = len(true_positives) + len(valid_non_planted)
+    precision = useful_findings / len(findings) if findings else 0
 
     return {
         "recall": round(recall, 3),
@@ -722,6 +785,7 @@ def score_c4(planted: list[dict], findings: list[dict],
         "detected": len(matched),
         "total_planted": total,
         "true_positives": len(true_positives),
+        "valid_non_planted": len(valid_non_planted),
         "false_positives": len(false_positives),
         "match_method": "semantic_llm" if use_llm else "keyword_overlap",
         "undetected": [planted[i]["id"] for i in range(total) if i not in matched],
@@ -793,6 +857,83 @@ def _semantic_match_llm(finding: dict, defect: dict, prompt_template: str,
         print(f"    Semantic match LLM error: {e}")
 
     return {"is_same_issue": False, "confidence": "low", "reasoning": "LLM call failed"}
+
+
+def _validate_non_planted_finding(finding: dict, code_diff: str,
+                                  agent: str, model: str) -> dict:
+    """Use LLM to determine if an unmatched finding is a valid real issue or noise."""
+    agent_file = finding.get("file", "")
+    if agent_file and code_diff:
+        basename = os.path.basename(agent_file)
+        lines = code_diff.split('\n')
+        relevant = []
+        in_file = False
+        for line in lines:
+            if line.startswith('diff --git') or line.startswith('--- ') or line.startswith('+++ '):
+                in_file = basename in line or agent_file in line
+            if in_file:
+                relevant.append(line)
+        diff_excerpt = '\n'.join(relevant)[:8000] if relevant else code_diff[:4000]
+    else:
+        diff_excerpt = code_diff[:4000]
+
+    prompt = (
+        "You are an expert code reviewer. An AI agent reviewed a pull request and "
+        "produced the following finding. Determine whether this finding identifies "
+        "a REAL, substantive code issue (bug, security flaw, performance problem, "
+        "or significant maintainability concern) — or whether it is noise "
+        "(a style nitpick, a non-issue, or a hallucinated problem that doesn't exist in the code).\n\n"
+        f"## Code Under Review (Diff)\n```diff\n{diff_excerpt}\n```\n\n"
+        f"## Agent's Finding\n"
+        f"File: {finding.get('file', 'N/A')}\n"
+        f"Lines: {finding.get('line_range', finding.get('line', 'N/A'))}\n"
+        f"Category: {finding.get('category', 'N/A')}\n"
+        f"Severity: {finding.get('severity', 'N/A')}\n"
+        f"Description: {finding.get('description', 'N/A')}\n"
+        f"Suggested fix: {finding.get('suggested_fix', 'N/A')}\n\n"
+        "## Task\n"
+        "Is this a valid, real code issue that a senior engineer would flag in a code review? "
+        "Style preferences, formatting nitpicks, and issues that don't actually exist in the code are NOT valid.\n\n"
+        "Respond in JSON:\n"
+        '{\n  "is_valid": true/false,\n  "confidence": "high" | "medium" | "low",\n'
+        '  "reasoning": "<1-2 sentences>"\n}'
+    )
+
+    if agent == "agy":
+        cmd = ["agy", "--input-format", "text", "--model", model,
+               "--output-format", "json", "--dangerously-skip-permissions",
+               "--print-timeout", "2m"]
+    elif agent == "claude":
+        cmd = ["claude", "--print", "-", "--model", model,
+               "--output-format", "json", "--dangerously-skip-permissions"]
+    else:
+        return {"is_valid": False, "confidence": "low", "reasoning": "unknown agent"}
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, input=prompt, timeout=180,
+            env={**os.environ, "AGY_ADC_AUTH": "true"},
+        )
+        response_text = result.stdout
+        try:
+            data = json.loads(response_text)
+            response_text = data.get("response", response_text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        import re
+        m = re.search(r'\{[\s\S]*"is_valid"[\s\S]*\}', response_text)
+        if m:
+            parsed = json.loads(m.group())
+            return {
+                "is_valid": bool(parsed.get("is_valid", False)),
+                "confidence": parsed.get("confidence", "low"),
+                "reasoning": parsed.get("reasoning", ""),
+            }
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+        print(f"    Non-planted validation LLM error: {e}")
+
+    return {"is_valid": False, "confidence": "low", "reasoning": "LLM call failed"}
 
 
 # ── C5a: Test Generation ─────────────────────────────────────────────────
@@ -931,6 +1072,7 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
                 result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c5a"))
+                _recompute_total_score(result["scores"], "c5a")
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -1112,6 +1254,7 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
                 result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c5b"))
+                _recompute_total_score(result["scores"], "c5b")
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -1205,13 +1348,26 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
         f2p = run_tests(work_dir, entry["FAIL_TO_PASS"])
         p2p = run_tests(work_dir, entry["PASS_TO_PASS"])
 
-        f2p_passed = sum(1 for v in f2p.values() if v == "passed")
-        p2p_passed = sum(1 for v in p2p.values() if v == "passed")
+        f2p_passed = sum(1 for k, v in f2p.items() if not k.startswith("_") and v == "passed")
+        p2p_passed = sum(1 for k, v in p2p.items() if not k.startswith("_") and v == "passed")
         f2p_total = len(entry["FAIL_TO_PASS"])
         p2p_total = len(entry["PASS_TO_PASS"])
 
         print(f"  FAIL_TO_PASS: {f2p_passed}/{f2p_total}")
+        f2p_failed = [t for t, v in f2p.items() if not t.startswith("_") and v != "passed"]
+        if f2p_failed:
+            for t in f2p_failed:
+                print(f"    FAILED: {t} ({f2p[t]})")
+            stdout = f2p.get("_stdout", "")
+            if stdout:
+                print("  --- F2P test output (last 3000 chars) ---")
+                print(stdout[-3000:])
+                print("  --- end test output ---")
         print(f"  PASS_TO_PASS: {p2p_passed}/{p2p_total}")
+        p2p_failed = [t for t, v in p2p.items() if not t.startswith("_") and v != "passed"]
+        if p2p_failed:
+            for t in p2p_failed:
+                print(f"    REGRESSED: {t} ({p2p[t]})")
 
         resolved = f2p_passed == f2p_total and p2p_passed == p2p_total
 
@@ -1255,6 +1411,7 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
             result["judge_usage"] = judge_scores.get("judge_usage", {})
             if judge_scores.get("parsed_scores"):
                 result["scores"].update(validate_judge_scores(judge_scores["parsed_scores"], "c3"))
+                _recompute_total_score(result["scores"], "c3")
                 print(f"  Judge scoring complete | {judge_scores.get('judge_usage', {}).get('total_tokens', '?')} tokens")
 
         return result
@@ -1293,49 +1450,57 @@ def print_summary(category: str, results: list[dict]) -> None:
     print(f"{'='*80}")
 
     if category == "c3":
-        print(f"{'Entry':<10} {'F2P':>8} {'P2P':>8} {'Resolved':>9} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
-        print("-" * 60)
+        print(f"{'Entry':<12} {'F2P':>8} {'P2P':>8} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
+        print("-" * 62)
         for r in results:
             tr = r.get("test_results", {})
+            sc = r.get("scores", {})
             u = r.get("usage", {})
-            print(f"{r['instance_id']:<10} {tr.get('f2p_passed','?')}/{tr.get('f2p_total','?'):>5} {tr.get('p2p_passed','?')}/{tr.get('p2p_total','?'):>5} {'YES' if r.get('scores',{}).get('resolved') else 'NO':>9} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
+            total = sc.get('total_score', '?')
+            print(f"{r['instance_id']:<12} {tr.get('f2p_passed','?')}/{tr.get('f2p_total','?'):>5} {tr.get('p2p_passed','?')}/{tr.get('p2p_total','?'):>5} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
     elif category == "c4":
-        print(f"{'Entry':<10} {'Recall':>8} {'Prec':>8} {'Found':>8} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
-        print("-" * 60)
+        print(f"{'Entry':<12} {'Recall':>8} {'Prec':>8} {'TP':>4} {'VNP':>4} {'FP':>4} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
+        print("-" * 78)
         for r in results:
             sc = r.get("scores", {})
             u = r.get("usage", {})
-            print(f"{r['instance_id']:<10} {sc.get('recall',0):>7.0%} {sc.get('precision',0):>7.0%} {sc.get('detected','?')}/{sc.get('total_planted','?'):>4} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
+            tp = sc.get('true_positives', '?')
+            vnp = sc.get('valid_non_planted', 0)
+            fp = sc.get('false_positives', '?')
+            total = sc.get('total_score', '?')
+            print(f"{r['instance_id']:<12} {sc.get('recall',0):>7.0%} {sc.get('precision',0):>7.0%} {tp:>4} {vnp:>4} {fp:>4} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
-    elif category in ("c5b", "c3"):
-        print(f"{'Entry':<10} {'F2P':>8} {'P2P':>8} {'Resolved':>9} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
-        print("-" * 60)
+    elif category == "c5b":
+        print(f"{'Entry':<12} {'F2P':>8} {'P2P':>8} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
+        print("-" * 62)
         for r in results:
             tr = r.get("test_results", {})
+            sc = r.get("scores", {})
             u = r.get("usage", {})
-            print(f"{r['instance_id']:<10} {tr.get('f2p_passed','?')}/{tr.get('f2p_total','?'):>5} {tr.get('p2p_passed','?')}/{tr.get('p2p_total','?'):>5} {'YES' if r.get('scores',{}).get('resolved') else 'NO':>9} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
+            total = sc.get('total_score', '?')
+            print(f"{r['instance_id']:<12} {tr.get('f2p_passed','?')}/{tr.get('f2p_total','?'):>5} {tr.get('p2p_passed','?')}/{tr.get('p2p_total','?'):>5} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
     elif category == "c5a":
-        print(f"{'Entry':<10} {'Written':>8} {'Passed':>8} {'Rate':>8} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
-        print("-" * 60)
+        print(f"{'Entry':<12} {'Written':>8} {'Passed':>8} {'Rate':>8} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
+        print("-" * 68)
         for r in results:
             sc = r.get("scores", {})
             u = r.get("usage", {})
-            print(f"{r['instance_id']:<10} {sc.get('tests_written','?'):>8} {sc.get('tests_passed','?'):>8} {sc.get('pass_rate',0):>7.0%} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
+            total = sc.get('total_score', '?')
+            print(f"{r['instance_id']:<12} {sc.get('tests_written','?'):>8} {sc.get('tests_passed','?'):>8} {sc.get('pass_rate',0):>7.0%} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
     else:  # c1, c2
-        print(f"{'Entry':<10} {'Time':>7} {'Tokens':>8} {'Turns':>6} {'Score':>8}")
+        print(f"{'Entry':<12} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
         print("-" * 45)
         for r in results:
             u = r.get("usage", {})
             sc = r.get("scores", {})
-            total = "?"
-            if isinstance(sc, dict) and "dimensions" in sc:
-                total = sum(d.get("score", 0) for d in sc["dimensions"].values() if isinstance(d, dict))
-            elif isinstance(sc, dict) and any(k.startswith("D") for k in sc):
-                total = sum(v.get("score", 0) for k, v in sc.items() if k.startswith("D") and isinstance(v, dict))
-            print(f"{r['instance_id']:<10} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6} {total:>8}")
+            total = sc.get("total_score", "?")
+            if total == "?":
+                if isinstance(sc, dict) and any(k.startswith("D") for k in sc):
+                    total = sum(v.get("score", 0) for k, v in sc.items() if k.startswith("D") and isinstance(v, dict))
+            print(f"{r['instance_id']:<12} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
     # Cost/efficiency summary
     print(f"\n--- Efficiency Metrics ---")

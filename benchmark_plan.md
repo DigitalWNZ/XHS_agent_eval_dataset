@@ -556,102 +556,102 @@ overly punitive for isolated minor issues). An isolated infraction in an
 otherwise strong codebase should not drop a dimension score by more than one
 tier — reserve the lowest scores for widespread, systemic anti-patterns.
 
-#### Dimension 1: Functional Correctness — FAIL_TO_PASS (新功能正确性) — 25 points
+#### Dimension 1: Functional Correctness — FAIL_TO_PASS (新功能正确性) — 50 points
 
 **Method:** Automated test execution — new feature tests the agent never saw
 
 | Score | Criteria |
 |-------|----------|
-| 25 | 100% of FAIL_TO_PASS tests pass. All new feature tests green. |
-| 20 | 80-99% of FAIL_TO_PASS tests pass. Core feature works, minor edge cases missed. |
-| 15 | 60-79% of FAIL_TO_PASS tests pass. Main flow works but significant gaps. |
-| 10 | 30-59% of FAIL_TO_PASS tests pass. Partial implementation. |
+| 50 | 100% of FAIL_TO_PASS tests pass. All new feature tests green. |
+| 40 | 80-99% of FAIL_TO_PASS tests pass. Core feature works, minor edge cases missed. |
+| 30 | 60-79% of FAIL_TO_PASS tests pass. Main flow works but significant gaps. |
+| 20 | 30-59% of FAIL_TO_PASS tests pass. Partial implementation. |
 | 0  | < 30% of FAIL_TO_PASS tests pass, or code doesn't parse. |
 
-#### Dimension 2: Regression Safety — PASS_TO_PASS (回归安全性) — 10 points
+#### Dimension 2: Regression Safety — PASS_TO_PASS (回归安全性) — 20 points
 
 **Method:** Automated test execution — existing 13 user tests must still pass
 
 | Score | Criteria |
 |-------|----------|
-| 10 | 100% of PASS_TO_PASS tests still pass. Zero regressions. |
-| 7  | 90-99% of PASS_TO_PASS tests pass. 1-2 minor regressions. |
-| 3  | 70-89% of PASS_TO_PASS tests pass. Several regressions. |
+| 20 | 100% of PASS_TO_PASS tests still pass. Zero regressions. |
+| 14 | 90-99% of PASS_TO_PASS tests pass. 1-2 minor regressions. |
+| 6  | 70-89% of PASS_TO_PASS tests pass. Several regressions. |
 | 0  | < 70% of PASS_TO_PASS tests pass. Agent broke existing functionality. |
 
-#### Dimension 3: Readability (可读性) — 15 points
+#### Dimension 3: Readability (可读性) — 7 points
 
 **Method:** LLM-as-judge
 
 | Score | Criteria |
 |-------|----------|
-| 15 | Intent-revealing naming that reads like natural language. Consistent formatting matching the existing codebase. Docstrings on all public interfaces. Complex logic has inline explanatory comments. |
-| 12 | Highly readable, consistent formatting, clear naming. Minor gaps in documentation of non-obvious logic. |
-| 9  | Mostly readable, but some cryptic names (`temp`, `data1`, `v`), or complex algorithms/regex lack inline comments. |
-| 6  | Inconsistent naming/casing, large undocumented blocks, confusing layout. |
-| 3  | Completely cryptic naming throughout, no comments, messy indentation. |
+| 7  | Intent-revealing naming that reads like natural language. Consistent formatting matching the existing codebase. Docstrings on all public interfaces. Complex logic has inline explanatory comments. |
+| 5  | Highly readable, consistent formatting, clear naming. Minor gaps in documentation of non-obvious logic. |
+| 4  | Mostly readable, but some cryptic names (`temp`, `data1`, `v`), or complex algorithms/regex lack inline comments. |
+| 2  | Inconsistent naming/casing, large undocumented blocks, confusing layout. |
+| 1  | Completely cryptic naming throughout, no comments, messy indentation. |
 
-**Hard cap:** If the agent uses single-letter variable names in business logic (not loop counters), readability MUST be ≤ 9.
+**Hard cap:** If the agent uses single-letter variable names in business logic (not loop counters), readability MUST be ≤ 4.
 
-#### Dimension 4: Maintainability (可维护性) — 15 points
+#### Dimension 4: Maintainability (可维护性) — 7 points
 
 **Method:** Automated (AST complexity analysis) + LLM-as-judge
 
 | Score | Criteria |
 |-------|----------|
-| 15 | Flawless separation of concerns. Single-responsibility functions (mostly < 20 lines). Clean dependency injection. Loose coupling. Zero copy-pasted logic (DRY compliance). |
-| 12 | Strong modularity, clear layer boundaries, short functions (mostly < 30 lines), mockable dependencies. |
-| 9  | Standard structure but some implementation details leak across layers; a few functions are monolithic or contain duplicate logic blocks. |
-| 6  | Monolithic functions (> 80 lines), high cyclomatic complexity (> 15), deep nesting (4+), or systemic copy-pasted code across modules. |
-| 3  | Extreme debt: gigantic functions (> 150 lines), God Classes, global mutable state, tight coupling. |
+| 7  | Flawless separation of concerns. Single-responsibility functions (mostly < 20 lines). Clean dependency injection. Loose coupling. Zero copy-pasted logic (DRY compliance). |
+| 5  | Strong modularity, clear layer boundaries, short functions (mostly < 30 lines), mockable dependencies. |
+| 4  | Standard structure but some implementation details leak across layers; a few functions are monolithic or contain duplicate logic blocks. |
+| 2  | Monolithic functions (> 80 lines), high cyclomatic complexity (> 15), deep nesting (4+), or systemic copy-pasted code across modules. |
+| 1  | Extreme debt: gigantic functions (> 150 lines), God Classes, global mutable state, tight coupling. |
 
 **Hard caps:**
-- If any single new file exceeds 500 lines, maintainability MUST be ≤ 9.
-- If a single function exceeds 100 lines, maintainability MUST be ≤ 6.
-- If business logic is placed directly in API route handlers (bypassing service layer), maintainability MUST be ≤ 9.
+- If any single new file exceeds 500 lines, maintainability MUST be ≤ 4.
+- If a single function exceeds 100 lines, maintainability MUST be ≤ 2.
+- If business logic is placed directly in API route handlers (bypassing service layer), maintainability MUST be ≤ 4.
 
-#### Dimension 5: Robustness (健壮性) — 15 points
+#### Dimension 5: Robustness (健壮性) — 7 points
 
 **Method:** Automated (pattern detection) + LLM-as-judge
 
 | Score | Criteria |
 |-------|----------|
-| 15 | Defensive programming throughout. Specific exceptions handled and propagated (not bare `except:`). Safe resource management (context managers, async cleanup). No magic constants. Input validation at boundaries. Concurrent safety where applicable. |
-| 12 | Strong defensive coding. Specific exceptions handled. Clean resource lifetimes. Minor magic constants (< 2). |
-| 9  | Errors handled but generic catch-all blocks common. Some magic constants. Missing validation on 1-2 edge cases. |
-| 6  | Silent error swallowing (logging but not propagating). Manual resource management with leak risks. Bare `except: pass` in business logic. |
-| 3  | Silently swallowed exceptions in critical paths (payment, data mutation). No input validation. Hardcoded credentials or secrets. |
+| 7  | Defensive programming throughout. Specific exceptions handled and propagated (not bare `except:`). Safe resource management (context managers, async cleanup). No magic constants. Input validation at boundaries. Concurrent safety where applicable. |
+| 5  | Strong defensive coding. Specific exceptions handled. Clean resource lifetimes. Minor magic constants (< 2). |
+| 4  | Errors handled but generic catch-all blocks common. Some magic constants. Missing validation on 1-2 edge cases. |
+| 2  | Silent error swallowing (logging but not propagating). Manual resource management with leak risks. Bare `except: pass` in business logic. |
+| 1  | Silently swallowed exceptions in critical paths (payment, data mutation). No input validation. Hardcoded credentials or secrets. |
 
 **Hard caps:**
-- If the agent uses bare `except:` or `except Exception: pass` in business logic, robustness MUST be ≤ 9.
-- If errors in payment/settlement/data-mutation paths are silently swallowed, robustness MUST be ≤ 6.
-- If hardcoded secrets/credentials are introduced, robustness MUST be ≤ 3.
+- If the agent uses bare `except:` or `except Exception: pass` in business logic, robustness MUST be ≤ 4.
+- If errors in payment/settlement/data-mutation paths are silently swallowed, robustness MUST be ≤ 2.
+- If hardcoded secrets/credentials are introduced, robustness MUST be ≤ 1.
 
-#### Dimension 6: Convention Adherence (规范遵循) — 10 points
+#### Dimension 6: Convention Adherence (规范遵循) — 5 points
 
 **Method:** Automated pattern matching + LLM-as-judge
 
 | Score | Criteria |
 |-------|----------|
-| 10 | Follows all established repo patterns: repository pattern for data access, service layer for logic, Pydantic schemas for validation, consistent naming (snake_case), proper file placement, imports organized per existing style. New code is indistinguishable from existing code in style. |
-| 8  | Follows most patterns. 1-2 minor deviations (e.g., slightly different import style). |
-| 6  | Follows general structure but with notable deviations: putting business logic in API layer, or skipping the repository pattern. |
-| 4  | Partially follows conventions. Mix of patterns used inconsistently. |
-| 2  | Ignores repo conventions entirely. Code works but doesn't fit the codebase. |
+| 5  | Follows all established repo patterns: repository pattern for data access, service layer for logic, Pydantic schemas for validation, consistent naming (snake_case), proper file placement, imports organized per existing style. New code is indistinguishable from existing code in style. |
+| 4  | Follows most patterns. 1-2 minor deviations (e.g., slightly different import style). |
+| 3  | Follows general structure but with notable deviations: putting business logic in API layer, or skipping the repository pattern. |
+| 2  | Partially follows conventions. Mix of patterns used inconsistently. |
+| 1  | Ignores repo conventions entirely. Code works but doesn't fit the codebase. |
 
-**Hard cap:** If the agent skips the repository pattern entirely (direct DB queries in service or API layer), convention MUST be ≤ 6.
+**Hard cap:** If the agent skips the repository pattern entirely (direct DB queries in service or API layer), convention MUST be ≤ 3.
 
-#### Dimension 7: Change Minimality (变更最小化) — 10 points
+#### Dimension 7: Change Minimality (变更最小化) — 4 points
 
 **Method:** Automated diff analysis
 
 | Score | Criteria |
 |-------|----------|
-| 10 | Changes are minimal and focused. Only touches files necessary for the task. No unnecessary refactoring, no unrelated changes, no dead code introduced. |
-| 8  | Mostly minimal. 1-2 minor unnecessary changes (e.g., reformatting an unrelated line). |
-| 6  | Some unnecessary changes: touching files that didn't need modification, or adding unused imports/utilities. |
-| 4  | Significant unnecessary changes: refactoring unrelated code, adding helper functions never called. |
-| 2  | Massive unnecessary changes that obscure the actual feature implementation. |
+| 4  | Changes are minimal and focused. Only touches files necessary for the task. No unnecessary refactoring, no unrelated changes, no dead code introduced. |
+| 3  | Mostly minimal. 1-2 minor unnecessary changes (e.g., reformatting an unrelated line). |
+| 2  | Some unnecessary changes: touching files that didn't need modification, or adding unused imports/utilities. |
+| 1  | Significant unnecessary changes: refactoring unrelated code, adding helper functions never called. |
+| 0  | Massive unnecessary changes that obscure the actual feature implementation. |
 
 ### Overall Score Synthesis (C3)
 
@@ -858,65 +858,65 @@ Respond in JSON:
 
 #### Evaluation Criteria (5 dimensions, 100 points total)
 
-##### Dimension 1: Coverage (测试覆盖率) — 30 points
+##### Dimension 1: Coverage (测试覆盖率) — 50 points
 
-**Method:** Automated (pytest-cov)
+**Method:** Automated (pytest pass rate)
 
 | Score | Criteria |
 |-------|----------|
-| 30 | Line coverage >= 90% AND branch coverage >= 80% for the target module. |
-| 24 | Line coverage 75-89% AND branch coverage 65-79%. |
-| 18 | Line coverage 60-74% OR branch coverage 50-64%. |
-| 12 | Line coverage 40-59%. Major code paths untested. |
-| 6  | Line coverage < 40%. Only trivial happy-path tested. |
+| 50 | 100% pass rate AND test count >= gold_test_count. All agent-written tests pass and the suite is comprehensive. |
+| 40 | 100% pass rate but test count < gold_test_count. All tests pass but coverage is incomplete. |
+| 30 | Pass rate >= 80%. Most tests pass, a few failures. |
+| 20 | Pass rate 50-79%. Significant test failures. |
+| 10 | Pass rate < 50%, OR fewer than 5 tests written. |
 
-##### Dimension 2: Assertion Quality (断言质量) — 25 points
+##### Dimension 2: Assertion Quality (断言质量) — 18 points
 
 **Method:** AST analysis + LLM-as-judge
 
 | Score | Criteria |
 |-------|----------|
-| 25 | Every test has specific, meaningful assertions (exact value checks, not just "no exception"). Asserts cover return values, state changes, side effects, AND error conditions. Uses appropriate assertion methods (assertEqual for values, assertRaises for exceptions, mock.assert_called_with for interactions). |
-| 20 | Good assertions covering return values and error conditions. Minor gaps in side-effect verification. |
-| 15 | Assertions present but some are weak (e.g., `assert result is not None` instead of checking the actual value). Error conditions partially tested. |
-| 10 | Many tests just check "no exception raised". Few meaningful value assertions. |
-| 5  | Trivial assertions only (e.g., `assert True`, `assert response.status_code == 200` without body checks). |
+| 18 | Every test has specific, meaningful assertions (exact value checks, not just "no exception"). Asserts cover return values, state changes, side effects, AND error conditions. Uses appropriate assertion methods. |
+| 14 | Good assertions covering return values and error conditions. Minor gaps in side-effect verification. |
+| 10 | Assertions present but some are weak (e.g., `assert result is not None` instead of checking the actual value). Error conditions partially tested. |
+| 7  | Many tests just check "no exception raised". Few meaningful value assertions. |
+| 3  | Trivial assertions only (e.g., `assert True`, `assert response.status_code == 200` without body checks). |
 
-##### Dimension 3: Edge Case Coverage (边界场景覆盖) — 20 points
+##### Dimension 3: Edge Case Coverage (边界场景覆盖) — 14 points
 
 **Method:** LLM-as-judge against gold-standard edge case list
 
 | Score | Criteria |
 |-------|----------|
-| 20 | Tests cover: empty inputs, boundary values (min/max), error conditions (invalid input, resource not found, permission denied), concurrent operations (if applicable), and at least 2 non-obvious edge cases specific to the business logic. |
-| 16 | Tests cover most common edge cases (empty input, not found, permission). 1 non-obvious case. |
-| 12 | Some edge cases covered but gaps in error conditions or boundary values. |
-| 8  | Only happy path + 1-2 obvious error cases (e.g., 404). |
-| 4  | Happy path only. No edge cases. |
+| 14 | Tests cover: empty inputs, boundary values (min/max), error conditions (invalid input, resource not found, permission denied), concurrent operations (if applicable), and at least 2 non-obvious edge cases specific to the business logic. |
+| 11 | Tests cover most common edge cases (empty input, not found, permission). 1 non-obvious case. |
+| 8  | Some edge cases covered but gaps in error conditions or boundary values. |
+| 5  | Only happy path + 1-2 obvious error cases (e.g., 404). |
+| 3  | Happy path only. No edge cases. |
 
-##### Dimension 4: Test Independence & Structure (测试独立性与结构) — 15 points
+##### Dimension 4: Test Independence & Structure (测试独立性与结构) — 11 points
 
 **Method:** Automated (pytest execution analysis) + AST analysis
 
 | Score | Criteria |
 |-------|----------|
-| 15 | All tests pass when run individually and in any order. Proper setup/teardown (fixtures, not shared mutable state). Each test tests one thing (single assertion concern). Clear test names following `test_<action>_<condition>_<expected>` pattern. Tests use existing conftest.py fixtures. |
-| 12 | Tests independent and structured. Minor issues (e.g., 1 test name unclear, or slightly redundant setup). |
-| 9  | Mostly independent but some tests share mutable state or have order dependencies. Test names could be clearer. |
-| 6  | Test isolation issues: shared state, order-dependent tests, or setup logic mixed into test functions. |
-| 3  | Tests tightly coupled, can't run individually, or fragile (break when unrelated code changes). |
+| 11 | All tests pass when run individually and in any order. Proper setup/teardown (fixtures, not shared mutable state). Each test tests one thing (single assertion concern). Clear test names following `test_<action>_<condition>_<expected>` pattern. Tests use existing conftest.py fixtures. |
+| 9  | Tests independent and structured. Minor issues (e.g., 1 test name unclear, or slightly redundant setup). |
+| 6  | Mostly independent but some tests share mutable state or have order dependencies. Test names could be clearer. |
+| 4  | Test isolation issues: shared state, order-dependent tests, or setup logic mixed into test functions. |
+| 2  | Tests tightly coupled, can't run individually, or fragile (break when unrelated code changes). |
 
-##### Dimension 5: Convention Adherence (规范遵循) — 10 points
+##### Dimension 5: Convention Adherence (规范遵循) — 7 points
 
 **Method:** Automated (AST pattern matching)
 
 | Score | Criteria |
 |-------|----------|
-| 10 | Follows existing test patterns in the repo: uses pytest (not unittest), uses fixtures from conftest.py, follows existing file naming (test_<module>.py), uses existing test client and DB fixtures, mock patterns consistent with existing tests. |
-| 8  | Mostly follows conventions. 1 minor deviation. |
-| 6  | Partially follows conventions. Uses pytest but doesn't leverage existing fixtures. |
-| 4  | Uses different testing patterns (e.g., unittest.TestCase when repo uses pytest functions). |
-| 2  | Completely different testing style. Ignores existing test infrastructure. |
+| 7  | Follows existing test patterns in the repo: uses pytest (not unittest), uses fixtures from conftest.py, follows existing file naming (test_<module>.py), uses existing test client and DB fixtures, mock patterns consistent with existing tests. |
+| 5  | Mostly follows conventions. 1 minor deviation. |
+| 4  | Partially follows conventions. Uses pytest but doesn't leverage existing fixtures. |
+| 2  | Uses different testing patterns (e.g., unittest.TestCase when repo uses pytest functions). |
+| 1  | Completely different testing style. Ignores existing test infrastructure. |
 
 ---
 
@@ -944,53 +944,53 @@ Respond in JSON:
 
 #### Evaluation Criteria (4 dimensions, 100 points total)
 
-##### Dimension 1: Root Cause Identification (根因定位) — 30 points
+##### Dimension 1: Root Cause Identification (根因定位) — 20 points
 
 **Method:** LLM-as-judge against ground-truth root cause
 
 | Score | Criteria |
 |-------|----------|
-| 30 | Correctly identifies the exact root cause: the specific line(s) of code, the nature of the bug (off-by-one, race condition, missing error handling), and why it produces the observed symptom. |
-| 24 | Identifies the correct area and type of bug but slightly imprecise about the exact mechanism (e.g., "there's a race condition in the application flow" without specifying the TOCTOU pattern). |
-| 18 | Identifies the correct file/function but mischaracterizes the bug type, or identifies the symptom but not the underlying cause. |
-| 12 | Partially correct: right area but wrong diagnosis. Would lead to a fix that might mask the bug but not truly resolve it. |
-| 6  | Incorrect root cause identification. Points to the wrong code or wrong type of issue. |
+| 20 | Correctly identifies the exact root cause: the specific line(s) of code, the nature of the bug (off-by-one, race condition, missing error handling), and why it produces the observed symptom. |
+| 16 | Identifies the correct area and type of bug but slightly imprecise about the exact mechanism (e.g., "there's a race condition in the application flow" without specifying the TOCTOU pattern). |
+| 12 | Identifies the correct file/function but mischaracterizes the bug type, or identifies the symptom but not the underlying cause. |
+| 8  | Partially correct: right area but wrong diagnosis. Would lead to a fix that might mask the bug but not truly resolve it. |
+| 4  | Incorrect root cause identification. Points to the wrong code or wrong type of issue. |
 
-##### Dimension 2: Fix Correctness (修复正确性) — 35 points
+##### Dimension 2: Fix Correctness (修复正确性) — 50 points
 
 **Method:** Automated test execution (SWE-bench style)
 
 | Score | Criteria |
 |-------|----------|
-| 35 | All FAIL_TO_PASS tests pass AND all PASS_TO_PASS tests pass. The fix resolves the reported issue completely. |
-| 28 | FAIL_TO_PASS tests pass but 1 PASS_TO_PASS test regressed (fix has minor side effect). |
-| 21 | Most FAIL_TO_PASS tests pass (70%+). The core issue is resolved but edge cases may remain. |
-| 14 | Partial fix: the immediate symptom is addressed but the underlying issue can still trigger under different conditions. |
-| 7  | Fix doesn't resolve the issue. Tests still fail, or new failures introduced. |
+| 50 | All FAIL_TO_PASS tests pass AND all PASS_TO_PASS tests pass. The fix resolves the reported issue completely. |
+| 40 | FAIL_TO_PASS tests pass but 1 PASS_TO_PASS test regressed (fix has minor side effect). |
+| 30 | Most FAIL_TO_PASS tests pass (70%+). The core issue is resolved but edge cases may remain. |
+| 20 | Partial fix: the immediate symptom is addressed but the underlying issue can still trigger under different conditions. |
+| 10 | Fix doesn't resolve the issue. Tests still fail, or new failures introduced. |
 
-##### Dimension 3: Fix Minimality (修复最小化) — 15 points
+##### Dimension 3: Fix Minimality (修复最小化) — 20 points
 
 **Method:** Automated diff analysis
 
 | Score | Criteria |
 |-------|----------|
-| 15 | Fix is surgical: changes only the lines necessary to resolve the bug. No refactoring, no unrelated changes, no "while I'm here" improvements. Diff is clean and focused. |
-| 12 | Fix is focused but includes 1-2 minor unnecessary changes (e.g., formatting a nearby line). |
-| 9  | Fix is correct but includes some unnecessary refactoring or defensive coding beyond what's needed. |
-| 6  | Significant unnecessary changes that obscure the actual fix. |
-| 3  | Major rewrite instead of targeted fix. |
+| 20 | Fix is surgical: changes only the lines necessary to resolve the bug. No refactoring, no unrelated changes, no "while I'm here" improvements. Diff is clean and focused. |
+| 16 | Fix is focused but includes 1-2 minor unnecessary changes (e.g., formatting a nearby line). |
+| 12 | Fix is correct but includes some unnecessary refactoring or defensive coding beyond what's needed. |
+| 8  | Significant unnecessary changes that obscure the actual fix. |
+| 4  | Major rewrite instead of targeted fix. |
 
-##### Dimension 4: Explanation Quality (诊断解释质量) — 20 points
+##### Dimension 4: Explanation Quality (诊断解释质量) — 10 points
 
 **Method:** LLM-as-judge
 
 | Score | Criteria |
 |-------|----------|
-| 20 | Explanation clearly describes: (1) what the bug is, (2) why the current code produces the wrong behavior (step-by-step reasoning), (3) why the fix resolves it, and (4) whether similar patterns exist elsewhere that might need the same fix. Demonstrates deep understanding. |
-| 16 | Clear explanation of the bug and fix. Missing either the step-by-step reasoning or the similar-pattern analysis. |
-| 12 | Explains what was changed but not deeply why the original code was wrong. Surface-level understanding. |
-| 8  | Minimal explanation. "Changed X to Y" without reasoning. |
-| 4  | No explanation or incorrect explanation that contradicts the actual fix. |
+| 10 | Explanation clearly describes: (1) what the bug is, (2) why the current code produces the wrong behavior (step-by-step reasoning), (3) why the fix resolves it, and (4) whether similar patterns exist elsewhere that might need the same fix. Demonstrates deep understanding. |
+| 8  | Clear explanation of the bug and fix. Missing either the step-by-step reasoning or the similar-pattern analysis. |
+| 6  | Explains what was changed but not deeply why the original code was wrong. Surface-level understanding. |
+| 4  | Minimal explanation. "Changed X to Y" without reasoning. |
+| 2  | No explanation or incorrect explanation that contradicts the actual fix. |
 
 ---
 
@@ -1010,14 +1010,9 @@ Respond in JSON:
 ### Composite Score
 
 ```
-Overall Score = w1×C1 + w2×C2 + w3×C3 + w4×C4 + w5×C5
+Overall Score = (C1 + C2 + C3 + C4 + C5a + C5b) / 6
 
-Default weights (adjustable per enterprise priority):
-  w1 = 0.15  (Requirements)
-  w2 = 0.15  (Design)
-  w3 = 0.30  (Code Generation — highest weight, core capability)
-  w4 = 0.20  (Code Review)
-  w5 = 0.20  (Testing & Debug — split: C5a=0.12, C5b=0.08)
+Equal-weight average across all 6 categories.
 ```
 
 ### Grade Mapping

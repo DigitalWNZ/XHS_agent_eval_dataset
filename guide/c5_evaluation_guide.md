@@ -236,7 +236,7 @@ judge_result = build_judge_payload("c5a", rubric, entry, test_code,
 | **40** | 100% pass rate but test count < gold_test_count. All tests pass but coverage is incomplete. |
 | **30** | Pass rate >= 80%. Most tests pass, a few failures. |
 | **20** | Pass rate 50-79%. Significant test failures. |
-| **10** | Pass rate < 50%, or no tests written. |
+| **10** | Pass rate < 50%, OR fewer than 5 tests written. |
 
 - **Method:** `automated` (via `pytest`)
 - **Tool:** pytest
