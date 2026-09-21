@@ -1,0 +1,677 @@
+{
+  "instance_id": "C2-04",
+  "category": "C2",
+  "category_name": "技术方案设计",
+  "maps_to_journey": "Journey 4: Review & Approval Workflow",
+  "input": {
+    "requirements_spec": "See C1-04 gold standard output — structured spec for the two-level review workflow (brand review → compliance review) with state machine, 7 user stories, edge cases, and NFRs.",
+    "requirements_spec_ref": "dataset/c1/C1-04_review_workflow.json#gold_standard_output",
+    "system_context": {
+      "existing_services": [
+        "User Service: user profiles, authentication, roles (creator/brand/admin). Access via UserRepository.",
+        "Campaign Service: campaign CRUD, state machine (draft→active→completed). Campaigns own submissions.",
+        "Application Service: creator applications to campaigns, acceptance workflow. Accepted creators can submit content.",
+        "Content Submission Service: content draft CRUD with version tracking (v1, v2, v3). Submissions have a status field, media references, and auto-validation pipeline.",
+        "Notification Service: async push notifications via Celery task queue. Accepts (user_id, template_id, payload).",
+        "Payment Service: wallet, transactions, settlement batch processing."
+      ],
+      "tech_stack": "Python 3.11, FastAPI, SQLAlchemy 2.0 (async), PostgreSQL, Redis, Celery, Pydantic v2",
+      "architecture_patterns": "Layered architecture: Model → Repository → Service → API. Dependency injection via FastAPI Depends. Custom exception classes (NotFoundError, ConflictError, ForbiddenError, ValidationError) mapped to HTTP responses. Pydantic schemas split into Create/Update/Response. Pagination via PaginatedResponse[T]. Soft delete with is_deleted flag. UUID primary keys. TimestampMixin for created_at/updated_at.",
+      "constraints": [
+        "All new tables must use the existing Base, TimestampMixin, and SoftDeleteMixin from app.models.base",
+        "All new endpoints must be registered under /api/v1/ via the existing router pattern",
+        "Auth is via X-User-Id header → get_current_user dependency. Role checks via require_role() dependency.",
+        "Async notifications must use Celery tasks (fire-and-forget), never blocking the request path",
+        "Database-level locking is available via SELECT FOR UPDATE (PostgreSQL)"
+      ]
+    }
+  },
+  "gold_standard_output": {
+    "module_design": {
+      "overview": "The review workflow introduces two new models (Review, ReviewComment), plus a ReviewAuditLog for immutable audit trail. The architecture follows a two-level sequential approval chain: content submissions first go through brand review, then automatically advance to compliance review upon brand approval. Each level is handled by the same Review model distinguished by a review_type enum. A single ReviewService orchestrates both levels, enforcing state preconditions, revision limits, and concurrency guards.",
+      "new_files": [
+        {
+          "path": "app/models/review.py",
+          "purpose": "Review, ReviewComment, and ReviewAuditLog SQLAlchemy models with enums for ReviewType and ReviewDecision"
+        },
+        {
+          "path": "app/schemas/review.py",
+          "purpose": "Pydantic schemas: ReviewCreate, ReviewDecisionUpdate, ReviewCommentCreate, ReviewResponse, ReviewCommentResponse, ReviewAuditLogResponse"
+        },
+        {
+          "path": "app/repositories/review_repo.py",
+          "purpose": "ReviewRepository: CRUD for reviews, comments, and audit log entries. Includes get_active_review_for_submission() with SELECT FOR UPDATE locking."
+        },
+        {
+          "path": "app/services/review_service.py",
+          "purpose": "ReviewService: orchestrates the two-level review flow. Enforces state machine transitions, revision limits, concurrency guards. Integrates with ContentSubmission service for status updates and Notification service for async alerts."
+        },
+        {
+          "path": "app/api/v1/reviews.py",
+          "purpose": "Review API router: endpoints for listing reviews, submitting decisions, adding comments"
+        }
+      ],
+      "modified_files": [
+        {
+          "path": "app/models/__init__.py",
+          "change": "Add imports for Review, ReviewComment, ReviewAuditLog"
+        },
+        {
+          "path": "app/api/v1/router.py",
+          "change": "Register reviews router under /api/v1/"
+        }
+      ],
+      "architecture_notes": "The two-level chain is NOT modeled as two separate workflows. Instead, a single Review model uses a review_type enum (brand_review | compliance_review). When a brand review results in 'approved', the ReviewService automatically creates a new Review record of type compliance_review and transitions the submission to 'pending_compliance'. This keeps the model simple while supporting the sequential chain."
+    },
+    "api_design": {
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/api/v1/submissions/{submission_id}/reviews",
+          "description": "List all reviews for a content submission, ordered by created_at descending",
+          "auth": "CurrentUser — brand (campaign owner) or admin",
+          "query_params": {
+            "review_type": {
+              "type": "string | null",
+              "enum": [
+                "brand_review",
+                "compliance_review"
+              ],
+              "description": "Filter by review type"
+            },
+            "page": {
+              "type": "int",
+              "default": 1,
+              "min": 1
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20,
+              "min": 1,
+              "max": 100
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": "PaginatedResponse[ReviewResponse]"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Submission not found"
+            },
+            {
+              "status": 403,
+              "condition": "User is not the campaign owner or admin"
+            }
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/submissions/{submission_id}/reviews",
+          "description": "Create a new review for a submission. Brand creates brand_review, admin creates compliance_review. System validates that the submission is in the correct state for the review type.",
+          "auth": "CurrentUser — brand (for brand_review) or admin (for compliance_review)",
+          "request_body": {
+            "schema": "ReviewCreate",
+            "fields": {
+              "review_type": {
+                "type": "ReviewType",
+                "required": true,
+                "description": "brand_review or compliance_review"
+              },
+              "decision": {
+                "type": "ReviewDecision",
+                "required": true,
+                "enum": [
+                  "approved",
+                  "rejected",
+                  "revision_requested"
+                ]
+              },
+              "rejection_reason": {
+                "type": "string | null",
+                "max_length": 500,
+                "description": "Required when decision is 'rejected'"
+              },
+              "violation_category": {
+                "type": "string | null",
+                "enum": [
+                  "prohibited_content",
+                  "misleading_claims",
+                  "missing_disclosure",
+                  "brand_safety",
+                  "other"
+                ],
+                "description": "Required for compliance_review rejection"
+              },
+              "comments": {
+                "type": "list[ReviewCommentCreate] | null",
+                "description": "Inline feedback comments. Required when decision is 'revision_requested', must have at least 1 comment"
+              }
+            }
+          },
+          "response": {
+            "status": 201,
+            "body": "ReviewResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Submission not found"
+            },
+            {
+              "status": 403,
+              "condition": "User role does not match review_type (brand for brand_review, admin for compliance_review)"
+            },
+            {
+              "status": 409,
+              "condition": "Submission is not in the correct state for this review type (e.g., trying to create compliance_review when submission is in pending_brand_review)"
+            },
+            {
+              "status": 409,
+              "condition": "An active review of this type already exists for this submission (duplicate review prevention)"
+            },
+            {
+              "status": 422,
+              "condition": "rejection_reason missing when decision is 'rejected', or comments missing when decision is 'revision_requested'"
+            }
+          ],
+          "side_effects": [
+            "Creates ReviewAuditLog entry",
+            "If brand approves: creates a new compliance_review record with decision=pending, updates submission status to pending_compliance",
+            "If compliance approves: updates submission status to ready_to_publish",
+            "If revision_requested or rejected: updates submission status accordingly",
+            "Sends async notification to affected party (creator on revision/rejection, admin on brand approval for compliance queue)"
+          ]
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/reviews/{review_id}/comments",
+          "description": "Add an inline feedback comment to an existing review",
+          "auth": "CurrentUser — must be the reviewer who created this review",
+          "request_body": {
+            "schema": "ReviewCommentCreate",
+            "fields": {
+              "content_version_id": {
+                "type": "string",
+                "required": true,
+                "description": "The specific content version this comment references"
+              },
+              "line_reference": {
+                "type": "string | null",
+                "description": "Optional field or line reference (e.g., 'body:paragraph_3' or 'image:2')"
+              },
+              "comment_text": {
+                "type": "string",
+                "required": true,
+                "min_length": 5,
+                "max_length": 1000
+              }
+            }
+          },
+          "response": {
+            "status": 201,
+            "body": "ReviewCommentResponse"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Review not found"
+            },
+            {
+              "status": 403,
+              "condition": "User is not the reviewer who created this review"
+            },
+            {
+              "status": 409,
+              "condition": "Review decision has already been finalized (cannot add comments to a closed review)"
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/reviews/{review_id}",
+          "description": "Get review detail including all comments and audit log entries",
+          "auth": "CurrentUser — campaign owner brand, assigned creator, or admin",
+          "response": {
+            "status": 200,
+            "body": "ReviewDetailResponse (includes ReviewResponse + list[ReviewCommentResponse] + list[ReviewAuditLogResponse])"
+          },
+          "errors": [
+            {
+              "status": 404,
+              "condition": "Review not found"
+            },
+            {
+              "status": 403,
+              "condition": "User is not authorized to view this review"
+            }
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/reviews/compliance-queue",
+          "description": "List all submissions pending compliance review, ordered by submission time (FIFO). Admin-only endpoint for the compliance review queue.",
+          "auth": "require_role('admin')",
+          "query_params": {
+            "page": {
+              "type": "int",
+              "default": 1
+            },
+            "page_size": {
+              "type": "int",
+              "default": 20,
+              "max": 100
+            },
+            "overdue_only": {
+              "type": "bool",
+              "default": false,
+              "description": "Filter to show only reviews pending > 24 hours"
+            }
+          },
+          "response": {
+            "status": 200,
+            "body": "PaginatedResponse[ComplianceQueueItem]"
+          },
+          "errors": [
+            {
+              "status": 403,
+              "condition": "User is not an admin"
+            }
+          ]
+        }
+      ]
+    },
+    "data_model": {
+      "tables": [
+        {
+          "name": "reviews",
+          "description": "Tracks each review action (brand or compliance) on a content submission",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "constraints": "PK, default=generate_uuid"
+            },
+            {
+              "name": "submission_id",
+              "type": "String(36)",
+              "constraints": "FK → content_submissions.id, NOT NULL"
+            },
+            {
+              "name": "reviewer_id",
+              "type": "String(36)",
+              "constraints": "FK → users.id, NOT NULL"
+            },
+            {
+              "name": "review_type",
+              "type": "Enum(ReviewType)",
+              "constraints": "NOT NULL, values: brand_review, compliance_review"
+            },
+            {
+              "name": "decision",
+              "type": "Enum(ReviewDecision)",
+              "constraints": "NOT NULL, values: pending, approved, rejected, revision_requested"
+            },
+            {
+              "name": "rejection_reason",
+              "type": "String(500)",
+              "constraints": "nullable, required when decision=rejected"
+            },
+            {
+              "name": "violation_category",
+              "type": "String(50)",
+              "constraints": "nullable, required for compliance_review rejection"
+            },
+            {
+              "name": "revision_count",
+              "type": "Integer",
+              "constraints": "NOT NULL, default=0, tracks cumulative revisions for this submission"
+            },
+            {
+              "name": "decided_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "nullable, set when decision changes from pending"
+            },
+            {
+              "name": "is_active",
+              "type": "Boolean",
+              "constraints": "NOT NULL, default=True. Set to False when superseded by a new review after revision"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now() (from TimestampMixin)"
+            },
+            {
+              "name": "updated_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL (from TimestampMixin)"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_reviews_submission_type",
+              "columns": [
+                "submission_id",
+                "review_type"
+              ],
+              "note": "Primary lookup pattern: find reviews for a submission by type"
+            },
+            {
+              "name": "ix_reviews_reviewer",
+              "columns": [
+                "reviewer_id"
+              ],
+              "note": "Lookup reviews by reviewer for workload queries"
+            },
+            {
+              "name": "ix_reviews_decision",
+              "columns": [
+                "decision"
+              ],
+              "note": "Filter by decision status (e.g., pending for queue)"
+            },
+            {
+              "name": "uq_reviews_active_submission_type",
+              "columns": [
+                "submission_id",
+                "review_type"
+              ],
+              "type": "UNIQUE partial",
+              "condition": "WHERE is_active = True",
+              "note": "Enforce at most one active review per (submission, type) at database level"
+            }
+          ]
+        },
+        {
+          "name": "review_comments",
+          "description": "Inline feedback comments attached to a review, referencing specific content versions and locations",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "constraints": "PK, default=generate_uuid"
+            },
+            {
+              "name": "review_id",
+              "type": "String(36)",
+              "constraints": "FK → reviews.id, NOT NULL, ON DELETE CASCADE"
+            },
+            {
+              "name": "content_version_id",
+              "type": "String(36)",
+              "constraints": "FK → content_versions.id, NOT NULL"
+            },
+            {
+              "name": "line_reference",
+              "type": "String(100)",
+              "constraints": "nullable, e.g. 'body:paragraph_3', 'image:2', 'hashtag:1'"
+            },
+            {
+              "name": "comment_text",
+              "type": "String(1000)",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now()"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_review_comments_review",
+              "columns": [
+                "review_id"
+              ],
+              "note": "Fetch all comments for a review"
+            }
+          ]
+        },
+        {
+          "name": "review_audit_log",
+          "description": "Immutable append-only log of all review actions for traceability and dispute resolution",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "constraints": "PK, default=generate_uuid"
+            },
+            {
+              "name": "review_id",
+              "type": "String(36)",
+              "constraints": "FK → reviews.id, NOT NULL"
+            },
+            {
+              "name": "submission_id",
+              "type": "String(36)",
+              "constraints": "FK → content_submissions.id, NOT NULL (denormalized for query efficiency)"
+            },
+            {
+              "name": "actor_id",
+              "type": "String(36)",
+              "constraints": "FK → users.id, NOT NULL"
+            },
+            {
+              "name": "actor_role",
+              "type": "String(20)",
+              "constraints": "NOT NULL, snapshot of actor's role at time of action"
+            },
+            {
+              "name": "action",
+              "type": "String(50)",
+              "constraints": "NOT NULL, e.g. 'brand_approved', 'compliance_rejected', 'revision_requested', 'comment_added'"
+            },
+            {
+              "name": "previous_status",
+              "type": "String(50)",
+              "constraints": "nullable, submission status before the action"
+            },
+            {
+              "name": "new_status",
+              "type": "String(50)",
+              "constraints": "nullable, submission status after the action"
+            },
+            {
+              "name": "payload",
+              "type": "JSON",
+              "constraints": "nullable, action-specific data: rejection reason, feedback comments, violation category"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now()"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_audit_log_submission",
+              "columns": [
+                "submission_id",
+                "created_at"
+              ],
+              "note": "Fetch full audit trail for a submission in chronological order"
+            },
+            {
+              "name": "ix_audit_log_actor",
+              "columns": [
+                "actor_id"
+              ],
+              "note": "Query actions by a specific reviewer"
+            }
+          ],
+          "notes": "This table is append-only. No UPDATE or DELETE operations are permitted at the application layer. The SoftDeleteMixin is NOT applied to this model."
+        }
+      ]
+    },
+    "integration_points": [
+      {
+        "service": "Content Submission Service",
+        "interaction": "ReviewService calls SubmissionService.update_status() to transition submission status (e.g., pending_brand_review → brand_approved → pending_compliance → ready_to_publish). The submission service owns the status field; the review service requests transitions and the submission service validates them against its own state machine.",
+        "interface": "Internal method call (same microservice). SubmissionService.update_status(submission_id: str, new_status: SubmissionStatus, actor_id: str) → raises ConflictError if transition is invalid."
+      },
+      {
+        "service": "Notification Service",
+        "interaction": "After each review decision, ReviewService dispatches an async Celery task to notify the affected party. Fire-and-forget — notification failure does not roll back the review action.",
+        "interface": "Celery task: send_notification.delay(user_id=str, template_id=str, payload=dict). Templates: 'review_revision_requested', 'review_brand_approved', 'review_compliance_rejected', 'review_ready_to_publish', 'review_escalated'."
+      },
+      {
+        "service": "User Service",
+        "interaction": "ReviewService uses the existing get_current_user dependency to authenticate and authorize reviewers. Role checks (brand vs admin) are enforced via require_role().",
+        "interface": "Existing FastAPI dependency: CurrentUser, require_role('brand'), require_role('admin')."
+      }
+    ],
+    "technical_decisions": [
+      {
+        "decision": "Sequential two-level review (brand → compliance) using a single Review model with review_type enum",
+        "alternatives_considered": [
+          "Two separate models (BrandReview, ComplianceReview): rejected because it doubles the code with nearly identical schemas and logic.",
+          "Parallel review (brand and compliance simultaneously): rejected per CQ-4.1 — creates conflict resolution complexity and wastes compliance resources if brand rejects."
+        ],
+        "justification": "A single Review model with review_type enum keeps the data model simple while cleanly separating the two review levels. The ReviewService handles the automatic brand_approved → create compliance_review transition internally."
+      },
+      {
+        "decision": "Database-level partial unique index for one-active-review-per-submission-per-type constraint",
+        "alternatives_considered": [
+          "Application-level check only: rejected because race conditions can create duplicate active reviews under concurrent requests.",
+          "Full unique index on (submission_id, review_type): rejected because a submission can have multiple reviews over its lifecycle (one per revision cycle), only one should be active at a time."
+        ],
+        "justification": "A partial unique index WHERE is_active = True guarantees at the database level that no two active reviews of the same type exist for a submission. Previous reviews are deactivated (is_active = False) when a new revision cycle begins."
+      },
+      {
+        "decision": "Simple audit log table (ReviewAuditLog) instead of event sourcing",
+        "alternatives_considered": [
+          "Event sourcing with event store: rejected for v1 — overkill for the current scale, adds infrastructure complexity (event store, projections, replay).",
+          "No audit log (reconstruct from Review history): rejected because reviews are mutable (decision field changes) and we need an immutable record."
+        ],
+        "justification": "An append-only audit log table provides the immutability and traceability required by NFR-4.1 with minimal infrastructure. The table uses no SoftDeleteMixin and the application layer prohibits UPDATE/DELETE. Can migrate to event sourcing in v2 if replay/projection needs arise."
+      },
+      {
+        "decision": "SELECT FOR UPDATE row locking on submission status transitions",
+        "alternatives_considered": [
+          "Optimistic locking with version field: viable but requires retry logic on the client side, adding complexity to the API contract.",
+          "No locking (application-level status check only): rejected — TOCTOU race between status check and status update."
+        ],
+        "justification": "SELECT FOR UPDATE provides pessimistic locking that guarantees only one transition executes at a time for a given submission. The lock is held only during the transaction (short-lived). This is the simplest correct solution for PostgreSQL."
+      },
+      {
+        "decision": "Revision count tracked cumulatively on the Review record, not on the submission",
+        "alternatives_considered": [
+          "Track on submission: rejected because if the submission model is owned by another service, we'd need cross-service state coordination.",
+          "Track as a derived count from audit log: rejected because COUNT queries under concurrent writes are unreliable for enforcement."
+        ],
+        "justification": "Storing revision_count on the Review record (carried forward to new reviews via the service layer) keeps the state local to the review domain. The service increments the count when creating a new review after a revision, and checks it before allowing revision_requested decisions."
+      }
+    ],
+    "data_flow": {
+      "description": "Full review cycle for a content submission, from brand review through compliance to publish readiness",
+      "steps": [
+        {
+          "step": 1,
+          "action": "Creator submits content (handled by Content Submission Service)",
+          "result": "Submission created with status=pending_brand_review, version=v1",
+          "data": "ContentSubmission record in DB"
+        },
+        {
+          "step": 2,
+          "action": "Brand opens review queue → GET /api/v1/submissions/{id}/reviews",
+          "result": "Brand sees the submission content and any existing reviews",
+          "data": "PaginatedResponse[ReviewResponse]"
+        },
+        {
+          "step": 3,
+          "action": "Brand submits review decision → POST /api/v1/submissions/{id}/reviews",
+          "flow_branches": [
+            {
+              "branch": "3a: Brand approves",
+              "steps": [
+                "ReviewService acquires SELECT FOR UPDATE lock on submission",
+                "Validates submission.status == pending_brand_review",
+                "Creates Review(review_type=brand_review, decision=approved)",
+                "Writes ReviewAuditLog(action=brand_approved, previous_status=pending_brand_review, new_status=pending_compliance)",
+                "Calls SubmissionService.update_status(pending_compliance)",
+                "Creates Review(review_type=compliance_review, decision=pending) for the compliance stage",
+                "Dispatches Celery task: notify admin of new compliance queue item",
+                "Releases lock, commits transaction",
+                "→ Continues to Step 4"
+              ]
+            },
+            {
+              "branch": "3b: Brand requests revision",
+              "steps": [
+                "Validates revision_count < 3",
+                "Creates Review(review_type=brand_review, decision=revision_requested) with comments",
+                "Writes ReviewAuditLog with feedback payload",
+                "Calls SubmissionService.update_status(revision_requested)",
+                "Dispatches Celery task: notify creator with feedback",
+                "→ Creator revises and resubmits (new version), flow restarts at Step 2 with incremented revision_count"
+              ]
+            },
+            {
+              "branch": "3c: Brand rejects",
+              "steps": [
+                "Creates Review(review_type=brand_review, decision=rejected, rejection_reason=...)",
+                "Writes ReviewAuditLog",
+                "Calls SubmissionService.update_status(brand_rejected)",
+                "Dispatches Celery task: notify creator of rejection",
+                "→ Terminal state for this submission"
+              ]
+            }
+          ]
+        },
+        {
+          "step": 4,
+          "action": "Compliance reviewer opens queue → GET /api/v1/reviews/compliance-queue",
+          "result": "Admin sees list of submissions awaiting compliance review (FIFO)",
+          "data": "PaginatedResponse[ComplianceQueueItem]"
+        },
+        {
+          "step": 5,
+          "action": "Compliance reviewer submits decision → POST /api/v1/submissions/{id}/reviews",
+          "flow_branches": [
+            {
+              "branch": "5a: Compliance approves",
+              "steps": [
+                "ReviewService acquires lock, validates submission.status == pending_compliance",
+                "Updates existing compliance Review(decision=approved, decided_at=now())",
+                "Writes ReviewAuditLog(action=compliance_approved, new_status=ready_to_publish)",
+                "Calls SubmissionService.update_status(ready_to_publish)",
+                "Dispatches Celery task: notify creator to publish",
+                "→ Terminal success state"
+              ]
+            },
+            {
+              "branch": "5b: Compliance rejects",
+              "steps": [
+                "Updates existing compliance Review(decision=rejected, rejection_reason=..., violation_category=...)",
+                "Writes ReviewAuditLog with violation details",
+                "Calls SubmissionService.update_status(compliance_rejected)",
+                "Dispatches Celery tasks: notify creator and brand of compliance rejection",
+                "→ Creator can revise and resubmit (flow restarts at Step 2 with incremented revision_count, re-entering brand review)"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "risk_assessment": [
+      {
+        "risk": "Review queue grows unbounded if brands are slow to review",
+        "impact": "Creator experience degrades, content becomes stale",
+        "mitigation": "Implement reminder notifications (48h) and auto-escalation (7 days) via scheduled Celery beat tasks. P1 priority."
+      },
+      {
+        "risk": "Compliance bottleneck — single compliance queue for all submissions",
+        "impact": "Compliance review becomes the slowest link in the chain",
+        "mitigation": "Monitor compliance queue depth. For v1, pooled queue with overdue flagging. V2 can add reviewer assignment and specialization."
+      },
+      {
+        "risk": "Audit log table grows indefinitely",
+        "impact": "Query performance degrades over time",
+        "mitigation": "Partition by created_at (monthly). Add TTL archival policy for entries older than 2 years. Ensure queries always filter by submission_id (indexed)."
+      }
+    ]
+  },
+  "evaluation_rubric": "evaluation/rubrics/c2_design.json"
+}

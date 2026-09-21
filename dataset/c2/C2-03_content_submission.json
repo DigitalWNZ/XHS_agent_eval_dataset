@@ -1,0 +1,502 @@
+{
+  "instance_id": "C2-03",
+  "category": "C2",
+  "category_name": "技术方案设计",
+  "maps_to_journey": "Journey 3: Content Submission & Revision",
+  "input": {
+    "requirements_spec": "See C1-03 gold standard: enable accepted creators to submit content drafts for campaign collaborations. Submissions pass through an automated validation pipeline (text length, image count, sensitive word detection, image quality API) before reaching the brand. Supports iterative revision workflow with version history. States: draft → auto_checking → auto_rejected/pending_review → revision_requested → approved → published. Max revisions configurable per campaign. Deadline enforcement via UTC comparison.",
+    "system_context": "Existing FastAPI microservice (campaign-service) with Python 3.11, PostgreSQL, Redis, Celery. Existing modules: User (model/repo/service/API with CRUD, soft-delete, pagination), Campaign (assumed created by C2-01), Application (assumed created by C2-02). Layered architecture: Model → Repository → Service → API. Uses SQLAlchemy 2.0 async, Pydantic v2 schemas, custom AppError exceptions. Auth via X-User-Id header with role-based access. See existing user_repo.py, user_service.py, users.py for patterns.",
+    "constraints": "Submission API must respond within 500ms (p95). Auto-check pipeline must complete within 30 seconds. External image quality API has 10-second timeout. Version numbers must be strictly sequential with no gaps. Media files are pre-uploaded to XHS CDN — submissions contain CDN URLs only."
+  },
+  "gold_standard_output": {
+    "module_design": {
+      "overview": "Two new SQLAlchemy models (ContentSubmission, ContentVersion), corresponding Pydantic schemas, a SubmissionRepository for data access, a SubmissionService for business logic, an API router mounted at /api/v1, and a ContentValidator utility that orchestrates the auto-check pipeline.",
+      "new_files": [
+        {
+          "path": "app/models/submission.py",
+          "purpose": "ContentSubmission and ContentVersion SQLAlchemy models with SubmissionStatus enum",
+          "depends_on": [
+            "app/models/base.py"
+          ]
+        },
+        {
+          "path": "app/schemas/submission.py",
+          "purpose": "Pydantic schemas: SubmissionCreate, SubmissionResponse, VersionResponse, ValidationResultResponse",
+          "depends_on": [
+            "app/schemas/common.py"
+          ]
+        },
+        {
+          "path": "app/repositories/submission_repo.py",
+          "purpose": "SubmissionRepository class following the UserRepository pattern",
+          "depends_on": [
+            "app/models/submission.py"
+          ]
+        },
+        {
+          "path": "app/services/submission_service.py",
+          "purpose": "SubmissionService class with submit, resubmit, list_versions, get_submission logic",
+          "depends_on": [
+            "app/repositories/submission_repo.py",
+            "app/services/content_validator.py"
+          ]
+        },
+        {
+          "path": "app/services/content_validator.py",
+          "purpose": "ContentValidator class orchestrating the auto-check pipeline (text, image count, sensitive words, image quality)",
+          "depends_on": []
+        },
+        {
+          "path": "app/api/v1/submissions.py",
+          "purpose": "FastAPI router for submission endpoints, mounted at /api/v1",
+          "depends_on": [
+            "app/services/submission_service.py",
+            "app/api/deps.py"
+          ]
+        }
+      ],
+      "modified_files": [
+        {
+          "path": "app/models/__init__.py",
+          "change": "Add ContentSubmission and ContentVersion to __all__ exports"
+        },
+        {
+          "path": "app/api/v1/router.py",
+          "change": "Include submissions router with prefix /submissions and /applications/{id}/submissions"
+        }
+      ]
+    },
+    "api_design": {
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/api/v1/applications/{application_id}/submissions",
+          "summary": "Submit content draft for a campaign application",
+          "auth": "Creator only (must be the accepted applicant)",
+          "request_body": {
+            "title": "str (required, 5-100 chars)",
+            "body": "str (required, min length from campaign config)",
+            "image_urls": "list[str] (required, 1-9 items, must match XHS CDN domain pattern)",
+            "video_url": "str | null (optional, must match XHS CDN domain pattern)",
+            "hashtags": "list[str] (optional, 0-20 items, each 1-30 chars)"
+          },
+          "response_body": {
+            "id": "str (submission UUID)",
+            "application_id": "str",
+            "version_number": "int",
+            "status": "str (auto_checking)",
+            "title": "str",
+            "body": "str",
+            "image_urls": "list[str]",
+            "video_url": "str | null",
+            "hashtags": "list[str]",
+            "validation_result": "null (not yet available)",
+            "submitted_at": "datetime",
+            "created_at": "datetime"
+          },
+          "status_codes": {
+            "201": "Submission created, auto-check pipeline triggered",
+            "403": "User is not the accepted creator for this application",
+            "404": "Application not found",
+            "409": "A previous submission is still being processed (auto_checking), or concurrent submission detected",
+            "422": "Validation error: deadline passed, max revisions exceeded, invalid field values, or submission not in resubmittable state"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/applications/{application_id}/submissions",
+          "summary": "List all submission versions for an application",
+          "auth": "Creator (own application) or Brand (campaign owner)",
+          "query_params": {
+            "page": "int (default 1, min 1)",
+            "page_size": "int (default 20, min 1, max 100)"
+          },
+          "response_body": "PaginatedResponse[VersionResponse] — items ordered by version_number descending",
+          "status_codes": {
+            "200": "Success",
+            "403": "User is neither the applicant creator nor the campaign-owning brand",
+            "404": "Application not found"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/submissions/{submission_id}",
+          "summary": "Get full detail of a specific submission version",
+          "auth": "Creator (own) or Brand (campaign owner)",
+          "response_body": {
+            "id": "str",
+            "application_id": "str",
+            "version_number": "int",
+            "status": "str",
+            "title": "str",
+            "body": "str",
+            "image_urls": "list[str]",
+            "video_url": "str | null",
+            "hashtags": "list[str]",
+            "validation_result": "ValidationResultResponse | null",
+            "brand_feedback": "str | null",
+            "submitted_at": "datetime",
+            "created_at": "datetime",
+            "updated_at": "datetime"
+          },
+          "status_codes": {
+            "200": "Success",
+            "403": "User is neither the applicant creator nor the campaign-owning brand",
+            "404": "Submission not found"
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/submissions/{submission_id}/resubmit",
+          "summary": "Resubmit revised content (creates a new version)",
+          "auth": "Creator only (must be the applicant)",
+          "request_body": "Same as initial submission (title, body, image_urls, video_url, hashtags)",
+          "response_body": "Same as initial submission response, with incremented version_number",
+          "status_codes": {
+            "201": "New version created, auto-check pipeline triggered",
+            "403": "User is not the applicant creator",
+            "404": "Submission not found",
+            "409": "Previous version still in auto_checking state",
+            "422": "Current status is not auto_rejected or revision_requested, deadline passed, or max revisions exceeded"
+          }
+        }
+      ]
+    },
+    "data_model": {
+      "tables": [
+        {
+          "name": "content_submissions",
+          "description": "Tracks the overall submission lifecycle for an application. One row per application.",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "constraints": "PK, default=generate_uuid"
+            },
+            {
+              "name": "application_id",
+              "type": "String(36)",
+              "constraints": "FK → applications.id, NOT NULL, UNIQUE"
+            },
+            {
+              "name": "current_version",
+              "type": "Integer",
+              "constraints": "NOT NULL, default=0"
+            },
+            {
+              "name": "status",
+              "type": "Enum(SubmissionStatus)",
+              "constraints": "NOT NULL, default=draft"
+            },
+            {
+              "name": "max_revisions",
+              "type": "Integer",
+              "constraints": "NOT NULL, default=3"
+            },
+            {
+              "name": "created_by",
+              "type": "String(36)",
+              "constraints": "FK → users.id, NOT NULL"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now()"
+            },
+            {
+              "name": "updated_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now(), onupdate=now()"
+            },
+            {
+              "name": "is_deleted",
+              "type": "Boolean",
+              "constraints": "NOT NULL, default=False"
+            },
+            {
+              "name": "deleted_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "nullable"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "ix_content_submissions_application_id",
+              "columns": [
+                "application_id"
+              ],
+              "unique": true
+            },
+            {
+              "name": "ix_content_submissions_status",
+              "columns": [
+                "status"
+              ]
+            },
+            {
+              "name": "ix_content_submissions_created_by",
+              "columns": [
+                "created_by"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "content_versions",
+          "description": "Stores each immutable version of submitted content. One row per submission attempt.",
+          "columns": [
+            {
+              "name": "id",
+              "type": "String(36)",
+              "constraints": "PK, default=generate_uuid"
+            },
+            {
+              "name": "submission_id",
+              "type": "String(36)",
+              "constraints": "FK → content_submissions.id, NOT NULL"
+            },
+            {
+              "name": "version_number",
+              "type": "Integer",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "title",
+              "type": "String(100)",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "body",
+              "type": "Text",
+              "constraints": "NOT NULL"
+            },
+            {
+              "name": "image_urls",
+              "type": "JSON",
+              "constraints": "NOT NULL, default=[]"
+            },
+            {
+              "name": "video_url",
+              "type": "String(500)",
+              "constraints": "nullable"
+            },
+            {
+              "name": "hashtags",
+              "type": "JSON",
+              "constraints": "NOT NULL, default=[]"
+            },
+            {
+              "name": "validation_result",
+              "type": "JSON",
+              "constraints": "nullable"
+            },
+            {
+              "name": "brand_feedback",
+              "type": "Text",
+              "constraints": "nullable"
+            },
+            {
+              "name": "submitted_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now()"
+            },
+            {
+              "name": "created_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now()"
+            },
+            {
+              "name": "updated_at",
+              "type": "DateTime(timezone=True)",
+              "constraints": "NOT NULL, server_default=now(), onupdate=now()"
+            }
+          ],
+          "indexes": [
+            {
+              "name": "uq_content_versions_submission_version",
+              "columns": [
+                "submission_id",
+                "version_number"
+              ],
+              "unique": true
+            },
+            {
+              "name": "ix_content_versions_submission_id",
+              "columns": [
+                "submission_id"
+              ]
+            }
+          ]
+        }
+      ],
+      "enums": [
+        {
+          "name": "SubmissionStatus",
+          "values": [
+            "draft",
+            "auto_checking",
+            "auto_rejected",
+            "pending_review",
+            "revision_requested",
+            "approved",
+            "published",
+            "expired"
+          ]
+        }
+      ],
+      "relationships": [
+        "ContentSubmission has ONE-TO-MANY ContentVersion (submission_id FK)",
+        "ContentSubmission has MANY-TO-ONE Application (application_id FK, unique — one submission per application)",
+        "ContentSubmission has MANY-TO-ONE User (created_by FK)"
+      ]
+    },
+    "integration_points": [
+      {
+        "service": "Application Service (internal)",
+        "purpose": "Verify the creator has an accepted application for the campaign. Fetch campaign requirements (min_word_count, min_image_count, max_image_count, content_deadline, max_revisions).",
+        "interface": "Direct repository query (same database) — ApplicationRepository.get_by_id(application_id) with status=accepted check",
+        "failure_handling": "If application not found or not accepted, raise NotFoundError or ForbiddenError"
+      },
+      {
+        "service": "Campaign Service (internal)",
+        "purpose": "Fetch campaign requirements for auto-check validation and deadline enforcement",
+        "interface": "Direct repository query — CampaignRepository.get_by_id(campaign_id) to read content requirements and deadlines",
+        "failure_handling": "If campaign not found, raise NotFoundError"
+      },
+      {
+        "service": "Sensitive Word Detection (internal library)",
+        "purpose": "Check submitted text body against a list of restricted terms",
+        "interface": "SensitiveWordChecker.check(text: str) -> list[str] — returns list of detected sensitive words. Loaded from config/sensitive_words.txt at startup.",
+        "failure_handling": "If word list file missing, log error and skip check (treat as passed with warning)"
+      },
+      {
+        "service": "Image Quality API (external stub)",
+        "purpose": "Score image quality (resolution, clarity, composition) for each submitted image URL",
+        "interface": "HTTP POST to configured IMAGE_QUALITY_API_URL with {\"image_url\": \"...\"} → {\"score\": float 0-100, \"details\": {...}}. Threshold: score >= 60 to pass.",
+        "failure_handling": "10-second timeout per image. On timeout or error: mark check as 'skipped' with reason 'Image quality service unavailable'. Submission proceeds to pending_review with incomplete_checks flag. Retry via Celery with exponential backoff (1s, 4s, 16s), max 3 retries."
+      },
+      {
+        "service": "Notification Service (external)",
+        "purpose": "Notify brand when submission passes auto-check and enters pending_review. Notify creator when auto-check fails or when submission expires.",
+        "interface": "Celery task: send_notification.delay(user_id, notification_type, payload)",
+        "failure_handling": "Fire-and-forget. Notification failure does not block submission flow. Failed notifications are logged and retried by the notification service."
+      }
+    ],
+    "technical_decisions": [
+      {
+        "decision": "Auto-check pipeline runs synchronously within the API request for v1",
+        "alternatives_considered": [
+          "Async via Celery task — returns immediately with status=auto_checking, creator polls for result",
+          "Synchronous chain within the API handler — runs checks sequentially, returns final status"
+        ],
+        "chosen": "Synchronous chain with per-check timeouts",
+        "rationale": "For v1, the pipeline has only 4 checks and the longest (image quality API) has a 10-second timeout. Total worst-case is ~15 seconds, well within the 30-second pipeline SLA. Synchronous avoids the complexity of polling/websocket for status updates. If the external API is consistently slow, migrate to async in v2.",
+        "trade_offs": "Blocks the creator's request for up to ~15 seconds. Acceptable for v1 UX since submission is an infrequent, high-intent action."
+      },
+      {
+        "decision": "Store each content version as a separate row in content_versions table",
+        "alternatives_considered": [
+          "JSON array of versions in a single content_submissions column",
+          "Separate table with one row per version"
+        ],
+        "chosen": "Separate content_versions table",
+        "rationale": "Separate rows enable efficient queries (e.g., 'get version 2 of submission X' without parsing JSON), enforce unique constraint on (submission_id, version_number), allow individual version indexing, and support pagination over version history. JSON array would require full-document reads and writes, and cannot enforce uniqueness at the DB level.",
+        "trade_offs": "Slightly more complex joins when fetching a submission with its latest version. Mitigated by the current_version field on content_submissions that points to the latest version number."
+      },
+      {
+        "decision": "Media files are referenced by CDN URL, not stored by campaign-service",
+        "alternatives_considered": [
+          "Accept file uploads in the submission API and store in object storage",
+          "Accept CDN URLs only, validate domain whitelist"
+        ],
+        "chosen": "CDN URLs only, with domain whitelist validation",
+        "rationale": "Media upload is already handled by XHS's existing Content service. Duplicating upload logic in campaign-service would be redundant and increase storage costs. CDN URL validation (regex against allowed domains) prevents SSRF and content injection while keeping the submission API lightweight.",
+        "trade_offs": "Cannot guarantee image availability at review time if the creator deletes the original post. Mitigated by URL reachability check during auto-validation."
+      },
+      {
+        "decision": "Use database advisory lock on application_id to prevent concurrent submissions",
+        "alternatives_considered": [
+          "Application-level mutex via Redis distributed lock",
+          "PostgreSQL advisory lock on application_id hash",
+          "Optimistic locking with version column"
+        ],
+        "chosen": "PostgreSQL advisory lock (pg_advisory_xact_lock) on application_id hash",
+        "rationale": "Advisory lock is session-scoped, automatically released on transaction end, and does not require additional infrastructure (Redis). It prevents two concurrent submit requests from creating duplicate versions. Optimistic locking would allow the race to happen and then fail one request, which is acceptable but provides a worse UX.",
+        "trade_offs": "PostgreSQL-specific. If migrating to another database, would need to switch to Redis-based locking. Acceptable trade-off for v1."
+      }
+    ],
+    "data_flow": {
+      "submission_flow": {
+        "description": "End-to-end flow for a creator submitting content for a campaign",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Creator calls POST /api/v1/applications/{id}/submissions with content",
+            "component": "API Router (submissions.py)"
+          },
+          {
+            "step": 2,
+            "action": "Acquire advisory lock on application_id to prevent concurrent submissions",
+            "component": "SubmissionService"
+          },
+          {
+            "step": 3,
+            "action": "Validate preconditions: application exists and is accepted, content_deadline not passed, max revisions not exceeded, no version currently in auto_checking",
+            "component": "SubmissionService → ApplicationRepository, CampaignRepository"
+          },
+          {
+            "step": 4,
+            "action": "Create ContentVersion row (version_number = current_version + 1), update ContentSubmission.current_version and status=auto_checking",
+            "component": "SubmissionRepository"
+          },
+          {
+            "step": 5,
+            "action": "Run validation pipeline synchronously: text_length_check → image_count_check → sensitive_word_check → image_quality_check",
+            "component": "ContentValidator"
+          },
+          {
+            "step": 6,
+            "action": "Each check returns {check_name, passed, detail}. Results are collected into a validation_result JSON array.",
+            "component": "ContentValidator"
+          },
+          {
+            "step": 7,
+            "action": "Save validation_result to ContentVersion. If all checks passed → status=pending_review. If any failed → status=auto_rejected.",
+            "component": "SubmissionService → SubmissionRepository"
+          },
+          {
+            "step": 8,
+            "action": "Send notification: if pending_review → notify brand; if auto_rejected → notify creator with failure reasons",
+            "component": "SubmissionService → Notification Service (fire-and-forget)"
+          },
+          {
+            "step": 9,
+            "action": "Release advisory lock (automatic on transaction commit). Return submission response with status and validation_result.",
+            "component": "API Router"
+          }
+        ]
+      },
+      "resubmission_flow": {
+        "description": "Flow for creator resubmitting revised content",
+        "steps": [
+          {
+            "step": 1,
+            "action": "Creator calls POST /api/v1/submissions/{id}/resubmit with updated content",
+            "component": "API Router"
+          },
+          {
+            "step": 2,
+            "action": "Validate: submission exists, user is the creator, status is auto_rejected or revision_requested, deadline not passed, revisions remaining > 0",
+            "component": "SubmissionService"
+          },
+          {
+            "step": 3,
+            "action": "Acquire advisory lock, create new ContentVersion with incremented version_number, then run the same validation pipeline as initial submission (steps 4-9 of submission_flow)",
+            "component": "SubmissionService → ContentValidator"
+          }
+        ]
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c2_design.json"
+}

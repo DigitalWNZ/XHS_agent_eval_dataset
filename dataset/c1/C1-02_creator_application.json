@@ -1,0 +1,287 @@
+{
+  "instance_id": "C1-02",
+  "category": "C1",
+  "category_name": "需求理解与预评审",
+  "maps_to_journey": "Journey 2: Creator Discovery & Application",
+  "input": {
+    "role": "Product Manager",
+    "requirement_description": "Creators need a way to find and apply to brand campaigns. They should be able to browse available campaigns, check if they're eligible, and submit an application. Brands need to see incoming applications and decide who to work with. We need some kind of ranking to help brands find the best creators. The existing campaign and user services are already in place.",
+    "context": "The system is a FastAPI microservice called campaign-service. We have existing User service (with follower_count, engagement_rate, content_categories, region) and Campaign service (with eligibility criteria, budget, fee range, status). Tech stack: Python, PostgreSQL, Redis, Celery."
+  },
+  "gold_standard_output": {
+    "structured_spec": {
+      "overview": "Enable creators to discover active campaigns in a marketplace, check their eligibility, and submit applications. Enable brands to view, rank, and accept or reject applications. The system enforces eligibility rules, manages budget reservation on acceptance, and prevents race conditions when multiple creators apply to budget-constrained campaigns.",
+      "user_stories": [
+        {
+          "id": "US-2.1",
+          "story": "As a creator, I want to browse available campaigns in a marketplace so that I can find collaboration opportunities that match my profile.",
+          "acceptance_criteria": [
+            "Creator can list all campaigns in 'active' status with pagination (default 20, max 100)",
+            "Creator can filter by: content category (multi-select), fee range (min/max), application deadline (upcoming within N days), brand name (substring search)",
+            "Creator can sort by: relevance (default, based on profile match), newest first, highest fee, deadline soonest",
+            "Each campaign in the list shows: title, brand display_name, fee range, application deadline, number of accepted creators / slots remaining (if max_creators set), eligibility status badge ('eligible' / 'ineligible' / 'applied')",
+            "Campaigns past their application_deadline are excluded from listing",
+            "Paused and non-active campaigns are excluded from listing"
+          ]
+        },
+        {
+          "id": "US-2.2",
+          "story": "As a creator, I want to view a campaign's full details and check my eligibility so that I can decide whether to apply.",
+          "acceptance_criteria": [
+            "Creator can view full campaign detail including: title, description, content requirements, target audience tags, budget info (fee range only, not total budget), timeline, brand profile summary",
+            "System displays an eligibility check result with per-criterion breakdown: follower count (pass/fail with threshold shown), engagement rate (pass/fail), content category match (pass/fail with required categories listed), region restriction (pass/fail)",
+            "If ineligible, system shows which specific criteria are not met",
+            "If already applied, system shows the existing application status",
+            "Returns 404 for non-existent or non-active campaigns"
+          ]
+        },
+        {
+          "id": "US-2.3",
+          "story": "As a creator, I want to submit an application to a campaign so that the brand can consider me for the collaboration.",
+          "acceptance_criteria": [
+            "Creator can submit an application with: content_outline (required, 50-1000 chars describing proposed content approach), estimated_delivery_date (required, must be before campaign's content_deadline), requested_fee (required, must be within campaign's min_fee to max_fee range)",
+            "System validates creator eligibility before accepting the application — ineligible creators receive 403 with reason",
+            "System validates campaign is still accepting applications (status='active' AND application_deadline not passed)",
+            "Application is created in 'submitted' status",
+            "Creator cannot submit more than one application per campaign — returns 409 'You have already applied to this campaign'",
+            "Brand receives a notification about the new application"
+          ]
+        },
+        {
+          "id": "US-2.4",
+          "story": "As a creator, I want to withdraw my application so that I can change my mind before the brand decides.",
+          "acceptance_criteria": [
+            "Creator can withdraw an application in 'submitted' status → status becomes 'withdrawn'",
+            "Creator cannot withdraw an 'accepted' application (must negotiate directly with brand, handled out-of-scope for v1)",
+            "Withdrawn applications do not count toward any budget or slot limits",
+            "Creator can re-apply after withdrawing (creates a new application record)",
+            "Returns 409 if application is already in a terminal status ('accepted', 'rejected', 'withdrawn')"
+          ]
+        },
+        {
+          "id": "US-2.5",
+          "story": "As a brand marketing manager, I want to view all applications for my campaign so that I can select the best creators.",
+          "acceptance_criteria": [
+            "Brand can list all applications for a specific campaign they own, with pagination",
+            "Applications are ranked by a 'fit_score' (default sort), computed from: category_match_score (0-40), follower_count_score (0-20), engagement_rate_score (0-20), historical_completion_rate (0-10), fee_competitiveness (0-10, lower requested fee relative to range = higher score)",
+            "Brand can filter applications by: status ('submitted', 'accepted', 'rejected'), fit_score range",
+            "Each application shows: creator display_name, follower_count, engagement_rate, content categories, content_outline, requested_fee, fit_score, submitted_at",
+            "Returns 403 if brand does not own the campaign"
+          ]
+        },
+        {
+          "id": "US-2.6",
+          "story": "As a brand marketing manager, I want to accept or reject applications so that I can build my creator team for the campaign.",
+          "acceptance_criteria": [
+            "Brand can accept a 'submitted' application → status becomes 'accepted'",
+            "On acceptance: system atomically reserves the requested_fee from the campaign's remaining budget. If insufficient budget remains, acceptance fails with 409 'Insufficient campaign budget to accept this creator'",
+            "Brand can reject a 'submitted' application with an optional reason (max 500 chars) → status becomes 'rejected'",
+            "Brand can batch-reject multiple applications in a single request",
+            "Creator is notified on acceptance or rejection",
+            "Returns 403 if brand does not own the campaign",
+            "Returns 409 if application is not in 'submitted' status"
+          ]
+        },
+        {
+          "id": "US-2.7",
+          "story": "As a creator, I want to view my application history so that I can track the status of all my applications.",
+          "acceptance_criteria": [
+            "Creator can list all their own applications across campaigns with pagination",
+            "Creator can filter by application status",
+            "Each entry shows: campaign title, brand name, application status, requested_fee, submitted_at, responded_at (if accepted/rejected)",
+            "Creator can view a single application's full detail including rejection reason if applicable"
+          ]
+        }
+      ],
+      "state_machine": {
+        "entity": "Application",
+        "states": [
+          "submitted",
+          "accepted",
+          "rejected",
+          "withdrawn"
+        ],
+        "transitions": [
+          {
+            "from": "submitted",
+            "to": "accepted",
+            "trigger": "brand accepts",
+            "guard": "sufficient campaign budget remaining, campaign is active",
+            "side_effects": [
+              "reserve requested_fee from campaign budget",
+              "notify creator"
+            ]
+          },
+          {
+            "from": "submitted",
+            "to": "rejected",
+            "trigger": "brand rejects",
+            "side_effects": [
+              "notify creator with optional reason"
+            ]
+          },
+          {
+            "from": "submitted",
+            "to": "withdrawn",
+            "trigger": "creator withdraws"
+          },
+          {
+            "from": "accepted",
+            "to": "rejected",
+            "trigger": "brand revokes acceptance",
+            "guard": "creator has not yet submitted content",
+            "side_effects": [
+              "release reserved budget",
+              "notify creator"
+            ]
+          }
+        ],
+        "notes": "Terminal states: accepted (transitions to content submission flow), rejected, withdrawn. No transition from rejected or withdrawn back to submitted — creator must create a new application."
+      },
+      "edge_cases": [
+        {
+          "id": "EC-2.1",
+          "scenario": "Two brands accept creators concurrently, both passing the budget check but combined acceptances exceed remaining budget (race condition)",
+          "handling": "Use SELECT ... FOR UPDATE on the campaign budget row to serialize acceptance operations. The second transaction will see the updated budget and fail with 409 'Insufficient campaign budget'. This must be handled at the database level, not application level."
+        },
+        {
+          "id": "EC-2.2",
+          "scenario": "Creator applies to the same campaign twice",
+          "handling": "Enforce unique constraint on (campaign_id, creator_id) where status != 'withdrawn'. Return 409 'You have already applied to this campaign'. If previous application was withdrawn, allow a new application (new record)."
+        },
+        {
+          "id": "EC-2.3",
+          "scenario": "Creator applies after the application_deadline has passed",
+          "handling": "Return 422 'Application deadline has passed for this campaign'. Check deadline at application submission time, not just at page load."
+        },
+        {
+          "id": "EC-2.4",
+          "scenario": "Creator's eligibility changes after application was submitted (e.g., follower count drops below threshold)",
+          "handling": "Eligibility is checked at application time only. Once submitted, the application remains valid regardless of subsequent profile changes. Brand can still reject based on their own judgment."
+        },
+        {
+          "id": "EC-2.5",
+          "scenario": "Brand tries to accept an application but campaign status is no longer 'active' (e.g., paused or cancelled)",
+          "handling": "Return 409 'Campaign is no longer active. Cannot accept new applications.' Existing accepted applications remain valid."
+        },
+        {
+          "id": "EC-2.6",
+          "scenario": "Brand revokes acceptance after creator has already submitted content",
+          "handling": "Return 409 'Cannot revoke acceptance — creator has already submitted content. Use the review workflow to handle content disputes.' This prevents data loss and protects creator work."
+        },
+        {
+          "id": "EC-2.7",
+          "scenario": "Creator requests a fee outside the campaign's min_fee/max_fee range",
+          "handling": "Return 422 'Requested fee must be between {min_fee} and {max_fee}'. Validate at submission time."
+        },
+        {
+          "id": "EC-2.8",
+          "scenario": "Brand accepts the last budget slot, then another creator's pending application becomes un-fulfillable",
+          "handling": "Do not auto-reject pending applications when budget is exhausted. Leave them in 'submitted' status — the brand may cancel another acceptance. Brand can manually reject remaining applications. System should display a warning 'Budget fully allocated' on the applications list."
+        },
+        {
+          "id": "EC-2.9",
+          "scenario": "Creator sets estimated_delivery_date after the campaign's content_deadline",
+          "handling": "Return 422 'Estimated delivery date must be before the campaign content deadline ({content_deadline})'"
+        },
+        {
+          "id": "EC-2.10",
+          "scenario": "Fit score calculation encounters a creator with zero followers (division by zero in engagement rate normalization)",
+          "handling": "Guard against division by zero: if follower_count is 0, follower_score component is 0 and engagement_rate_score is 0. Log a warning for data quality investigation."
+        }
+      ],
+      "clarifying_questions": [
+        {
+          "id": "CQ-2.1",
+          "question": "Should the fit_score ranking algorithm weights be configurable by the brand, or fixed by the platform?",
+          "impact": "Configurable weights add complexity (UI for weight sliders, per-campaign weight storage) but give brands more control. Fixed weights are simpler but may not suit all campaign types.",
+          "assumption_if_unanswered": "Fixed platform-defined weights for v1. Make weights configurable in config (not DB) so they can be tuned without code changes."
+        },
+        {
+          "id": "CQ-2.2",
+          "question": "Is there a maximum number of campaigns a creator can apply to simultaneously?",
+          "impact": "Unlimited applications could lead to creators over-committing and not delivering quality content. A cap protects both creators and brands.",
+          "assumption_if_unanswered": "No limit for v1 — creators self-manage their capacity."
+        },
+        {
+          "id": "CQ-2.3",
+          "question": "Should the brand see the creator's full profile (including exact follower count, engagement rate) or only a summary/tier?",
+          "impact": "Full data helps brands make informed decisions but may raise privacy concerns. Tier-based ('10K-50K followers') is more privacy-friendly.",
+          "assumption_if_unanswered": "Full profile data visible to brands for campaigns the creator has applied to. This is industry standard for influencer platforms."
+        },
+        {
+          "id": "CQ-2.4",
+          "question": "What is the 'historical_completion_rate' metric based on — does it require a prior campaign history feature?",
+          "impact": "If this is v1 with no prior campaigns, all creators have zero history. The score component would be meaningless.",
+          "assumption_if_unanswered": "Set historical_completion_rate to a neutral default (0.5) for all creators in v1. Track actual completion starting from launch for future use."
+        },
+        {
+          "id": "CQ-2.5",
+          "question": "Should rejected creators be notified with the specific rejection reason, or just a generic 'not selected' message?",
+          "impact": "Specific reasons improve creator experience but may expose brand preferences or create disputes.",
+          "assumption_if_unanswered": "Brand provides an optional reason. If provided, creator sees it. If not, creator sees 'The brand has chosen other creators for this campaign.'"
+        },
+        {
+          "id": "CQ-2.6",
+          "question": "How should the relevance ranking in the marketplace work — is it purely based on creator profile match, or does it also factor in campaign recency, brand reputation, etc.?",
+          "impact": "A richer relevance model improves creator experience but is harder to build and tune.",
+          "assumption_if_unanswered": "V1 relevance = weighted score of (category overlap × 0.5 + fee attractiveness × 0.3 + deadline proximity × 0.2). No ML-based personalization in v1."
+        }
+      ],
+      "non_functional_requirements": [
+        {
+          "id": "NFR-2.1",
+          "category": "Performance",
+          "requirement": "Campaign marketplace listing (with filters and relevance sort) must respond within 300ms (p95) for up to 5,000 active campaigns",
+          "rationale": "Creator marketplace is a high-traffic browsing page — slow loading causes drop-off"
+        },
+        {
+          "id": "NFR-2.2",
+          "category": "Concurrency",
+          "requirement": "Application acceptance must use pessimistic locking (SELECT FOR UPDATE) on campaign budget to prevent over-allocation under concurrent requests",
+          "rationale": "Budget exhaustion race condition is a financial risk — over-allocating budget means platform pays the difference"
+        },
+        {
+          "id": "NFR-2.3",
+          "category": "Security",
+          "requirement": "Creators can only view and manage their own applications. Brands can only view applications for campaigns they own. Fit score algorithm internals (weights, formula) must not be exposed via API.",
+          "rationale": "Prevent gaming of ranking system and unauthorized data access"
+        },
+        {
+          "id": "NFR-2.4",
+          "category": "Data Integrity",
+          "requirement": "Budget reservation on acceptance and budget release on revocation must be transactional — partial completion (accepted but budget not deducted) must not be possible",
+          "rationale": "Financial consistency is critical — mismatched budget records cause reconciliation nightmares"
+        },
+        {
+          "id": "NFR-2.5",
+          "category": "Scalability",
+          "requirement": "Eligibility checking must be performed efficiently — avoid N+1 queries when checking a creator against campaign criteria. Eligibility result should be cacheable for short durations (e.g., 5 minutes in Redis) since creator profile data changes infrequently.",
+          "rationale": "Eligibility check is called on every campaign detail view — must be fast"
+        }
+      ],
+      "priority_classification": {
+        "P0_must_have": [
+          "US-2.1 (Browse marketplace with filters)",
+          "US-2.2 (Eligibility check)",
+          "US-2.3 (Submit application)",
+          "US-2.5 (Brand view applications)",
+          "US-2.6 (Accept/reject with budget reservation)",
+          "Budget race condition handling (EC-2.1)"
+        ],
+        "P1_should_have": [
+          "US-2.4 (Withdraw application)",
+          "US-2.7 (Creator application history)",
+          "Fit score ranking (US-2.5)",
+          "Batch reject"
+        ],
+        "P2_nice_to_have": [
+          "Relevance-based marketplace sorting",
+          "Configurable ranking weights",
+          "Application analytics for brands (conversion rate, avg response time)"
+        ]
+      }
+    }
+  },
+  "evaluation_rubric": "evaluation/rubrics/c1_requirements.json"
+}
