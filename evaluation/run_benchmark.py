@@ -357,7 +357,7 @@ def run_c1_c2(entry: dict, category: str, agent: str, model: str, timeout: int) 
     try:
         traj_file = RESULTS_DIR / "trajectories" / f"{instance_id}_{agent}_{model}.jsonl"
         agent_result = invoke_agent(agent, model, prompt, work_dir, timeout, trajectory_file=traj_file)
-        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['trajectory_events']} events | {agent_result['usage'].get('total_tokens', '?')} tokens")
+        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['num_turns']} turns | {agent_result['usage'].get('total_tokens', '?')} tokens")
 
         agent_response = extract_agent_response(agent_result)
 
@@ -580,7 +580,7 @@ def run_c4(entry: dict, agent: str, model: str, timeout: int) -> dict:
     try:
         traj_file = RESULTS_DIR / "trajectories" / f"{instance_id}_{agent}_{model}.jsonl"
         agent_result = invoke_agent(agent, model, prompt, work_dir, timeout, trajectory_file=traj_file)
-        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['trajectory_events']} events | {agent_result['usage'].get('total_tokens', '?')} tokens")
+        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['num_turns']} turns | {agent_result['usage'].get('total_tokens', '?')} tokens")
 
         agent_response = extract_agent_response(agent_result)
 
@@ -1000,7 +1000,7 @@ def run_c5a(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
         traj_file = RESULTS_DIR / "trajectories" / f"{instance_id}_{agent}_{model}.jsonl"
         agent_result = invoke_agent(agent, model, prompt, work_dir, timeout, need_file_writes=True, trajectory_file=traj_file)
-        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['usage'].get('total_tokens', '?')} tokens")
+        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['num_turns']} turns | {agent_result['usage'].get('total_tokens', '?')} tokens")
 
         agent_response = extract_agent_response(agent_result)
         test_target = entry["input"]["test_target_file"]
@@ -1169,7 +1169,7 @@ def run_c5b(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
         traj_file = RESULTS_DIR / "trajectories" / f"{instance_id}_{agent}_{model}.jsonl"
         agent_result = invoke_agent(agent, model, prompt, work_dir, timeout, need_file_writes=True, trajectory_file=traj_file)
-        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['usage'].get('total_tokens', '?')} tokens")
+        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['num_turns']} turns | {agent_result['usage'].get('total_tokens', '?')} tokens")
 
         agent_patch = capture_agent_patch(work_dir)
         patch_lines = len(agent_patch.splitlines())
@@ -1315,7 +1315,7 @@ def run_c3(entry: dict, agent: str, model: str, timeout: int) -> dict:
 
         traj_file = RESULTS_DIR / "trajectories" / f"{instance_id}_{agent}_{model}.jsonl"
         agent_result = invoke_agent(agent, model, entry["problem_statement"], work_dir, timeout, need_file_writes=True, trajectory_file=traj_file)
-        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['usage'].get('total_tokens', '?')} tokens")
+        print(f"  Agent finished in {agent_result['elapsed_seconds']}s | {agent_result['num_turns']} turns | {agent_result['usage'].get('total_tokens', '?')} tokens")
 
         agent_patch = capture_agent_patch(work_dir)
         patch_lines = len(agent_patch.splitlines())
