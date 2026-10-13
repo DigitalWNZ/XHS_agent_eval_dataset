@@ -20,6 +20,10 @@ Usage:
     # C5b: Debugging
     python evaluation/run_benchmark.py --category c5b --entry C5b-01
 
+    # C6: Environment tasks (containerized; graded by a verifier script)
+    python evaluation/run_benchmark.py --category c6 --entry C6-01 --agent loop --model gemini-3.5-flash
+    python evaluation/run_benchmark.py --category c6 --entry C6-01 --agent gold   # validate task
+
     # Run all entries in a category
     python evaluation/run_benchmark.py --category c4 --all
 
@@ -28,6 +32,8 @@ Usage:
     --model gemini-3.8-flash-high  (default)
     --timeout 30                (minutes, default 30)
     --dry-run                   (show prompt, don't invoke)
+    --trials 5                  (C6 only: independent trials per entry)
+    --sandbox docker|udocker|bwrap  (C6 only: task environment backend, default docker)
 """
 
 import argparse
@@ -41,6 +47,8 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+import env_runner  # C6 environment tasks (evaluation/env_runner.py)
 
 BASE_DIR = Path(__file__).parent.parent
 DATASET_DIR = BASE_DIR / "dataset"
@@ -75,7 +83,7 @@ def load_rubric(category: str) -> dict:
 def get_rubric_suffix(category: str) -> str:
     return {
         "c1": "requirements", "c2": "design", "c3": "codegen",
-        "c4": "review", "c5a": "testing", "c5b": "debug",
+        "c4": "review", "c5a": "testing", "c5b": "debug", "c6": "env", "c7": "swe", "c8": "feature",
     }[category]
 
 
@@ -1431,6 +1439,9 @@ RUNNERS = {
     "c4": run_c4,
     "c5a": run_c5a,
     "c5b": run_c5b,
+    "c6": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),
+    "c7": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),  # same containerized runner
+    "c8": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),
 }
 
 
@@ -1481,6 +1492,15 @@ def print_summary(category: str, results: list[dict]) -> None:
             total = sc.get('total_score', '?')
             print(f"{r['instance_id']:<12} {tr.get('f2p_passed','?')}/{tr.get('f2p_total','?'):>5} {tr.get('p2p_passed','?')}/{tr.get('p2p_total','?'):>5} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
+    elif category in ("c6", "c7", "c8"):
+        print(f"{'Entry':<12} {'Pass':>7} {'Rate':>6} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
+        print("-" * 58)
+        for r in results:
+            tr = r.get("test_results", {})
+            sc = r.get("scores", {})
+            u = r.get("usage", {})
+            print(f"{r['instance_id']:<12} {tr.get('passed','?')}/{tr.get('total','?'):<4} {sc.get('pass_rate',0):>6.0%} {sc.get('total_score','?'):>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
+
     elif category == "c5a":
         print(f"{'Entry':<12} {'Written':>8} {'Passed':>8} {'Rate':>8} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
         print("-" * 68)
@@ -1516,14 +1536,21 @@ def print_summary(category: str, results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="XHS Agent Evaluation Benchmark Runner")
-    parser.add_argument("--category", required=True, choices=["c1", "c2", "c3", "c4", "c5a", "c5b"])
+    parser.add_argument("--category", required=True, choices=["c1", "c2", "c3", "c4", "c5a", "c5b", "c6", "c7", "c8"])
     parser.add_argument("--entry", help="Single entry ID (e.g., C3-01)")
     parser.add_argument("--all", action="store_true", help="Run all entries in category")
-    parser.add_argument("--agent", default="agy", choices=["agy", "claude"])
+    parser.add_argument("--agent", default="agy", choices=["agy", "claude", "loop", "gold", "empty"],
+                        help="loop/gold/empty are C6/C7/C8-only (built-in agent / gold solution / no-op)")
     parser.add_argument("--model", default="gemini-3.8-flash-high")
     parser.add_argument("--timeout", type=int, default=30, help="Agent timeout in minutes")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--trials", type=int, default=5, help="C6: trials per entry")
+    parser.add_argument("--sandbox", default="docker", choices=["docker", "udocker", "bwrap"],
+                        help="C6: environment backend (udocker = rootless, exact image; bwrap = host toolchain)")
     args = parser.parse_args()
+    env_runner.CONFIG.update(trials=args.trials, sandbox=args.sandbox)
+    if args.category not in ("c6", "c7", "c8") and args.agent in ("loop", "gold", "empty"):
+        parser.error("--agent loop/gold/empty is only supported for --category c6/c7/c8")
 
     if not args.entry and not args.all:
         parser.error("Specify --entry or --all")
@@ -1542,6 +1569,10 @@ def main():
                 print(build_prompt_c2(entry)[:500])
             elif args.category == "c4":
                 print(build_prompt_c4(entry)[:500])
+            elif args.category in ("c6", "c7", "c8"):
+                print(entry["problem_statement"][:500])
+                print(f"  environment: {json.dumps(entry['environment'])}")
+                print(f"  verification: {json.dumps(entry['verification'], ensure_ascii=False)[:300]}")
         return
 
     runner = RUNNERS[args.category]
