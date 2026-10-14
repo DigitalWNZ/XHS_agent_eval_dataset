@@ -1,0 +1,1 @@
+C7-07 agy runs (13:39 batch) invalid: grading reused the trial container /tmp, where the agent's own test runs left a stale requests test_utils.py copy -> TestExtractZippedPaths failed for every trial (both models, F2P 2/2). Fixed in env_runner._verify_swebench (clean /tmp before eval.sh); rerun queued.

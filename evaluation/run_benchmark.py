@@ -171,6 +171,7 @@ def invoke_agent(
             "claude", "--print", "-",
             "--model", model,
             "--output-format", "stream-json",
+            "--verbose",  # required by Claude Code for --print + stream-json
             "--dangerously-skip-permissions",
         ]
     else:
@@ -208,6 +209,16 @@ def invoke_agent(
                 usage = r.get("usage", {})
                 num_turns = r.get("num_turns", 0)
                 conversation_id = r.get("conversation_id", "")
+            elif event.get("type") == "result":  # Claude Code stream-json final event
+                response_text = event.get("result", "") or ""
+                u = event.get("usage", {}) or {}
+                inp = sum(u.get(k, 0) or 0 for k in (
+                    "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+                out = u.get("output_tokens", 0) or 0
+                usage = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
+                         "cost_usd": event.get("total_cost_usd")}
+                num_turns = event.get("num_turns", 0)
+                conversation_id = event.get("session_id", "")
         except json.JSONDecodeError:
             trajectory.append({"raw": line})
 

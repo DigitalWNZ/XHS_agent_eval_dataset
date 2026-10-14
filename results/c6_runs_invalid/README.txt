@@ -1,0 +1,1 @@
+C6-08 agy runs (13:39 batch) invalid: udocker R1 maps only uid 0, so FrontierSWE grader runuser/setuid to agent failed -> "did not build" in 0s for every trial. Fixed: C6-08 runs in proot (environment/verification.udocker_execmode = P1).

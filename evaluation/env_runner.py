@@ -87,8 +87,9 @@ def _tools_dir() -> Path:
 
 def _run(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
     """subprocess.run that kills the whole process group on timeout (proot/udocker children)."""
-    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         start_new_session=True)
+    # stdin=DEVNULL: udocker R1 (runc) hangs in init when it inherits an interactive stdin.
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -188,8 +189,10 @@ def _udocker_desired_execmode() -> str:
     return mode
 
 
-def _udocker_set_execmode(name: str, cdir: Path) -> None:
-    mode = _udocker_desired_execmode()
+def _udocker_set_execmode(name: str, cdir: Path, mode: str | None = None) -> None:
+    """mode: per-entry override (environment/verification.udocker_execmode), e.g. "P1" for
+    tasks whose grader switches users (runuser/setuid), which R1's single-uid mapping can't do."""
+    mode = mode or _udocker_desired_execmode()
     f = (cdir / name).resolve() / "execmode"
     current = f.read_text().strip() if f.is_file() else "P1"
     if current != mode:
@@ -234,7 +237,7 @@ class UdockerSandbox:
                                capture_output=True)
                 if env.get("udocker_rmi_after_create"):  # bases don't need the layers
                     subprocess.run(self.ud + ["rmi", image], capture_output=True)
-            _udocker_set_execmode(self.name, cdir)
+            _udocker_set_execmode(self.name, cdir, env.get("udocker_execmode"))
         self.root = (cdir / self.name).resolve() / "ROOT"
         self.trial = Path(tempfile.mkdtemp(prefix="xhs-c6-trial-"))
         self.mounts = {}
@@ -558,6 +561,11 @@ def _verify_swebench(sb, entry: dict) -> dict:
     diff = sb.exec(f"cd {shlex.quote(workdir)} && git -c core.fileMode=false diff "
                    f"{inst['base_commit']}", timeout=300).stdout
     sb.put_file(BASE_DIR / v["eval_script"], "/tests/eval.sh")
+    # Official SWE-bench grades in a FRESH container. The agent's own test runs can leave temp
+    # files that change test outcomes (e.g. requests' extract_zipped_paths only extracts into
+    # /tmp if the file isn't there yet -> stale copy fails test_zipped_paths_extracted), so
+    # grade with an empty /tmp.
+    sb.exec("find /tmp -mindepth 1 -delete 2>/dev/null; true", timeout=120)
     try:
         p = sb.exec("bash /tests/eval.sh 2>&1", timeout=v.get("timeout_sec", 1800))
         rc, log = p.returncode, p.stdout + p.stderr
@@ -623,7 +631,8 @@ def _verify_harbor_separate(sb, entry: dict) -> dict:
     try:
         subprocess.run(ud + ["create", f"--name={name}", image], check=True, capture_output=True)
         _udocker_set_execmode(name, Path(os.environ.get("UDOCKER_DIR", Path.home() / ".udocker"))
-                              / "containers")
+                              / "containers", v.get("udocker_execmode")
+                              or entry["environment"].get("udocker_execmode"))
         envs = [f"--env={k}={val}" for k, val in v.get("env", {}).items()]
         if getattr(sb, "oracle_flag", None):
             envs.append(f"--env=HARBOR_ORACLE_FLAG={sb.oracle_flag}")
