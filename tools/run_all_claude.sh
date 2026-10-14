@@ -1,4 +1,6 @@
 #!/bin/bash
+# HISTORICAL: records the Oct 2026 runs and uses the PRE-restructure IDs (old C6/C7/C8; see
+# results/id_mapping.json). For new runs use tools/run_all.sh, which uses the current C6/C7 IDs.
 # Full C6 + C7 + C8 run with Claude Code + Opus 5.5 (Vertex), 3 trials per entry.
 # Waits until the Gemini runs (run_all_agy.sh) and the C7-07 rerun have finished.
 # Detached-safe (start with setsid nohup). Summary -> runs/claude_summary.md.

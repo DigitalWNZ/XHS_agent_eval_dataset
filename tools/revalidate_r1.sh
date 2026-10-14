@@ -1,6 +1,6 @@
 #!/bin/bash
 # Re-validate under udocker R1 (rootless runc). Usage: revalidate_r1.sh "cat:ENTRY:agents[:rm]" ...
-#   e.g. c8:C8-01:gold,empty:rm   -> run gold+empty, then remove the entry's base container.
+#   e.g. c7:C7-11:gold,empty:rm   -> run gold+empty, then remove the entry's base container.
 cd "$(dirname "$0")/../sources/xhs" || exit 1
 L=../../runs/validate_r1; mkdir -p $L
 for spec in "$@"; do

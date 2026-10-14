@@ -50,7 +50,7 @@ if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
 # Set by run_benchmark.main() from CLI flags.
 CONFIG = {"trials": 5, "sandbox": "docker", "dry_run": False}
 
-# Neutral git identity for agents: C8 (DeepSWE) grades only COMMITTED work, and neither the host
+# Neutral git identity for agents: DeepSWE-derived entries grade only COMMITTED work, and neither the host
 # nor the task images configure user.name/email, so `git commit` would fail. Host CLI agents
 # inherit these via os.environ; containers get them via UdockerSandbox env vars.
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "agent", "GIT_AUTHOR_EMAIL": "agent@example.com",
@@ -669,7 +669,7 @@ def _verify_harbor_separate(sb, entry: dict) -> dict:
 
 
 def _verify_deepswe(sb, entry: dict) -> dict:
-    """DeepSWE v1.1 grading (C8), mirroring Harbor's flow for these tasks:
+    """DeepSWE v1.1 grading (DeepSWE-derived entries; verifier type deepswe), mirroring Harbor's flow for these tasks:
       1. collect: in the agent's sandbox, `git diff --binary <base> HEAD > model.patch`
          (only COMMITTED work counts, as the task instructions say);
       2. verify: a FRESH sandbox of the same image (pristine /app at base_commit), with

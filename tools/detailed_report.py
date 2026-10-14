@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Detailed per-case report (every entry x model x trial) for the C6/C7/C8 agent runs -> markdown.
+"""Detailed per-case report (every entry x model x trial) for the C6/C7 agent runs -> markdown.
 
 Reads the run summaries (results/c{6,7,8}_<agent>_<model>_<ts>.json), keeping only trials whose
 run_dir still exists under results/c*_runs/ (invalidated runs were moved to *_runs_invalid/ and
-are therefore excluded). Usage: detailed_report.py > runs/detailed_results.md
+are therefore excluded). Runs from before the C6/C7 restructure are mapped to the current IDs via
+results/id_mapping.json. Usage: detailed_report.py > runs/detailed_results.md
 """
 import collections
 import glob
 import json
 import os
+import sys
 
-XHS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sources", "xhs")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from idmap import XHS, current_id  # noqa: E402
+
 AGENTS = {"agy": "Antigravity", "claude": "Claude Code"}
 MODEL_ORDER = ["gemini-3.6-flash-high", "gemini-3.8-flash-high", "claude-opus-5-5"]
-CAT_NAMES = {"C6": "C6 环境任务（容器化终端） — Terminal-Bench 2.0 / FrontierSWE v2",
-             "C7": "C7 日常后端缺陷修复 — SWE-bench Verified",
-             "C8": "C8 功能开发 — DeepSWE v1.1"}
+CATS = ("C6", "C7")
+CAT_NAMES = {"C6": "C6 区分度任务 — Discriminative (model-differentiating)",
+             "C7": "C7 日常工作任务 — Daily work (routine engineering)"}
 
 entries = {}
-for f in glob.glob(f"{XHS}/dataset/c[678]/C*.json"):
+for f in glob.glob(f"{XHS}/dataset/c[67]/C*.json"):
     e = json.load(open(f))
     entries[e["instance_id"]] = e
 
@@ -31,11 +35,12 @@ for f in sorted(glob.glob(f"{XHS}/results/c[678]_*_*_*.json")):
         rd = r.get("run_dir", "")
         if not rd or not os.path.isdir(rd) or "_invalid" in rd:
             continue
+        eid = current_id(r["instance_id"], rd)
         for i, t in enumerate(r.get("trials", [])):
             tdir = t.get("trial_dir") or os.path.join(rd, f"trial_{i}")
             if not os.path.exists(os.path.join(tdir, "verdict.json")):
                 continue
-            trials[(r["instance_id"], r["model"])].append(
+            trials[(eid, r["model"])].append(
                 {**t, "agent": d["agent"], "run": os.path.basename(rd), "tdir": tdir})
 
 
@@ -53,13 +58,19 @@ def fmt_time(s):
     return f"{s / 60:.1f} min" if s >= 60 else f"{s:.0f} s"
 
 
+def source(e):
+    return e["maps_to_journey"].replace("External: ", "")
+
+
 out = []
 models = [m for m in MODEL_ORDER if any(k[1] == m for k in trials)]
-out.append("# Detailed results: C6 / C7 / C8 agent runs\n")
+out.append("# Detailed results: C6 (discriminative) / C7 (daily work) agent runs\n")
 out.append("Agents: Antigravity (agy) with gemini-3.6-flash-high / gemini-3.8-flash-high; "
-           "Claude Code with claude-opus-5-5 (Vertex). Independent trials per entry (3, C6-01 "
-           "Gemini 5). P = pass, F = fail. C6-08 has a continuous score in [0, 1] and passes at "
+           "Claude Code with claude-opus-5-5 (Vertex). Independent trials per entry (3; C7-01 "
+           "Gemini 5). P = pass, F = fail. C6-07 has a continuous score in [0, 1] and passes at "
            ">= 0.1. Runs invalidated by harness bugs are excluded (see results/*_runs_invalid/).\n")
+out.append("Entry IDs follow the C6/C7 restructure; *Former ID* is the ID used when the runs were "
+           "recorded (raw run folders keep it; mapping in results/id_mapping.json).\n")
 out.append("Columns: *Details* = grader verdict (F2P/P2P = fail-to-pass / pass-to-pass tests passed); "
            "*Agent time* = agent wall time (budget-capped); *Tokens* = input+output incl. cache; "
            "*Turns* as reported by the agent CLI (agy reports 1 per session; when agy hits its time "
@@ -67,33 +78,34 @@ out.append("Columns: *Details* = grader verdict (F2P/P2P = fail-to-pass / pass-t
 
 # Overview
 out.append("## Overview\n")
-out.append("| Entry | Task | " + " | ".join(models) + " |")
-out.append("|---|---|" + "---|" * len(models))
+out.append("| Entry | Former ID | Source / task | " + " | ".join(models) + " |")
+out.append("|---|---|---|" + "---|" * len(models))
 cat_tot = collections.defaultdict(lambda: [0, 0])
-for eid in sorted(entries):
-    row = []
-    for m in models:
-        ts = trials.get((eid, m), [])
-        p = sum(1 for t in ts if float(t.get("score", t.get("reward", 0)) or 0) >= thresh(eid))
-        cat_tot[(eid[:2], m)][0] += p
-        cat_tot[(eid[:2], m)][1] += len(ts)
-        row.append(f"{p}/{len(ts)}" if ts else "—")
-    task = entries[eid]["maps_to_journey"].split("/ ")[-1]
-    out.append(f"| {eid} | {task} | " + " | ".join(row) + " |")
-for c in ("C6", "C7", "C8"):
-    out.append(f"| **{c} total** | | " + " | ".join(
-        f"**{cat_tot[(c, m)][0]}/{cat_tot[(c, m)][1]}**" for m in models) + " |")
-allp = {m: sum(cat_tot[(c, m)][0] for c in ("C6", "C7", "C8")) for m in models}
-alln = {m: sum(cat_tot[(c, m)][1] for c in ("C6", "C7", "C8")) for m in models}
-out.append("| **All** | | " + " | ".join(
+for cat in CATS:
+    for eid in sorted(k for k in entries if k.startswith(cat)):
+        row = []
+        for m in models:
+            ts = trials.get((eid, m), [])
+            p = sum(1 for t in ts if float(t.get("score", t.get("reward", 0)) or 0) >= thresh(eid))
+            cat_tot[(cat, m)][0] += p
+            cat_tot[(cat, m)][1] += len(ts)
+            row.append(f"{p}/{len(ts)}" if ts else "—")
+        out.append(f"| {eid} | {entries[eid].get('former_id', '')} | {source(entries[eid])} | "
+                   + " | ".join(row) + " |")
+    out.append(f"| **{cat} total** | | | " + " | ".join(
+        f"**{cat_tot[(cat, m)][0]}/{cat_tot[(cat, m)][1]} "
+        f"({100 * cat_tot[(cat, m)][0] / max(cat_tot[(cat, m)][1], 1):.0f}%)**" for m in models) + " |")
+allp = {m: sum(cat_tot[(c, m)][0] for c in CATS) for m in models}
+alln = {m: sum(cat_tot[(c, m)][1] for c in CATS) for m in models}
+out.append("| **All** | | | " + " | ".join(
     f"**{allp[m]}/{alln[m]} ({100 * allp[m] / max(alln[m], 1):.0f}%)**" for m in models) + " |\n")
 
 # Per entry
-for cat in ("C6", "C7", "C8"):
+for cat in CATS:
     out.append(f"## {CAT_NAMES[cat]}\n")
     for eid in sorted(k for k in entries if k.startswith(cat)):
         e = entries[eid]
-        out.append(f"### {eid} · {e['maps_to_journey'].split('/ ')[-1]}\n")
+        out.append(f"### {eid} · {source(e)} (former {e.get('former_id', '—')})\n")
         out.append(f"- **Rednote relevance:** {e.get('rednote_relevance', '—')}")
         if e.get("daily_work_scenario"):
             out.append(f"- **Daily-work scenario:** {e['daily_work_scenario']}")

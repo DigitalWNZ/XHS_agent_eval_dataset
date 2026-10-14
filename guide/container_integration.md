@@ -1,6 +1,6 @@
 # How containers are integrated in the evaluation harness (C6 / C7)
 
-C1–C5 run agents in a git worktree of `xhs-campaign-service`. C6 (environment tasks) and C7
+C1–C5 run agents in a git worktree of `xhs-campaign-service`. C6 (discriminative tasks) and C7
 (SWE-bench repos) instead run every trial inside the task's own container image. That image is
 the same one the source benchmark (Terminal-Bench 2.0, FrontierSWE v2, SWE-bench Verified)
 publishes. This page explains how that works.
@@ -28,7 +28,7 @@ flowchart LR
 
 Per trial:
 1. **Start a fresh sandbox** from the entry's `environment` (image, workdir).
-2. **Run the agent.** Its work lands in the task workdir (`/app` for C6, `/testbed` for C7).
+2. **Run the agent.** Its work lands in the task workdir (`/app` for Terminal-Bench / FrontierSWE / DeepSWE entries, `/testbed` for SWE-bench entries).
 3. **Grade inside the container.** The hidden tests or eval script are copied in only now and run
    by the entry's `verification`.
 4. **Destroy** the sandbox and record `verdict.json`.
@@ -46,7 +46,7 @@ never call Docker directly; they go through this interface.
 |---|---|---|---|
 | `docker` (default) | `DockerSandbox` | Builds the entry's Dockerfile (if present) or pulls `prebuilt_image`, then runs one long-lived container per trial (`docker run -d ... sleep infinity`). Commands go through `docker exec`. Enforces `cpus`, `memory`, `network: false`. | Machines with a Docker daemon. Highest isolation. |
 | `udocker` | `UdockerSandbox` | Rootless; no daemon, no sudo. Unpacks the exact image once into a reusable **base container**. Each command is a `udocker run` (proot) with per-trial bind mounts. | Cloudtop and other hosts without Docker or root. Used for all runs so far. |
-| `bwrap` | `BwrapSandbox` | bubblewrap with the **host** `/usr` read-only and no network. | Only for tasks that need nothing beyond host tools (e.g. C6-01). Cannot run tb2_pytest, swebench or harbor_separate verifiers. |
+| `bwrap` | `BwrapSandbox` | bubblewrap with the **host** `/usr` read-only and no network. | Only for tasks that need nothing beyond host tools (e.g. C7-01). Cannot run tb2_pytest, swebench or harbor_separate verifiers. |
 
 ### udocker details
 
@@ -56,7 +56,7 @@ never call Docker directly; they go through this interface.
 - **Per-trial isolation via bind mounts:** fresh host directories are mounted over:
   - the workdir (`/app` or `/testbed`), seeded from the image's own copy
   - `/tmp`, `/logs`, `/tests`
-  - any `environment.per_trial_paths` (e.g. C6-08 uses an empty `/root` to hide verifier assets)
+  - any `environment.per_trial_paths` (e.g. C6-07 uses an empty `/root` to hide verifier assets)
 
   Trials and parallel runs therefore don't see each other's work or the tests.
 - **Shared toolchain:** `~/.cache/xhs_c6/opt` is mounted at `/opt/xhs`. It holds `uv`/`uvx` plus
@@ -135,12 +135,13 @@ Tests are never visible to the agent. They are copied in only after the agent ex
 
 | `verification.type` | Used by | What runs |
 |---|---|---|
-| `script` | C6-01 | A custom verifier is copied to `container_path` and run; its last stdout line is a JSON verdict `{reward, reason, checks}`. |
-| `tb2_pytest` | C6-02..07 | The original Terminal-Bench `tests/` are copied to `/tests`. `bash /tests/grader.sh` runs: the original `test.sh` minus the four curl/uv install lines, with uv from `/opt/xhs`. Reward is read from `/logs/verifier/reward.txt`; per-test results come from the CTRF report. |
-| `swebench` | C7 | The diff against `base_commit` is recorded. The official SWE-bench `eval.sh` runs in the instance image (reset test files, apply hidden test patch, run tests). The merged log is graded on the host by swebench's own `get_eval_report` (`evaluation/swebench_grade.py`, run with `~/.cache/xhs_c6/swebench-venv`). Reward = resolved (all FAIL_TO_PASS and PASS_TO_PASS tests pass). |
-| `harbor_separate` | C6-08 | As in Harbor's `environment_mode = "separate"`: a **disposable** container is created from the task's *verifier* image, the agent's `/app` is copied in (minus `artifact_excludes`), and `bash /root/tests/test.sh` runs. The reward is continuous (0–1) from `/logs/verifier/reward.txt`; the container is removed afterwards. Currently implemented for udocker only. |
+| `script` | — (supported; former C6-01 used it) | A custom verifier is copied to `container_path` and run; its last stdout line is a JSON verdict `{reward, reason, checks}`. |
+| `tb2_pytest` | C6-01, C6-04, C6-06, C7-01..04 | The original Terminal-Bench `tests/` are copied to `/tests`. `bash /tests/grader.sh` runs: the original `test.sh` minus the four curl/uv install lines, with uv from `/opt/xhs`. Reward is read from `/logs/verifier/reward.txt`; per-test results come from the CTRF report. |
+| `swebench` | C6-05, C7-05..10 | The diff against `base_commit` is recorded. The official SWE-bench `eval.sh` runs in the instance image (reset test files, apply hidden test patch, run tests). The merged log is graded on the host by swebench's own `get_eval_report` (`evaluation/swebench_grade.py`, run with `~/.cache/xhs_c6/swebench-venv`). Reward = resolved (all FAIL_TO_PASS and PASS_TO_PASS tests pass). |
+| `harbor_separate` | C6-07 | As in Harbor's `environment_mode = "separate"`: a **disposable** container is created from the task's *verifier* image, the agent's `/app` is copied in (minus `artifact_excludes`), and `bash /root/tests/test.sh` runs. The reward is continuous (0–1) from `/logs/verifier/reward.txt`; the container is removed afterwards. Currently implemented for udocker only. |
+| `deepswe` | C6-02, C6-03, C7-11..14 | DeepSWE v1.1, mirroring Harbor's separate mode: the agent's **committed** work (`git diff --binary <base_commit> HEAD`) is collected, applied in a fresh verifier container built from `tests/Dockerfile` (task image + tests), and `bash /tests/test.sh` applies the hidden `test.patch` and runs `grader.py`. Reward = 1 iff all FAIL_TO_PASS pass and no PASS_TO_PASS fails (`/logs/verifier/reward.json`). |
 
-Continuous rewards pass at `verification.pass_threshold` (C6-08: 0.1; binary graders default to
+Continuous rewards pass at `verification.pass_threshold` (C6-07: 0.1; binary graders default to
 1.0). Each trial records both `reward` (pass or fail) and `score` (raw value).
 
 ## 5. Reliability measures
@@ -151,7 +152,7 @@ Continuous rewards pass at `verification.pass_threshold` (C6-08: 0.1; binary gra
   parallel.
 - **SIGINT restore:** background jobs started from a non-interactive shell inherit
   SIGINT = ignored, and so do all their children. `env_runner` restores the default handler at
-  import, so tasks that test Ctrl-C handling (C6-05) behave correctly.
+  import, so tasks that test Ctrl-C handling (C7-03) behave correctly.
 - **Timeouts kill whole process groups** (`_run`), so proot/udocker children don't linger.
 - **Infra failures** (sandbox start, image pull) are recorded per trial as `infra_error` and count
   as 0. Rerun when they appear.
@@ -162,16 +163,16 @@ From the XHS repo root:
 
 ```bash
 # validate an entry (gold must pass, empty must fail)
-python3 evaluation/run_benchmark.py --category c6 --entry C6-03 --agent gold  --sandbox udocker
-python3 evaluation/run_benchmark.py --category c6 --entry C6-03 --agent empty --sandbox udocker
+python3 evaluation/run_benchmark.py --category c7 --entry C7-02 --agent gold  --sandbox udocker
+python3 evaluation/run_benchmark.py --category c7 --entry C7-02 --agent empty --sandbox udocker
 
 # agent runs: 3 trials with Antigravity
 GOOGLE_APPLICATION_CREDENTIALS=<adc with quota project> \
-python3 evaluation/run_benchmark.py --category c7 --entry C7-01 --agent agy \
+python3 evaluation/run_benchmark.py --category c6 --entry C6-05 --agent agy \
     --model gemini-3.8-flash-high --sandbox udocker --trials 3
 
-# C6-08 has a 2 h budget: raise --timeout (minutes) so it isn't capped at the default 30
-python3 evaluation/run_benchmark.py --category c6 --entry C6-08 --agent agy \
+# C6-07 has a 2 h budget: raise --timeout (minutes) so it isn't capped at the default 30
+python3 evaluation/run_benchmark.py --category c6 --entry C6-07 --agent agy \
     --model gemini-3.8-flash-high --sandbox udocker --trials 3 --timeout 120
 ```
 
@@ -194,7 +195,7 @@ The run summary is `results/<category>_<agent>_<model>_<ts>.json`.
   ~12 GB). After a base is created, remove the image layers with `udocker rmi <image>`; bases don't
   depend on them. Exception: keep the layers of verifier images used by `harbor_separate`, because
   a disposable container is created from them for every grading.
-- **C7 bases:** `scripts/prepare_c7_bases.sh` (analysis workspace) creates them one at a time,
+- **SWE-bench bases:** `tools/prepare_c7_bases.sh` (written for the pre-restructure C7 IDs) creates them one at a time,
   with a free-disk guard.
 - **agy auth:** agy uses the `quota_project_id` from the ADC file. Point
   `GOOGLE_APPLICATION_CREDENTIALS` at a copy of the ADC whose `quota_project_id` has Vertex
@@ -202,10 +203,10 @@ The run summary is `results/<category>_<agent>_<model>_<ts>.json`.
 
 > [!NOTE]
 > Under `--sandbox docker`, `DockerSandbox` builds the image from the entry's Dockerfile when one
-> exists; otherwise it pulls `prebuilt_image` (e.g. C7's SWE-bench images, which have no
+> exists; otherwise it pulls `prebuilt_image` (e.g. the SWE-bench images, which have no
 > Dockerfile). The rebuild is intended. udocker cannot build, so it always runs the published
 > image.
 
 > [!WARNING]
-> `per_trial_paths`, `container_env` and `harbor_separate` (C6-08) are currently implemented for
+> `per_trial_paths`, `container_env` and `harbor_separate` (C6-07) are currently implemented for
 > udocker only.

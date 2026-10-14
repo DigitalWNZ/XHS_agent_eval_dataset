@@ -1,3 +1,11 @@
+> [!NOTE]
+> This guide was written for the first containerized entry, `polyglot-c-py`, when it was
+> C6-01. After the 2026-10-14 restructure it is **C7-01** (daily work), and C6 now holds the 7
+> discriminative entries. Read "C6-01" below as today's C7-01 (`--category c7 --entry C7-01`).
+> C7-01 now uses the original Terminal-Bench pytest suite (`tb2_pytest`) instead of the custom
+> verifier described in section 2. For the current layout, IDs and field reference, see
+> [c6_entry_format.md](c6_entry_format.md).
+
 # C6 — Environment Tasks (Containerized Terminal) Evaluation Guide
 
 C6 adds **externally sourced, model-discriminative tasks** to the XHS benchmark. Unlike C3/C5, a C6 task doesn't run in the `xhs-campaign-service` git worktree. Each entry brings **its own environment (a Docker image)**, and a **verifier script** grades it inside that environment after the agent finishes.
@@ -17,7 +25,7 @@ The first entry, `C6-01`, is Terminal-Bench 2.0's `polyglot-c-py`. Across 75 lea
 | `environment` | object | `type: docker`, `dockerfile` (path in this repo), `prebuilt_image` (fallback), `workdir` (usually `/app`), `cpus`, `memory`, `network`, `agent_timeout_sec`, `initial_state` |
 | `verification` | object | `type: script`, `script` (path in this repo), `container_path`, `command`, `timeout_sec`, `checks_in_order` (readable criteria), `equivalent_to`, `original_tests` |
 | `gold_solution` | object | `script` (shell, run in `run_in`); used to validate the task and verifier |
-| `evaluation_rubric` | string | `evaluation/rubrics/c6_env.json` |
+| `evaluation_rubric` | string | `evaluation/rubrics/c6_discriminative.json` (C6) or `c7_daily.json` (C7) |
 | `source` | object | Original benchmark, repo, commit, path, author, original scoring, and what changed in conversion |
 | `discrimination` | object | Why the task separates models: leaderboard `n_models`, mean pass rate, std, `disc_r` (item–rest correlation), frontier-tier metrics, failure-mode breakdown |
 | `reference_scores` | array | Per-submission leaderboard pass rates (`agent`, `model`, `pass_rate`, `n_runs`) to compare your runs against |
@@ -37,7 +45,7 @@ The verifier runs **in the same container the agent used, after the agent stops*
 2. `gcc /app/polyglot/main.py.c -o /app/polyglot/cmain` exits 0 (warnings are fine).
 3. For n = 42, 10, 0: `python3 main.py.c n` and `./cmain n` both exit 0 and print `267914296`, `55`, `0`.
 
-## 3. Scoring (`evaluation/rubrics/c6_env.json`)
+## 3. Scoring (`evaluation/rubrics/c6_discriminative.json` / `c7_daily.json`)
 
 - Each trial gets a binary reward from the verifier.
 - **D1 Task Success (100 pts):** pass rate over N trials (default 5), snapped to tiers 100/80/60/40/20/0. `total_score = D1`. Pass threshold: 60.

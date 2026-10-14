@@ -1,4 +1,6 @@
 #!/bin/bash
+# HISTORICAL: records the Oct 2026 runs and uses the PRE-restructure IDs (old C6/C7/C8; see
+# results/id_mapping.json). For new runs use tools/run_all.sh, which uses the current C6/C7 IDs.
 # Detached orchestrator for the full agy run (C7, C8, C6-08), both models x 3 trials.
 # Survives logout/laptop close (start with setsid nohup). Writes runs/agy_summary.md at the end.
 cd "$(dirname "$0")/.." || exit 1
