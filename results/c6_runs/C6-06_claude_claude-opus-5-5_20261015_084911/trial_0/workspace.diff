@@ -1,0 +1,68 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,63 @@
++import asyncio
++from typing import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]],
++    max_concurrent: int,
++) -> None:
++    """Run ``tasks`` with at most ``max_concurrent`` running at once.
++
++    If ``run_tasks`` is cancelled (e.g. on KeyboardInterrupt under
++    ``asyncio.run``), every running task is cancelled and awaited so that its
++    cleanup code (``finally`` blocks, ``async with`` exits, ...) runs to
++    completion before this function returns. Tasks that have not started yet
++    are never started.
++
++    If any task raises, the remaining tasks still run; the first exception is
++    re-raised once all tasks have finished.
++    """
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be >= 1")
++
++    jobs = iter(list(tasks))
++    errors: list[BaseException] = []
++
++    async def worker() -> None:
++        for job in jobs:
++            try:
++                await job()
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                errors.append(exc)
++
++    workers = [
++        asyncio.create_task(worker())
++        for _ in range(min(max_concurrent, len(tasks)))
++    ]
++    if not workers:
++        return
++
++    try:
++        await asyncio.gather(*workers)
++    except BaseException:
++        # Cancelled (or interrupted): cancel the workers and wait until every
++        # task's cleanup has finished, even if we get cancelled again meanwhile.
++        for w in workers:
++            w.cancel()
++        while True:
++            pending = [w for w in workers if not w.done()]
++            if not pending:
++                break
++            try:
++                await asyncio.wait(pending)
++            except asyncio.CancelledError:
++                pass
++        for w in workers:
++            if not w.cancelled():
++                w.exception()  # mark retrieved to avoid warnings
++        raise
++
++    if errors:
++        raise errors[0]
