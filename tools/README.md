@@ -63,6 +63,51 @@ AGENT=gold  MODELS=gemini-3.8-flash-high TRIALS=1 QUALITY=off bash tools/run_que
 AGENT=empty MODELS=gemini-3.8-flash-high TRIALS=1 QUALITY=off bash tools/run_queue.sh 1 30 keep c9:C9-01           # expect 0
 ```
 
+## Cloud runner (`tools/cloud/`, GCP Batch)
+
+For many trials in parallel: `xhs_cloud.py` runs one Batch task per trial on worker VMs in a GCP project
+(default `gcr-evaluation-hub`, region `us-central1`) and removes every resource afterwards. Workers use real
+**Docker** (`--sandbox docker`: exact published images, C8-02's separate verifier supported) instead of udocker.
+Like the udocker runs, the source benchmarks' cpus/memory limits are not enforced by default (`--env
+XHS_DOCKER_LIMITS=1` enforces them; then C6-01's grader exceeds its 900 s timeout). Validated 2026-10-15 on
+Docker: gold 21/22 pass (C8-02's FrontierSWE oracle scores 0 on udocker too), empty 0/22.
+
+| File | Role |
+|---|---|
+| `cloud/xhs_cloud.py` | Controller: `bake`, `run`, `status`, `collect`, `down`, `gc` |
+| `cloud/bake.sh` | Startup script of the temporary bake VM → image family `xhs-worker` (Docker, bwrap, uv, Claude Code, agy, SWE-bench venv, all task images pre-pulled) |
+| `cloud/worker.py` | Runs one trial on a worker: code from GCS → `run_benchmark.py --sandbox docker --trials 1` → results + status to GCS |
+
+```bash
+export CLOUDSDK_CONFIG=~/.cache/sheets-gcloud      # a gcloud config whose ADC can manage the project
+python3 tools/cloud/xhs_cloud.py bake               # once, ~40 min; re-bake when tools or task images change
+python3 tools/cloud/xhs_cloud.py run --cases all --agent agy --models gemini-3.8-flash-high,gemini-4-argon-high --trials 3
+python3 tools/cloud/xhs_cloud.py run --cases c9:C9-01 --agent claude --models claude-opus-5-5 --trials 3 --detach
+python3 tools/cloud/xhs_cloud.py status <run-id> --watch     # from any shell
+python3 tools/cloud/xhs_cloud.py down <run-id>               # collect + delete jobs/VMs/GCS prefix
+python3 tools/cloud/xhs_cloud.py gc                          # clean up anything orphaned (label purpose=xhs-runner)
+```
+
+- **One-time project setup:** service account `xhs-runner` with `roles/aiplatform.user`, `logging.logWriter`,
+  `batch.agentReporter`, `artifactregistry.reader`, `monitoring.metricWriter`, and `storage.objectAdmin` on the
+  bucket `gs://gcr-evaluation-hub-xhs-runs`. Workers authenticate agy (`AGY_ADC_AUTH=true`) and Claude Code
+  (Vertex) with this service account; no user credential is copied to the cloud.
+- **Scheduling:** one Batch job per model and provisioning class; `--parallelism` = max concurrent trials per
+  model, `--per-vm` trials per VM (default 2 on `n2-standard-16`). VMs are **on-demand by default** (no
+  preemption); `--spot auto|all` opts into Spot. Infrastructure failures (worker exit 75) are retried up to
+  twice; agent failures are results. If a machine type is out of capacity in the region (stockout), the job
+  waits in SCHEDULED and `status` shows the Batch event; pick another `--machine-type` (e.g. `e2-standard-16`,
+  `n2d-standard-16`).
+- **Results:** each task gets a unique run timestamp (`XHS_RUN_TS`), so run folders from all workers merge into
+  `results/c*_runs/` exactly like local runs; `run`/`collect` then write `results/cloud_<run-id>_<cat>.md` with
+  `campaign_report.py`. Logs and per-task status go to `$RUNS_DIR/cloud/<run-id>/`.
+- **Teardown:** `run` deletes its Batch jobs (Batch deletes the VMs), any leftover VM labelled `xhs-run=<id>`
+  and the run's GCS prefix when it finishes, on error and on Ctrl-C (after collecting what finished).
+  `--detach` leaves the run going; finish it with `status --watch` + `down`.
+- **Isolation on workers:** agents run in bwrap with `/work` (all trials' repo copies) and the repo hidden, and
+  `/tmp` private. The worker service account can read the run bucket, so the validity audit flags any agent
+  access to it (`quality_grader.LEAK_URL`).
+
 ## Typical use
 
 ```bash

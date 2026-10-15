@@ -285,7 +285,8 @@ LEAK_PATH = re.compile(
     r"/dataset/c\d/(envs/|C\d-\d\d_)|\boriginal_tests/|/deliverables/cases/)")
 LEAK_FILE = re.compile(r"(solve\.sh|solution\.patch|gold\.(patch|sh)|instance\.json|test\.patch|verify\.py|"
                        r"eval\.sh|test_outputs\.py|grader\.(py|sh)|config\.json|/tests?/|C\d-\d\d_[\w.-]+\.json|/solution/)")
-LEAK_URL = re.compile(r"github\.com/[\w.-]+/[\w.-]+/(pull|pulls|commit|commits|compare)/|"
+LEAK_URL = re.compile(r"(gs://|storage\.googleapis\.com/(storage/v1/b/|upload/storage/v1/b/)?)[\w.-]*xhs-runs|"  # cloud runner bucket (code.tgz holds the dataset)
+                      r"github\.com/[\w.-]+/[\w.-]+/(pull|pulls|commit|commits|compare)/|"
                       r"api\.github\.com/repos/[\w.-]+/[\w.-]+/(pulls|commits|compare)|patch-diff\.githubusercontent|"
                       r"huggingface\.co/datasets/[\w.-]*(swe-bench|SWE-bench|deep-swe|terminal-bench|frontier)|"
                       r"tbench\.ai|github\.com/(datacurve-ai/deep-swe|laude-institute/terminal-bench|SWE-bench/experiments)")

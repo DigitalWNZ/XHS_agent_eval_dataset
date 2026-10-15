@@ -1614,7 +1614,7 @@ def main():
     print_summary(args.category, results)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts = os.environ.get("XHS_RUN_TS") or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     report_file = RESULTS_DIR / f"{args.category}_{args.agent}_{args.model}_{ts}.json"
     report = {
         "benchmark": "xhs-agent-eval",

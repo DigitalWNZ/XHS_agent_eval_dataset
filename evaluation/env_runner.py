@@ -33,6 +33,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
 import time
 import urllib.error
 import urllib.request
@@ -135,38 +136,45 @@ def _descendants(root: int) -> list[int]:
 
 
 class DockerSandbox:
-    """Fresh container per trial, built from the entry's Dockerfile (or a prebuilt image)."""
+    """Real Docker (root hosts, e.g. the cloud workers in tools/cloud/): a fresh container per trial from
+    the entry's EXACT published image (environment.prebuilt_image; digest refs work), so /tmp, /logs and
+    /tests are per-trial by construction. The workdir is seeded from the image into the host workspace
+    (shared with host CLI agents) and bind-mounted back. The source benchmark's cpus/memory limits are NOT
+    enforced by default, matching the udocker runs all earlier results come from (with them, e.g. C6-01's
+    grader exceeds its 900 s timeout); XHS_DOCKER_LIMITS=1 enforces them. A local Dockerfile build is only
+    used when no prebuilt image exists.
+    `image` overrides the image (verifier containers)."""
 
-    def __init__(self, entry: dict, host_workspace: Path | None = None):
+    def __init__(self, entry: dict, host_workspace: Path | None = None, image: str | None = None):
         env = entry["environment"]
         self.workdir = env.get("workdir", "/app")
-        self.ws = host_workspace
-        image = f"xhs-c6-{entry['instance_id'].lower()}"
-        dockerfile = BASE_DIR / env["dockerfile"] if env.get("dockerfile") else None
-        if dockerfile and dockerfile.exists():
+        image = image or env.get("docker_image") or env.get("prebuilt_image")
+        if not image:
+            image = f"xhs-c6-{entry['instance_id'].lower()}"
+            dockerfile = BASE_DIR / env["dockerfile"]
             subprocess.run(["docker", "build", "-q", "-t", image, "-f", str(dockerfile),
                             str(dockerfile.parent)], check=True, capture_output=True)
-        else:
-            image = env["prebuilt_image"]
+        elif subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode:
             subprocess.run(["docker", "pull", "-q", image], check=True, capture_output=True)
-        self.name = f"xhs-c6-{entry['instance_id'].lower()}-{int(time.time() * 1000)}"
-        if host_workspace is not None:  # seed the host workspace with the image's workdir
-            seed = self.name + "-seed"
-            subprocess.run(["docker", "create", "--name", seed, image], check=True,
-                           capture_output=True)
-            subprocess.run(["docker", "cp", f"{seed}:{self.workdir}/.", str(host_workspace)],
-                           capture_output=True)
-            subprocess.run(["docker", "rm", "-f", seed], capture_output=True)
-        cmd = ["docker", "run", "-d", "--name", self.name, "-w", self.workdir,
-               "-v", f"{_tools_dir()}:/opt/xhs"]
-        if env.get("cpus"):
+        self.image = image
+        self.name = f"xhs-{entry['instance_id'].lower()}-{uuid.uuid4().hex[:10]}"
+        self.ws = Path(host_workspace or tempfile.mkdtemp(prefix="xhs-c6-ws-"))
+        self.own_ws = host_workspace is None
+        seed = self.name + "-seed"  # seed the workspace with the image's workdir
+        subprocess.run(["docker", "create", "--name", seed, image], check=True, capture_output=True)
+        subprocess.run(["docker", "cp", f"{seed}:{self.workdir}/.", str(self.ws)], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", seed], capture_output=True)
+        cmd = ["docker", "run", "-d", "--name", self.name, "-w", self.workdir, "--entrypoint", "",
+               "-v", f"{_tools_dir()}:/opt/xhs", "-v", f"{self.ws}:{self.workdir}",
+               "--label", "xhs-trial=1"]
+        for k, v in {**GIT_IDENTITY, **env.get("container_env", {})}.items():
+            cmd += ["-e", f"{k}={v}"]
+        if env.get("cpus") and os.environ.get("XHS_DOCKER_LIMITS", "0") == "1":
             cmd += ["--cpus", str(env["cpus"])]
-        if env.get("memory"):
+        if env.get("memory") and os.environ.get("XHS_DOCKER_LIMITS", "0") == "1":
             cmd += ["--memory", str(env["memory"])]
         if env.get("network") is False:
             cmd += ["--network", "none"]
-        if host_workspace is not None:
-            cmd += ["-v", f"{host_workspace}:{self.workdir}"]
         subprocess.run(cmd + [image, "sleep", "infinity"], check=True, capture_output=True)
 
     def exec_argv(self, argv: list[str]) -> list[str]:
@@ -188,11 +196,13 @@ class DockerSandbox:
 
     def read_file(self, path: str) -> str | None:
         p = subprocess.run(["docker", "exec", self.name, "cat", path], capture_output=True,
-                           text=True)
+                           text=True, errors="replace")
         return p.stdout if p.returncode == 0 else None
 
     def close(self) -> None:
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+        if self.own_ws:
+            shutil.rmtree(self.ws, ignore_errors=True)
 
 
 _EXECMODE_CACHE: dict[str, str] = {}
@@ -801,8 +811,10 @@ def _verify_harbor_separate(sb, entry: dict) -> dict:
     import fnmatch  # pylint: disable=g-import-not-at-top
     import uuid  # pylint: disable=g-import-not-at-top
     v = entry["verification"]
+    if isinstance(sb, DockerSandbox):
+        return _verify_harbor_separate_docker(sb, entry)
     if not isinstance(sb, UdockerSandbox):
-        raise NotImplementedError("harbor_separate is implemented for --sandbox udocker")
+        raise NotImplementedError("harbor_separate is implemented for --sandbox udocker|docker")
     image = v.get("udocker_verifier_image") or v["verifier_image"]
     name = f"xhs-ver-{uuid.uuid4().hex[:12]}"
     work = Path(tempfile.mkdtemp(prefix="xhs-ver-"))
@@ -841,6 +853,10 @@ def _verify_harbor_separate(sb, entry: dict) -> dict:
     finally:
         subprocess.run(ud + ["rm", name], capture_output=True)
         shutil.rmtree(work, ignore_errors=True)
+    return _harbor_result(rc, out, txt, details, vlog)
+
+
+def _harbor_result(rc, out: str, txt: str, details: dict, vlog: str) -> dict:
     try:
         reward = max(0.0, min(1.0, float(txt)))
     except ValueError:
@@ -854,6 +870,47 @@ def _verify_harbor_separate(sb, entry: dict) -> dict:
                        for k in keys if k in details],
             "verifier_rc": rc, "reward_txt": txt, "reward_details": details,
             "verifier_log_tail": vlog[-4000:]}
+
+
+def _verify_harbor_separate_docker(sb, entry: dict) -> dict:
+    """harbor_separate under real Docker: same artifact copy and clean-room verifier as the udocker
+    path, but the verifier image is used directly (digest refs work, no local alias needed)."""
+    import fnmatch  # pylint: disable=g-import-not-at-top
+    v = entry["verification"]
+    image = v.get("docker_verifier_image") or v["verifier_image"]
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode:
+        subprocess.run(["docker", "pull", "-q", image], check=True, capture_output=True)
+    work = Path(tempfile.mkdtemp(prefix="xhs-ver-"))
+    app, logs = work / "app", work / "logs"
+    logs.mkdir()
+    names_ex = [pat.removeprefix("**/").removesuffix("/**") for pat in v.get("artifact_excludes", [])]
+
+    def _ignore(_d, names):
+        return [n for n in names if any(fnmatch.fnmatch(n, pat) for pat in names_ex)]
+    shutil.copytree(sb.ws, app, symlinks=True, ignore=_ignore)
+    name = f"xhs-ver-{uuid.uuid4().hex[:12]}"
+    envs = []
+    for k, val in v.get("env", {}).items():
+        envs += ["-e", f"{k}={val}"]
+    if getattr(sb, "oracle_flag", None):
+        envs += ["-e", f"HARBOR_ORACLE_FLAG={sb.oracle_flag}"]
+    argv = (["docker", "run", "--name", name, "--entrypoint", "", "-w", "/app", "-v", f"{app}:/app",
+             "-v", f"{logs}:/logs", "--label", "xhs-trial=1"] + envs + [image, "bash", "-c", v["command"]])
+    try:
+        try:
+            p = _run(argv, v.get("timeout_sec", 10800))
+            rc, out = p.returncode, (p.stdout + p.stderr)
+        except subprocess.TimeoutExpired:
+            rc, out = None, f"verifier timeout {v.get('timeout_sec', 10800)}s"
+        vdir = logs / "verifier"
+        txt = (vdir / "reward.txt").read_text().strip() if (vdir / "reward.txt").is_file() else ""
+        details = json.loads((vdir / "reward_details.json").read_text()) if (
+            vdir / "reward_details.json").is_file() else {}
+        vlog = (vdir / "verifier.log").read_text(errors="replace") if (vdir / "verifier.log").is_file() else ""
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        shutil.rmtree(work, ignore_errors=True)
+    return _harbor_result(rc, out, txt, details, vlog)
 
 
 def _verify_deepswe(sb, entry: dict) -> dict:
@@ -1028,7 +1085,9 @@ def run_c6(entry: dict, agent: str, model: str, timeout: int) -> dict:
     n = 1 if agent in ("gold", "empty") else CONFIG["trials"]
     print(f"\n{'='*60}\nRunning {iid}: {entry.get('maps_to_journey', '')}")
     print(f"  sandbox={CONFIG['sandbox']} | agent={agent} | model={model} | trials={n}")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    # XHS_RUN_TS: fixed run timestamp (cloud workers get a unique one per task so run folders from
+    # many machines never collide when merged into results/).
+    ts = os.environ.get("XHS_RUN_TS") or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_dir = RESULTS_DIR / f"{cat}_runs" / f"{iid}_{agent}_{model}_{ts}"
     trials = []
     for i in range(n):
