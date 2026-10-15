@@ -1,6 +1,6 @@
-# C6 / C7 / C8 entry format (field reference)
+# C6 / C7 / C8 / C9 entry format (field reference)
 
-C6, C7 and C8 are the containerized categories. They share the harness (`evaluation/env_runner.py`)
+C6, C7, C8 and C9 are the containerized categories. They share the harness (`evaluation/env_runner.py`)
 and the entry layout; they differ in purpose (layout of 2026-10-15, chosen from the 2026-10-14 campaign:
 claude-opus-5-5, gemini-3.6-flash-high, gemini-3.8-flash-high, gemini-4-argon-high, 3 trials each):
 
@@ -9,6 +9,7 @@ claude-opus-5-5, gemini-3.6-flash-high, gemini-3.8-flash-high, gemini-4-argon-hi
 | C6 | 区分度任务 Discriminative | C6-01..07 | Pass rates differ across the setups but no single setup dominates (campaign: Claude 62%, gemini-3.8 57%, Argon 57%, gemini-3.6 29%). Use C6 to rank models. | `evaluation/rubrics/c6_discriminative.json` |
 | C7 | 日常工作任务 Daily work | C7-01..11 | Routine engineering most setups solve (campaign pass rates 85–100%); code quality (D2) does most of the separating. | `evaluation/rubrics/c7_daily.json` |
 | C8 | 高难任务 Hard | C8-01..03 | Only the strongest setup solved them reliably, or most setups ran out of time (campaign: Claude 8/9, gemini-3.6 3/9, Argon 1/9, gemini-3.8 0/9). | `evaluation/rubrics/c8_hard.json` |
+| C9 | 客户提供任务 Customer-provided | C9-01 | Real requirements provided by the customer, kept verbatim plus an evaluation contract (deliverable path, test hook, deterministic business rules). | `evaluation/rubrics/c9_customer.json` |
 
 All categories mix source types. An entry's fields depend on its source type, not on its category:
 
@@ -301,3 +302,31 @@ Fields that differ from Parts 1–2:
 
 The build script is `tools/build/build_xhs_c8_deepswe_entries.py` (it writes the original C8
 IDs; run `tools/restructure_c6_c7.py`, then `tools/restructure_v2.py` afterwards).
+
+# Part 4: Customer-provided entries (C9)
+
+C9-01 (`dataset/c9/C9-01_toy_store_workbench.json`) is a customer requirement: a toy-shop clerk
+workbench delivered as one self-contained HTML file (products and cart, coupons and member discount,
+checkout, order status flow, partial refunds and returns, stock linkage, query and stats, persistence and
+backup). The customer brief is kept verbatim in `customer_brief`; `problem_statement` appends a
+**交付与验收约定** section so the result can be graded automatically:
+
+- the deliverable is `/app/index.html`, opened via `file://` in Chromium with the network blocked;
+- the page exposes `window.shopTestAPI` (synchronous methods, money in yuan) that must call the same
+  business logic as the UI;
+- business rules the tests depend on are fixed: status names, pro-rata refund allocation, the definition
+  of sales / refunds / net / units sold, and the `products` / `orders` keys in the export.
+
+Supporting files in `dataset/c9/envs/C9-01/`:
+
+| Path | Purpose |
+|---|---|
+| `prompt.md` | The full prompt (brief + contract + environment hint) |
+| `Dockerfile` | Documentation only: `mcr.microsoft.com/playwright/python:v1.55.0-noble` (Chromium in `/ms-playwright`) |
+| `tests/test_outputs.py`, `tests/grader.sh` | Hidden pytest + Playwright tests (33), run as `tb2_pytest` (reward 1 iff all pass; per-test CTRF results) |
+| `solution/index.html`, `solution/solve.sh` | Reference implementation (passes all tests) and the gold script that copies it to `/app` |
+
+D2 uses the 3 common items plus two case items in `evaluation/rubrics/tasks/C9-01.json` (clerk usability:
+amount breakdown, status hints, dangerous-action confirmation; and business logic shared by UI and test
+API with exact money arithmetic).
+

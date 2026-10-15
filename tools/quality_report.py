@@ -26,7 +26,7 @@ COMMON = [c["id"] for c in FW["common_items"]]
 
 def load_entries():
     out = {}
-    for f in sorted(glob.glob(f"{XHS}/dataset/c[678]/C*.json")):
+    for f in sorted(glob.glob(f"{XHS}/dataset/c[6789]/C*.json")):
         e = json.load(open(f))
         e["rub"] = json.load(open(os.path.join(XHS, e.get("task_rubric", f"evaluation/rubrics/tasks/{e['instance_id']}.json"))))
         out[e["instance_id"]] = e
@@ -35,7 +35,7 @@ def load_entries():
 
 def load_quality():
     out = []
-    for f in sorted(glob.glob(f"{XHS}/results/c[678]_runs/*/trial_*/quality.json")):
+    for f in sorted(glob.glob(f"{XHS}/results/c[6789]_runs/*/trial_*/quality.json")):
         q = json.load(open(f))
         if q.get("agent") in ("agy", "claude") and q.get("rubric_version", "").startswith("3"):
             q["entry"] = current_id(q["entry"], q["run"])  # recorded ID -> current ID (results/id_mapping.json)
@@ -58,7 +58,7 @@ def results_report():
     cell = collections.defaultdict(list)
     for q in qs:
         cell[(q["entry"], q["model"])].append(q)
-    o = ["# Results: pass rate and code quality (C6 / C7 / C8)\n",
+    o = ["# Results: pass rate and code quality (C6 / C7 / C8 / C9)\n",
          f"Rubric `evaluation/rubrics/coding_quality.json` v{FW['version']}. **Pass** = the source benchmark's hidden tests "
          "(unchanged). **Quality** = LLM judge (Claude Opus 5.5) on Readability, Maintainability, Robustness + 1–2 "
          "case-specific items; perfect 1 / accept 0.6 / bad 0; quality = 100 × mean. Trials with a confirmed validity "
@@ -78,7 +78,7 @@ def results_report():
             row.append(f"{sum(t['verifier_pass'] for t in ts)}/{len(ts)} · {f1(mean([t['quality_score'] for t in ts]))}"
                        + (f" ⚠{inv} invalid" if inv else ""))
         o.append(f"| {eid} | {ents[eid]['maps_to_journey'].replace('External: ', '')} | " + " | ".join(row) + " |")
-    for c in ("C6", "C7", "C8"):
+    for c in ("C6", "C7", "C8", "C9"):
         row = []
         for m in models:
             ts = cat.get((c, m), [])
@@ -89,7 +89,7 @@ def results_report():
     o.append("\n## Item scores (mean over trials, 0–100)\n")
     o.append("| Category | Model | 可读性 Readability | 可维护性 Maintainability | 健壮性 Robustness | Case-specific | Quality |")
     o.append("|---|---|---|---|---|---|---|")
-    for c in ("C6", "C7", "C8"):
+    for c in ("C6", "C7", "C8", "C9"):
         for m in models:
             ts = cat.get((c, m), [])
             col = lambda pred: f1(mean([100 * SC[i["level"]] if SC[i["level"]] is not None else None
@@ -124,7 +124,7 @@ def results_report():
 def rubric_doc():
     ents = load_entries()
     cl = lambda s: (s or "—").replace("|", "/").replace("\n", " ")
-    o = ["# Code-quality rubric per case (C6 / C7 / C8)\n",
+    o = ["# Code-quality rubric per case (C6 / C7 / C8 / C9)\n",
          "Pass/fail is unchanged (the source benchmark's hidden tests). Code quality is graded by one LLM judge "
          "(Claude Opus 5.5) on the 3 common items below plus each case's 1–2 items. Levels: perfect 1.0 / accept 0.6 / "
          "bad 0; quality = 100 × mean.\n",
@@ -133,7 +133,7 @@ def rubric_doc():
     for c in FW["common_items"]:
         k = c["criteria"]
         o.append(f"| {c['id']} | {c['name_zh']} | {cl(c['question'])} | {cl(k['perfect'])} | {cl(k['accept'])} | {cl(k['bad'])} | {cl(' '.join(c.get('caps', [])))} |")
-    for cat, title in (("C6", "C6 区分度任务 Discriminative"), ("C7", "C7 日常工作任务 Daily work"), ("C8", "C8 高难任务 Hard")):
+    for cat, title in (("C6", "C6 区分度任务 Discriminative"), ("C7", "C7 日常工作任务 Daily work"), ("C8", "C8 高难任务 Hard"), ("C9", "C9 客户提供任务 Customer-provided")):
         o.append(f"\n## {title}: case-specific items\n")
         o.append("| Case | Item | 评分项 | Question | Perfect | Accept | Bad |")
         o.append("|---|---|---|---|---|---|---|")

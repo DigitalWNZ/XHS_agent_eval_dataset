@@ -17,18 +17,19 @@ from idmap import XHS, current_id  # noqa: E402
 
 AGENTS = {"agy": "Antigravity", "claude": "Claude Code"}
 MODEL_ORDER = ["claude-opus-5-5", "gemini-3.6-flash-high", "gemini-3.8-flash-high", "gemini-4-argon-high"]
-CATS = ("C6", "C7", "C8")
+CATS = ("C6", "C7", "C8", "C9")
 CAT_NAMES = {"C6": "C6 区分度任务 — Discriminative (model-differentiating)",
              "C7": "C7 日常工作任务 — Daily work (routine engineering)",
-             "C8": "C8 高难任务 — Hard (frontier-separating)"}
+             "C8": "C8 高难任务 — Hard (frontier-separating)",
+             "C9": "C9 客户提供任务 — Customer-provided (real requirements)"}
 
 entries = {}
-for f in glob.glob(f"{XHS}/dataset/c[678]/C*.json"):
+for f in glob.glob(f"{XHS}/dataset/c[6789]/C*.json"):
     e = json.load(open(f))
     entries[e["instance_id"]] = e
 
 trials = collections.defaultdict(list)  # (entry, model) -> [trial dicts]
-for f in sorted(glob.glob(f"{XHS}/results/c[678]_*_*_*.json")):
+for f in sorted(glob.glob(f"{XHS}/results/c[6789]_*_*_*.json")):
     d = json.load(open(f))
     if d.get("agent") not in AGENTS:
         continue

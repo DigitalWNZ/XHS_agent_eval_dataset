@@ -83,7 +83,7 @@ def load_rubric(category: str) -> dict:
 def get_rubric_suffix(category: str) -> str:
     return {
         "c1": "requirements", "c2": "design", "c3": "codegen",
-        "c4": "review", "c5a": "testing", "c5b": "debug", "c6": "discriminative", "c7": "daily", "c8": "hard",
+        "c4": "review", "c5a": "testing", "c5b": "debug", "c6": "discriminative", "c7": "daily", "c8": "hard", "c9": "customer",
     }[category]
 
 
@@ -1463,6 +1463,7 @@ RUNNERS = {
     "c6": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),
     "c7": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),  # same containerized runner
     "c8": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),
+    "c9": lambda e, a, m, t: env_runner.run_c6(e, a, m, t),
 
 }
 
@@ -1514,7 +1515,7 @@ def print_summary(category: str, results: list[dict]) -> None:
             total = sc.get('total_score', '?')
             print(f"{r['instance_id']:<12} {tr.get('f2p_passed','?')}/{tr.get('f2p_total','?'):>5} {tr.get('p2p_passed','?')}/{tr.get('p2p_total','?'):>5} {total:>6} {r.get('agent_elapsed_seconds','?'):>6}s {format_tokens(u.get('total_tokens')):>8} {r.get('num_turns','?'):>6}")
 
-    elif category in ("c6", "c7", "c8"):
+    elif category in ("c6", "c7", "c8", "c9"):
         print(f"{'Entry':<12} {'Pass':>7} {'Rate':>6} {'Score':>6} {'Time':>7} {'Tokens':>8} {'Turns':>6}")
         print("-" * 58)
         for r in results:
@@ -1558,11 +1559,11 @@ def print_summary(category: str, results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="XHS Agent Evaluation Benchmark Runner")
-    parser.add_argument("--category", required=True, choices=["c1", "c2", "c3", "c4", "c5a", "c5b", "c6", "c7", "c8"])
+    parser.add_argument("--category", required=True, choices=["c1", "c2", "c3", "c4", "c5a", "c5b", "c6", "c7", "c8", "c9"])
     parser.add_argument("--entry", help="Single entry ID (e.g., C3-01)")
     parser.add_argument("--all", action="store_true", help="Run all entries in category")
     parser.add_argument("--agent", default="agy", choices=["agy", "claude", "loop", "gold", "empty"],
-                        help="loop/gold/empty are C6/C7/C8-only (built-in agent / gold solution / no-op)")
+                        help="loop/gold/empty are C6-C9-only (built-in agent / gold solution / no-op)")
     parser.add_argument("--model", default="gemini-3.8-flash-high")
     parser.add_argument("--timeout", type=int, default=30, help="Agent timeout in minutes")
     parser.add_argument("--dry-run", action="store_true")
@@ -1570,16 +1571,16 @@ def main():
     parser.add_argument("--sandbox", default="docker", choices=["docker", "udocker", "bwrap"],
                         help="C6: environment backend (udocker = rootless, exact image; bwrap = host toolchain)")
     parser.add_argument("--quality", default="machine", choices=["off", "machine", "full"],
-                        help="C6/C7/C8: coding-quality grading after each trial (full = with LLM judges)")
+                        help="C6-C9: coding-quality grading after each trial (full = with LLM judges)")
     parser.add_argument("--judge", default="claude:claude-opus-5-5",
-                        help="C6/C7/C8 --quality full: judge model, kind:model")
+                        help="C6-C9 --quality full: judge model, kind:model")
     parser.add_argument("--no-isolate", action="store_true",
-                        help="C6/C7/C8: don't run host CLI agents in bwrap (dataset/results stay visible)")
+                        help="C6-C9: don't run host CLI agents in bwrap (dataset/results stay visible)")
     args = parser.parse_args()
     env_runner.CONFIG.update(trials=args.trials, sandbox=args.sandbox, quality=args.quality,
                              judge=args.judge, isolate_agent=not args.no_isolate)
-    if args.category not in ("c6", "c7", "c8") and args.agent in ("loop", "gold", "empty"):
-        parser.error("--agent loop/gold/empty is only supported for --category c6/c7/c8")
+    if args.category not in ("c6", "c7", "c8", "c9") and args.agent in ("loop", "gold", "empty"):
+        parser.error("--agent loop/gold/empty is only supported for --category c6/c7/c8/c9")
 
     if not args.entry and not args.all:
         parser.error("Specify --entry or --all")
@@ -1598,7 +1599,7 @@ def main():
                 print(build_prompt_c2(entry)[:500])
             elif args.category == "c4":
                 print(build_prompt_c4(entry)[:500])
-            elif args.category in ("c6", "c7", "c8"):
+            elif args.category in ("c6", "c7", "c8", "c9"):
                 print(entry["problem_statement"][:500])
                 print(f"  environment: {json.dumps(entry['environment'])}")
                 print(f"  verification: {json.dumps(entry['verification'], ensure_ascii=False)[:300]}")

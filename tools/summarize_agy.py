@@ -17,7 +17,7 @@ since = sys.argv[1] if len(sys.argv) > 1 else ""
 res = collections.defaultdict(list)
 THRESH = {}
 reasons = collections.defaultdict(list)
-for f in sorted(glob.glob(f"{XHS}/results/c[678]_runs/*_*_*/trial_*/verdict.json")):
+for f in sorted(glob.glob(f"{XHS}/results/c[6789]_runs/*_*_*/trial_*/verdict.json")):
     run = f.split("/")[-3]
     rec_entry, agent, model = run.split("_")[:3]
     if agent not in ("agy", "claude"):  # skip gold/empty validation runs
@@ -27,7 +27,7 @@ for f in sorted(glob.glob(f"{XHS}/results/c[678]_runs/*_*_*/trial_*/verdict.json
     entry = current_id(rec_entry, run)
     v = json.load(open(f))
     if entry not in THRESH:  # continuous-score entries (e.g. C6-07) pass at pass_threshold
-        ef = glob.glob(f"{XHS}/dataset/c[678]/{entry}_*.json")
+        ef = glob.glob(f"{XHS}/dataset/c[6789]/{entry}_*.json")
         THRESH[entry] = float(json.load(open(ef[0]))["verification"].get("pass_threshold", 1.0)) if ef else 1.0
     score = float(v.get("reward", 0) or 0)
     ok = score >= THRESH[entry]

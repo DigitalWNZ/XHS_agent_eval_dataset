@@ -1,4 +1,4 @@
-# C6 / C7 / C8 evaluation
+# C6 / C7 / C8 / C9 evaluation
 
 C6 (7 discriminative cases) and C7 (14 daily-work cases) report two results per trial.
 
@@ -13,6 +13,7 @@ agent never sees them.
 | SWE-bench Verified | C7-03..08, C8-01 | `eval.sh` + FAIL_TO_PASS / PASS_TO_PASS, graded by swebench 4.1.0 |
 | DeepSWE v1.1 | C6-02, C6-07, C7-01, C7-09..11 | `tests/` from datacurve-ai/deep-swe @ 0b9fabb |
 | FrontierSWE v2 | C8-02 | the published verifier image; continuous score, pass at ≥ 0.1 |
+| Customer-provided | C9-01 | hidden Playwright tests written for this dataset (`dataset/c9/envs/C9-01/tests/`) |
 
 A trial passes if the verifier passes. Per case and model the result is the **pass rate** over
 the trials (D1 in `evaluation/rubrics/c6_discriminative.json` / `c7_daily.json`).

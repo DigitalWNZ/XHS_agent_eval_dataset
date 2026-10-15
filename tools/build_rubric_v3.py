@@ -23,8 +23,8 @@ PICK = {  # case -> v1 judge item ids (1-2), chosen for being task-specific and 
 }
 
 framework = {
-    "name": "Coding quality rubric (C6 / C7 / C8)",
-    "name_zh": "编码质量评分标准（C6 / C7 / C8）",
+    "name": "Coding quality rubric (C6 / C7 / C8 / C9)",
+    "name_zh": "编码质量评分标准（C6 / C7 / C8 / C9）",
     "version": "3.0",
     "applies_to": ["C6", "C7"],
     "summary": ("Pass/fail stays exactly as before (D1: the source benchmark's hidden tests). On top, an LLM judge "

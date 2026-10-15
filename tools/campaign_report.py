@@ -47,7 +47,7 @@ def run_metrics():
     global _METRICS
     if _METRICS is None:
         _METRICS = {}
-        for f in glob.glob(f"{XHS}/results/c[678]_*_*_*.json"):
+        for f in glob.glob(f"{XHS}/results/c[6789]_*_*_*.json"):
             try:
                 d = json.load(open(f))
             except (OSError, ValueError):
@@ -84,7 +84,7 @@ def trajectory_stats(path):
 def load(category, since, until="99999999_999999"):
     """Trials of the current category `category` (runs of any results/c*_runs dir, IDs mapped to current)."""
     rows = []
-    for d in sorted(glob.glob(f"{XHS}/results/c[678]_runs/*")):
+    for d in sorted(glob.glob(f"{XHS}/results/c[6789]_runs/*")):
         m = re.search(r"_(\d{8}_\d{6})$", d)
         if not m or not (since <= m.group(1) < until) or not re.search(r"_(agy|claude)_", os.path.basename(d)):
             continue
@@ -118,7 +118,7 @@ def load(category, since, until="99999999_999999"):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--category", required=True, choices=["c6", "c7", "c8"])
+    ap.add_argument("--category", required=True, choices=["c6", "c7", "c8", "c9"])
     ap.add_argument("--since", required=True, help="campaign start, YYYYMMDD_HHMM[SS]")
     ap.add_argument("--until", default="99999999_999999", help="exclusive end, YYYYMMDD_HHMM[SS] (default: no end)")
     ap.add_argument("--out", required=True)

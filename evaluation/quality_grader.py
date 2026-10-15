@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coding-quality grader for C6 / C7 / C8 trials (rubric v3: evaluation/rubrics/coding_quality.json).
+"""Coding-quality grader for C6 / C7 / C8 / C9 trials (rubric v3: evaluation/rubrics/coding_quality.json).
 
 Simple model:
   * pass/fail (D1) is the source benchmark's hidden-test verdict, exactly as before;
@@ -57,7 +57,7 @@ def entries() -> dict[str, dict]:
     with _ENTRIES_LOCK:  # graded from several threads; fill once, atomically
         if not _ENTRIES:
             loaded = {}
-            for f in glob.glob(str(BASE_DIR / "dataset/c[678]/C*.json")):
+            for f in glob.glob(str(BASE_DIR / "dataset/c[6789]/C*.json")):
                 e = with_task_rubric(json.loads(Path(f).read_text()))
                 loaded[e["instance_id"]] = e
             _ENTRIES.update(loaded)

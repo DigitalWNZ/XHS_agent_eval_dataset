@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full C6 (discriminative, 7) + C7 (daily work, 11) + C8 (hard, 3) run on the current IDs (2026-10-15 layout),
+# Full C6 (discriminative, 7) + C7 (daily work, 11) + C8 (hard, 3) + C9 (customer-provided, 1) run on the current IDs (2026-10-15 layout),
 # 3 trials per entry and model, with the LLM-judge quality grading inline (QUALITY=full).
 #   AGENT=agy    MODELS="gemini-3.6-flash-high gemini-3.8-flash-high"   (default)
 #   AGENT=claude MODELS=claude-opus-5-5  (also export CLAUDE_CODE_USE_VERTEX=1 CLOUD_ML_REGION=global
@@ -19,6 +19,7 @@ bash scripts/run_queue.sh 2 30  keep c7:C7-03 c7:C7-04 c7:C7-05 c7:C7-06 c7:C7-0
 bash scripts/run_queue.sh 1 180 keep c6:C6-02 c6:C6-07 c7:C7-01 c7:C7-09 c7:C7-10 c7:C7-11 \
   > "runs/${AGENT}_queue_deepswe.log" 2>&1 &
 bash scripts/run_queue.sh 1 120 keep c8:C8-02 > "runs/${AGENT}_queue_frontierswe.log" 2>&1 &
+bash scripts/run_queue.sh 1 60  keep c9:C9-01 > "runs/${AGENT}_queue_customer.log" 2>&1 &
 wait
 python3 scripts/summarize_agy.py "$S" > "runs/${AGENT}_summary.md" 2>&1
 echo "$(date +%T) ALL QUEUES DONE; summary in runs/${AGENT}_summary.md"
