@@ -80,4 +80,4 @@ Human corrections go in `results/quality_overrides.json`:
 | `evaluation/rubrics/coding_quality.json` | Levels, the 3 common items, judge settings, aggregation |
 | `evaluation/rubrics/tasks/<ID>.json` | The case's 1–2 items + project context for the judge |
 | `evaluation/quality_grader.py` | Judge call, quality score, validity audit → `<trial>/quality.json` |
-| `tools/build_rubric_v3.py` | How the case items were derived (from the earlier per-case drafts) |
+| `archive/migrations/build_rubric_v3.py` | How the case items were derived (from the earlier per-case drafts) |

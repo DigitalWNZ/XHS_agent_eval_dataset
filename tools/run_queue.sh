@@ -1,10 +1,10 @@
 #!/bin/bash
 # Run an agent (AGENT=agy|claude, MODELS=...) on a queue of entries, both models per entry (3 trials each), at most K entries at
 # a time; after both models finish an entry, optionally remove its udocker base (disk).
-# Usage: run_agy_queue.sh <K> <timeout_min> <rm|keep> <cat:ENTRY> [<cat:ENTRY> ...]
+# Usage: run_queue.sh <K> <timeout_min> <rm|keep> <cat:ENTRY> [<cat:ENTRY> ...]
 K=$1; TMO=$2; RM=$3; shift 3
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-XHS=$ROOT/sources/xhs; LOG=${LOG_DIR:-$ROOT/runs/agy}; mkdir -p "$LOG"   # LOG_DIR: per-campaign logs
+XHS="$(cd "$(dirname "$0")/.." && pwd)"   # this repo (tools/ lives at its top level)
+RUNS=${RUNS_DIR:-$XHS/runs}; LOG=${LOG_DIR:-$RUNS/agy}; mkdir -p "$LOG"   # RUNS_DIR / LOG_DIR: where queue logs go
 export GOOGLE_APPLICATION_CREDENTIALS=$HOME/.cache/xhs_c6/agy-adc/adc.json
 AGENT=${AGENT:-agy}
 MODELS=${MODELS:-"gemini-3.6-flash-high gemini-3.8-flash-high"}

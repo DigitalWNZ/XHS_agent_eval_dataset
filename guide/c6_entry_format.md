@@ -21,8 +21,8 @@ All categories mix source types. An entry's fields depend on its source type, no
 | DeepSWE v1.1 | `deepswe` | C6-02, C6-07 | C7-01, C7-09..11 | — | Part 3 |
 
 **Restructures, `former_id` and `id_history`.** Before 2026-10-14 the entries were split by source
-(C6 = Terminal-Bench / FrontierSWE, C7 = SWE-bench, C8 = DeepSWE). `tools/restructure_c6_c7.py` regrouped
-them into C6 (7) / C7 (14) on 2026-10-14, and `tools/restructure_v2.py` regrouped those into C6 (7) /
+(C6 = Terminal-Bench / FrontierSWE, C7 = SWE-bench, C8 = DeepSWE). `archive/migrations/restructure_c6_c7.py` regrouped
+them into C6 (7) / C7 (14) on 2026-10-14, and `archive/migrations/restructure_v2.py` regrouped those into C6 (7) /
 C7 (11) / C8 (3) on 2026-10-15. Each entry keeps the previous ID in `former_id` and every ID it had in
 `id_history`. Raw run folders (`results/c{6,7,8}_runs/<recorded id>_...`) keep the ID used when they ran;
 `results/id_mapping.json` has one epoch per restructure, and the report scripts and the quality grader map
@@ -185,7 +185,7 @@ Supporting files live in `dataset/<c6|c7|c8>/envs/<ID>/`:
 | `gold.patch` | The upstream fix from SWE-bench, kept for reference. |
 | `gold.sh` | Applies `gold.patch` in `/testbed`. Used only for validation (`--agent gold`). |
 
-The build script is `tools/build/build_xhs_c7_entries.py` (it writes the pre-restructure IDs; run `tools/restructure_c6_c7.py` afterwards). It must run with
+The build script is `archive/dataset_build/build_xhs_c7_entries.py` (it writes the pre-restructure IDs; run `archive/migrations/restructure_c6_c7.py` afterwards). It must run with
 the grader venv (`~/.cache/xhs_c6/swebench-venv`, swebench==4.1.0).
 
 ## Top-level fields
@@ -300,8 +300,8 @@ Fields that differ from Parts 1–2:
 | `source` | Benchmark repo/commit/path, `task_id`, `ext_id`, upstream repo and `base_commit`, language, category, `original_scoring`, `conversion_changes`. |
 | `discrimination` | `selected_for`, the externally reported observation that motivated the pick, and `observed_xhs_runs`. |
 
-The build script is `tools/build/build_xhs_c8_deepswe_entries.py` (it writes the original C8
-IDs; run `tools/restructure_c6_c7.py`, then `tools/restructure_v2.py` afterwards).
+The build script is `archive/dataset_build/build_xhs_c8_deepswe_entries.py` (it writes the original C8
+IDs; run `archive/migrations/restructure_c6_c7.py`, then `archive/migrations/restructure_v2.py` afterwards).
 
 # Part 4: Customer-provided entries (C9)
 

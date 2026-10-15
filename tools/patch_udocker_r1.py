@@ -11,7 +11,7 @@ Why R1 at all: under the default proot (P1/P2) modes the Go toolchain segfaults 
 (~70% of `go version` runs), which broke DeepSWE Go test suites. R1 uses unprivileged user
 namespaces + runc: no ptrace, faster, closer to Docker.
 
-Usage: python3 scripts/patch_udocker_r1.py   (then: udocker setup --execmode=R1 <container>)
+Usage: python3 tools/patch_udocker_r1.py   (then: udocker setup --execmode=R1 <container>)
 """
 import pathlib
 import subprocess

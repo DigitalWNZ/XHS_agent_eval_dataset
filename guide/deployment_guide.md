@@ -471,8 +471,8 @@ The LLM judge sometimes returns malformed JSON. The harness has regex fallback p
 | File | Purpose |
 |------|---------|
 | `evaluation/run_benchmark.py` | Main benchmark runner — handles all 6 categories |
-| `evaluation/harness.py` | Standalone evaluator for pre-captured agent output |
-| `evaluation/run_c3.py` | Legacy C3-only runner (superseded by run_benchmark.py) |
+| `archive/deprecated/harness_deprecated.py` | (Archived) standalone evaluator for pre-captured agent output |
+| `archive/deprecated/run_c3_deprecated.py` | (Archived) legacy C3-only runner (superseded by run_benchmark.py) |
 | `evaluation/rubrics/c1_requirements.json` | C1 scoring rubric with judge prompt template |
 | `evaluation/rubrics/c2_design.json` | C2 scoring rubric |
 | `evaluation/rubrics/c3_codegen.json` | C3 scoring rubric (7 dimensions) |

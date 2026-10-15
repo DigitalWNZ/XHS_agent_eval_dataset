@@ -1,28 +1,50 @@
 # tools/
 
-Helper scripts for the containerized categories (C6 discriminative / C7 daily work). They were developed in the
-analysis workspace and copied here so the harness setup is reproducible from this repo.
+Everything needed to **run** the containerized benchmark (C6 hill climb / C7 daily job / C8 hard / C9 customer-provided),
+grade it and report it. Together with `evaluation/` this is the single home of the run code; the analysis workspace no
+longer keeps copies. One-off migrations, historical orchestrators and dataset builders are in [`../archive/`](../archive/README.md).
+
+## Run
 
 | Script | Purpose |
 |---|---|
-| `patch_udocker_r1.py` | **Required for `--sandbox udocker`.** Patches udocker's R1 (rootless runc) engine: private spec dir per run (concurrent runs of one container) and stdio pass-through (multi-byte output crashed the pty relay). The harness uses R1 only when this patch is applied; otherwise it falls back to proot, where the Go toolchain segfaults intermittently. Re-run after reinstalling udocker. |
-| `fetch_oci_digest.py` | Fetch a digest-pinned public image (`repo@sha256:...`, which udocker can't pull) into a docker-save tarball for `udocker load` (used for C8-02's FrontierSWE images; former C6-08). |
-| `run_agy_queue.sh` | Run Antigravity on a queue of entries: both models per entry, K entries at a time, optional base removal afterwards (disk). Paths assume the analysis-workspace layout (`<root>/sources/xhs`); adjust `ROOT`/`XHS` if run from elsewhere. |
-| `revalidate_r1.sh`, `prepare_c7_bases.sh` | Validation chains (gold must pass, empty must fail) and C7 base pre-creation with a disk guard. Same path assumption. |
-| `run_all.sh` | Full C6 + C7 + C8 + C9 run on the current IDs (`AGENT=agy\|claude`, `MODELS=...`; quality grading inline). |
-| `run_queue.sh`, `run_all_agy.sh`, `run_all_claude.sh` | Agent-agnostic queue (`AGENT=agy|claude`, `MODELS=...`) and the historical orchestrators (pre-restructure IDs) used for the Gemini and Claude Code + Opus 5.5 runs (Claude via Vertex: `CLAUDE_CODE_USE_VERTEX=1 CLOUD_ML_REGION=global ANTHROPIC_VERTEX_PROJECT_ID=...`). |
-| `restructure_c6_c7.py` | One-off migration (2026-10-14) from the source-based C6/C7/C8 layout to C6 = discriminative (7) / C7 = daily work (14). Renumbers entries (keeping `former_id`), moves `envs/`, rewrites paths, updates the manifest and writes `results/id_mapping.json`. |
-| `restructure_v2.py` | One-off migration (2026-10-15) from that layout to C6 = discriminative (7) / C7 = daily work (11) / C8 = hard (3), based on the 2026-10-14 campaign. Renumbers entries (`former_id` = previous ID, `id_history` = all IDs), moves `envs/` and task rubrics, adds a second epoch to `results/id_mapping.json`, and records the campaign numbers in each entry's `discrimination.campaign_2026_10_14`. |
-| `campaign_report.py` | Per-campaign D1/D2 report under the current IDs/categories: `--category c6\|c7\|c8\|c9 --since <YYYYMMDD_HHMM>` (only run folders from that time on). |
-| `quality_report.py` | `results` → `results/README_quality.md` (pass rate + code quality per case/model, item scores, invalid trials, 5% spot-check sample); `rubric` → `guide/coding_rubric_items.md`. Reads the `quality.json` files written by `evaluation/quality_grader.py`. |
-| `build_rubric_v3.py` | One-off (2026-10-14): wrote `evaluation/rubrics/coding_quality.json` (3 common items) and the case items in `evaluation/rubrics/tasks/<ID>.json`, picking 1–2 judge items per case from earlier per-case rubric drafts (the drafts are not in the repo; the script is kept for provenance). |
-| `summarize_agy.py`, `detailed_report.py`, `idmap.py` | Results matrix and the per-case report (`results/README_c6_c7.md`). `idmap.py` maps the former IDs of runs recorded before the restructure to the current IDs. |
-| `build/` | Entry builders (provenance). They write the **pre-restructure** layout and IDs (C6 = Terminal-Bench 2.0 + FrontierSWE v2, C7 = SWE-bench Verified (needs swebench==4.1.0), C8 = DeepSWE v1.1); run `restructure_c6_c7.py` afterwards to get the current layout. They read source checkouts from the analysis workspace (`sources/tb2`, `sources/deepswe`, `deliverables/cases/...`). |
+| `run_all.sh` | Full C6 + C7 + C8 + C9 campaign on the current IDs, 3 trials per entry and model, LLM judge inline (`QUALITY=full`). `AGENT=agy\|claude`, `MODELS=...`; Claude via Vertex needs `CLAUDE_CODE_USE_VERTEX=1 CLOUD_ML_REGION=global ANTHROPIC_VERTEX_PROJECT_ID=...`. Runs from anywhere. |
+| `run_queue.sh` | `run_queue.sh <K> <timeout_min> <rm\|keep> <cat:ENTRY>...` — run one agent on a queue of entries (all `MODELS` per entry, K entries in parallel, optional udocker base removal). Calls `evaluation/run_benchmark.py`. Env: `AGENT`, `MODELS`, `TRIALS` (3), `QUALITY` (`off\|machine\|full`), `RUNS_DIR` (default `<repo>/runs`, git-ignored), `LOG_DIR`. |
 
-Setup on a fresh machine (udocker backend):
+## Environment setup and validation
+
+| Script | Purpose |
+|---|---|
+| `patch_udocker_r1.py` | **Required for `--sandbox udocker`.** Patches udocker's R1 (rootless runc) engine: private spec dir per run (concurrent runs of one container) and stdio pass-through. Without it the harness falls back to proot, where the Go toolchain segfaults intermittently. Re-run after reinstalling udocker. |
+| `fetch_oci_digest.py` | Fetch a digest-pinned public image (`repo@sha256:...`, which udocker can't pull) into a docker-save tarball for `udocker load` (C8-02's FrontierSWE images). |
+| `prepare_c7_bases.sh` | Pre-create the udocker base containers for the SWE-bench images, one at a time, with a disk guard. |
+| `revalidate_r1.sh` | Validation chain: `revalidate_r1.sh "cat:ENTRY:gold,empty[:rm]" ...` — gold must pass, empty must fail. Logs to `$RUNS_DIR/validate_r1`. |
+
+## Reports
+
+| Script | Purpose |
+|---|---|
+| `campaign_report.py` | Per-campaign D1/D2 report under the current IDs: `--category c6\|c7\|c8\|c9 --since <YYYYMMDD_HHMM> [--until ...] --out results/<name>.md`. Includes item levels, time, tool calls, tokens, per-case run metrics. |
+| `quality_report.py` | `results` → `results/README_quality.md`; `rubric` → `guide/coding_rubric_items.md`. Reads the `quality.json` files written by `evaluation/quality_grader.py`. |
+| `summarize_agy.py`, `detailed_report.py` | Results matrix (used by `run_all.sh`) and the per-case report (`results/README_c6_c7.md`). |
+| `idmap.py` | Shared helper: locates the repo and maps IDs recorded by older runs to the current IDs (`results/id_mapping.json`). |
+| `sheets/` | Fill the Google Sheet "XHS Evalution DataSet": `fill_sheet.py` (`Coding_Detail`), `fill_summary_sheet.py` (`Coding_Summary_Internal`, with a group-average row per category); Chinese texts in `sheet_texts.py`. Needs a Sheets-scoped ADC in `~/.cache/sheets-gcloud` (`CLOUDSDK_CONFIG=~/.cache/sheets-gcloud gcloud auth application-default login --scopes=...spreadsheets,...cloud-platform`). |
+
+## Setup on a fresh machine (udocker backend)
 
 ```bash
 uv tool install udocker
 python3 tools/patch_udocker_r1.py
 uv venv ~/.cache/xhs_c6/swebench-venv && VIRTUAL_ENV=~/.cache/xhs_c6/swebench-venv uv pip install swebench==4.1.0   # C7 grading
+```
+
+## Typical use
+
+```bash
+# full campaign, Gemini via Antigravity CLI (detached)
+AGENT=agy MODELS="gemini-3.8-flash-high gemini-4-argon-high" setsid nohup bash tools/run_all.sh > /tmp/run_all.log 2>&1 < /dev/null &
+# one case, Claude Code + Opus, 3 trials
+AGENT=claude MODELS=claude-opus-5-5 QUALITY=full bash tools/run_queue.sh 1 60 keep c9:C9-01
+# report
+python3 tools/campaign_report.py --category c9 --since 20261015_0946 --out results/campaign_c9_20261015.md
 ```
