@@ -30,12 +30,37 @@ longer keeps copies. One-off migrations, historical orchestrators and dataset bu
 | `idmap.py` | Shared helper: locates the repo and maps IDs recorded by older runs to the current IDs (`results/id_mapping.json`). |
 | `sheets/` | Fill the Google Sheet "XHS Evalution DataSet": `fill_sheet.py` (`Coding_Detail`), `fill_summary_sheet.py` (`Coding_Summary_Internal`, with a group-average row per category); Chinese texts in `sheet_texts.py`. Needs a Sheets-scoped ADC in `~/.cache/sheets-gcloud` (`CLOUDSDK_CONFIG=~/.cache/sheets-gcloud gcloud auth application-default login --scopes=...spreadsheets,...cloud-platform`). |
 
-## Setup on a fresh machine (udocker backend)
+## Setup on a fresh machine
+
+This repo is self-contained: a clone of it alone runs the benchmark (verified 2026-10-15 from a standalone clone: gold
+for C6-05 / C7-02 / C7-04 / C9-01 and a Claude Code + Opus run with the LLM judge). What the machine must provide:
+
+| # | Prerequisite | How | Needed for |
+|---|---|---|---|
+| 1 | `git`, `bwrap` (bubblewrap), Python 3.10+ | OS packages (`apt install git bubblewrap python3`) | Everything (`bwrap` hides the repo from the agent; without it trials run unisolated) |
+| 2 | `uv` / `uvx` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` (the harness also installs a copy under `~/.cache/xhs_c6/opt` if missing) | Graders (Terminal-Bench / C9 tests run via `uvx`) |
+| 3 | `udocker` + R1 patch | `uv tool install udocker && python3 tools/patch_udocker_r1.py` (re-run the patch after reinstalling udocker) | All containerized cases (`--sandbox udocker`) |
+| 4 | Agent CLIs | Antigravity CLI `agy` (Gemini models); Claude Code: `npm install -g @anthropic-ai/claude-code` | The agents under test |
+| 5 | Agent / judge credentials | **agy:** an `authorized_user` ADC file at `~/.cache/xhs_c6/agy-adc/adc.json` (e.g. `gcloud auth application-default login`, then copy `~/.config/gcloud/application_default_credentials.json` there). **Claude Code + LLM judge (Claude Opus):** Vertex AI — `export CLAUDE_CODE_USE_VERTEX=1 CLOUD_ML_REGION=global ANTHROPIC_VERTEX_PROJECT_ID=<project>` with the default ADC allowed to call Claude on Vertex in that project | Agent runs, `QUALITY=full` |
+| 6 | SWE-bench grader venv | `uv venv ~/.cache/xhs_c6/swebench-venv && VIRTUAL_ENV=~/.cache/xhs_c6/swebench-venv uv pip install swebench==4.1.0` | C7-03..C7-08, C8-01 |
+| 7 | C8-02 images (digest-pinned; udocker can't pull them) | see below | C8-02 only |
+| 8 | Disk / `/tmp` | ~60 GB free under `$HOME` (`~/.udocker` images + base containers; `tools/prepare_c7_bases.sh` pre-creates the SWE-bench bases with a disk guard); `/tmp` ≥ 16 GB (trial workspaces live there; DeepSWE repos are up to ~2.8 GB each) | Parallel runs |
+
+All other images are pulled from public registries on first use. `XHS_C6_CACHE` overrides `~/.cache/xhs_c6`.
+
+C8-02 images (once):
 
 ```bash
-uv tool install udocker
-python3 tools/patch_udocker_r1.py
-uv venv ~/.cache/xhs_c6/swebench-venv && VIRTUAL_ENV=~/.cache/xhs_c6/swebench-venv uv pip install swebench==4.1.0   # C7 grading
+python3 tools/fetch_oci_digest.py us-west1-docker.pkg.dev/proximal-core-0/proximal-evals-public/ffmpeg-libswscale-optimization@sha256:29c425c53c9079c9adce1a9d63bf9d4f2b81a5316cf5e9e995280b14c8595f48 xhs/ffmpeg-swscale-env:fswe-da83f84 /tmp/env.tar
+python3 tools/fetch_oci_digest.py us-west1-docker.pkg.dev/proximal-core-0/proximal-evals-public/ffmpeg-libswscale-optimization@sha256:494a93a2ae0a5e7b7e00741b23ad48550cbdb718966362eeaee753783c5f77c6 xhs/ffmpeg-swscale-verifier:fswe-da83f84 /tmp/verifier.tar
+udocker load -i /tmp/env.tar xhs/ffmpeg-swscale-env && udocker load -i /tmp/verifier.tar xhs/ffmpeg-swscale-verifier && rm /tmp/env.tar /tmp/verifier.tar
+```
+
+Smoke test (no agent, ~1 min): the reference solution must pass and an empty workspace must fail.
+
+```bash
+AGENT=gold  MODELS=gemini-3.8-flash-high TRIALS=1 QUALITY=off bash tools/run_queue.sh 2 30 keep c9:C9-01 c6:C6-05   # expect 1
+AGENT=empty MODELS=gemini-3.8-flash-high TRIALS=1 QUALITY=off bash tools/run_queue.sh 1 30 keep c9:C9-01           # expect 0
 ```
 
 ## Typical use
