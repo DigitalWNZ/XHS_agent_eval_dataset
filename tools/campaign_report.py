@@ -188,6 +188,24 @@ def main():
         o.append(f"| {m} | {f0(mean([t['elapsed'] / 60 if t['elapsed'] else None for t in ts]))} | "
                  f"{f0(mean([t['tool_calls'] for t in ts]))} | {f0(mean([t['tokens'] / 1000 if t['tokens'] else None for t in ts]))} | "
                  f"{f0(turns)} | {f'{cost:.2f}' if cost else '—'} |")
+    o.append("\n## Run metrics per case (mean per trial: agent time min · tool calls · tokens K)\n")
+    o.append("Same definitions as above, averaged over the trials of one case and model (— = no data, e.g. agy "
+             "timeouts before the partial-trajectory fix).\n")
+    o.append("| Case | Task | " + " | ".join(models) + " |")
+    o.append("|---|---|" + "---|" * len(models))
+    for eid in sorted(ents):
+        row = []
+        for m in models:
+            ts = cell.get((eid, m), [])
+            if not ts:
+                row.append("—")
+                continue
+            tm = mean([t["elapsed"] / 60 if t["elapsed"] else None for t in ts])
+            tc = mean([t["tool_calls"] for t in ts])
+            tk = mean([t["tokens"] / 1000 if t["tokens"] else None for t in ts])
+            row.append(f"{(f'{tm:.1f}' if tm is not None and tm < 10 else f0(tm))} · {f0(tc)} · {f0(tk)}")
+        task = ents[eid].get("maps_to_journey", "").replace("External: ", "")
+        o.append(f"| {eid} | {task[:45]} | " + " | ".join(row) + " |")
     o.append("\n## D2 item scores per model (mean over judged items, 0–100)\n")
     o.append("| Model | Readability | Maintainability | Robustness | Case-specific | Quality |")
     o.append("|---|---|---|---|---|---|")
