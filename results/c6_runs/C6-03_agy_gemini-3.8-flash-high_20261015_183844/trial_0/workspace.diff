@@ -1,0 +1,247 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,235 @@
++#!/usr/bin/env python3
++"""
++Jump Analyzer for Hurdle Jumpers.
++
++Analyzes MP4 videos of hurdle jumpers filmed with a stationary camera and
++extracts performance metrics:
++- jump_takeoff_frame_number: Frame number where the athlete's takeoff/jump begins
++- jump_land_frame_number: Frame number where the athlete lands
++
++Outputs the result in TOML format to /app/output.toml.
++"""
++
++import argparse
++import os
++import sys
++import cv2
++import numpy as np
++
++try:
++    import toml
++except ImportError:
++    toml = None
++
++
++def detect_jump(video_path: str) -> tuple[int, int]:
++    """
++    Detect the takeoff frame and landing frame of a hurdle jump from video.
++
++    Parameters
++    ----------
++    video_path : str
++        Path to input MP4 video file.
++
++    Returns
++    -------
++    tuple[int, int]
++        (jump_takeoff_frame_number, jump_land_frame_number)
++    """
++    if not os.path.isfile(video_path):
++        raise FileNotFoundError(f"Video file not found: {video_path}")
++
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Could not open video file: {video_path}")
++
++    # The first frame has no runner on the track and serves as the background reference.
++    ret, bg_frame = cap.read()
++    if not ret or bg_frame is None:
++        cap.release()
++        raise ValueError("Could not read background reference frame from video.")
++
++    h, w = bg_frame.shape[:2]
++
++    # Track region where athlete feet and legs operate
++    track_y_start = 220
++    track_y_end = 385
++    bg_track = bg_frame[track_y_start:track_y_end, :].astype(np.float32)
++
++    records = []
++    frame_idx = 0
++
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frame_idx += 1
++
++        track_crop = frame[track_y_start:track_y_end, :].astype(np.float32)
++        diff = np.abs(track_crop - bg_track).mean(axis=2)
++
++        # Threshold foreground motion on the track
++        th = (diff > 25).astype(np.uint8)
++        th = cv2.morphologyEx(
++            th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
++        )
++
++        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(th)
++        cand_indices = [i for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] > 100]
++
++        if cand_indices:
++            cand_mask = np.isin(labels, cand_indices)
++            ys, xs = np.where(cand_mask)
++            if len(ys) > 200:
++                cx = float(np.mean(xs))
++                # 99th percentile of y in image coordinates represents foot elevation
++                foot_y = float(np.percentile(ys, 99)) + track_y_start
++                records.append({
++                    "frame": frame_idx,
++                    "cx": cx,
++                    "foot_y": foot_y,
++                    "area": len(ys)
++                })
++
++    cap.release()
++
++    if not records:
++        raise RuntimeError("No athlete motion detected on track.")
++
++    # Hurdle location is fixed around x ~ 490
++    hurdle_x = 490.0
++
++    # Determine ground baseline from running strides (outside the jump region)
++    running_feet = [
++        r["foot_y"] for r in records
++        if abs(r["cx"] - hurdle_x) > 200 and r["foot_y"] < 375
++    ]
++    if running_feet:
++        ground_y = float(np.percentile(running_feet, 95))
++    else:
++        ground_y = 362.0
++
++    # Determine airborne status for each frame
++    # When airborne clearing the hurdle, feet rise significantly above ground
++    clearance_threshold = 15.0
++    airborne_frames = set()
++
++    for r in records:
++        clearance = ground_y - r["foot_y"]
++        if clearance > clearance_threshold:
++            airborne_frames.add(r["frame"])
++
++    # If the athlete is jumping so high that feet rise above track_y_start (220),
++    # interpolate airborne frames between takeoff approach and landing descent across the hurdle
++    rec_frames = {r["frame"]: r for r in records}
++    frame_numbers = sorted(rec_frames.keys())
++
++    # Find the jump window crossing hurdle_x
++    for i in range(len(frame_numbers) - 1):
++        f1 = frame_numbers[i]
++        f2 = frame_numbers[i + 1]
++        if f2 - f1 > 1 and f2 - f1 <= 5:
++            # Check if this gap occurs while crossing the hurdle
++            cx1 = rec_frames[f1]["cx"]
++            cx2 = rec_frames[f2]["cx"]
++            if (cx1 - hurdle_x) * (cx2 - hurdle_x) <= 0 or (abs(cx1 - hurdle_x) < 200 and abs(cx2 - hurdle_x) < 200):
++                for mid_f in range(f1 + 1, f2):
++                    airborne_frames.add(mid_f)
++
++    if not airborne_frames:
++        raise RuntimeError("Could not detect hurdle jump flight phase.")
++
++    # Group contiguous airborne frames into clusters
++    sorted_frames = sorted(list(airborne_frames))
++    clusters = []
++    current_cluster = [sorted_frames[0]]
++    for f in sorted_frames[1:]:
++        if f == current_cluster[-1] + 1:
++            current_cluster.append(f)
++        else:
++            clusters.append(current_cluster)
++            current_cluster = [f]
++    clusters.append(current_cluster)
++
++    # Hurdle jump is the longest cluster or the one crossing the hurdle
++    hurdle_jump_cluster = None
++    for cluster in sorted(clusters, key=len, reverse=True):
++        # Verify cluster crosses or is closest to the hurdle
++        cluster_cxs = [
++            rec_frames[f]["cx"] for f in cluster if f in rec_frames
++        ]
++        if cluster_cxs:
++            min_c = min(cluster_cxs)
++            max_c = max(cluster_cxs)
++            if min_c <= hurdle_x + 100 and max_c >= hurdle_x - 100:
++                hurdle_jump_cluster = cluster
++                break
++
++    if hurdle_jump_cluster is None:
++        hurdle_jump_cluster = max(clusters, key=len)
++
++    takeoff_frame = int(hurdle_jump_cluster[0])
++    land_frame = int(hurdle_jump_cluster[-1] + 1)
++
++    return takeoff_frame, land_frame
++
++
++def write_toml(data: dict, output_path: str) -> None:
++    """Write metrics dictionary to TOML file."""
++    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++    if toml is not None:
++        with open(output_path, "w", encoding="utf-8") as f:
++            toml.dump(data, f)
++    else:
++        with open(output_path, "w", encoding="utf-8") as f:
++            f.write(f"jump_takeoff_frame_number = {int(data['jump_takeoff_frame_number'])}\n")
++            f.write(f"jump_land_frame_number = {int(data['jump_land_frame_number'])}\n")
++
++
++def analyze_video(video_path: str, output_path: str = "/app/output.toml") -> dict[str, int]:
++    """Analyze video, detect jump takeoff and landing frames, and write TOML."""
++    takeoff, land = detect_jump(video_path)
++    result = {
++        "jump_takeoff_frame_number": int(takeoff),
++        "jump_land_frame_number": int(land),
++    }
++    write_toml(result, output_path)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Analyze hurdle jump video and output metrics in TOML.")
++    parser.add_argument(
++        "video",
++        nargs="?",
++        default="/app/example_video.mp4",
++        help="Path to input MP4 video file (default: /app/example_video.mp4)",
++    )
++    parser.add_argument(
++        "-i",
++        "--input",
++        dest="input_video",
++        default=None,
++        help="Alternative argument for input MP4 video file",
++    )
++    parser.add_argument(
++        "-o",
++        "--output",
++        dest="output_file",
++        default="/app/output.toml",
++        help="Path to output TOML file (default: /app/output.toml)",
++    )
++
++    args = parser.parse_args()
++    video_path = args.input_video if args.input_video else args.video
++    output_path = args.output_file
++
++    results = analyze_video(video_path, output_path)
++    print(f"Analysis complete for: {video_path}")
++    print(f"jump_takeoff_frame_number = {results['jump_takeoff_frame_number']}")
++    print(f"jump_land_frame_number = {results['jump_land_frame_number']}")
++    print(f"Saved to: {output_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 54
++jump_land_frame_number = 62

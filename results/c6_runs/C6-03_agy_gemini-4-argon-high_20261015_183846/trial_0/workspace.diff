@@ -1,0 +1,218 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,206 @@
++#!/usr/bin/env python3
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_jump(video_path="/app/example_video.mp4", output_path="/app/output.toml"):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise RuntimeError(f"Could not open video file: {video_path}")
++
++    ret, first_frame = cap.read()
++    if not ret or first_frame is None:
++        cap.release()
++        raise RuntimeError(f"Could not read first frame from: {video_path}")
++
++    h, w = first_frame.shape[:2]
++
++    # Build a 7x7 spatial envelope of the background frame to be invariant to
++    # small camera vibrations / wind shake (up to +-3 pixels).
++    env_kernel = np.ones((7, 7), dtype=np.uint8)
++    bg_min = cv2.erode(first_frame, env_kernel).astype(np.int16)
++    bg_max = cv2.dilate(first_frame, env_kernel).astype(np.int16)
++    open_kernel = np.ones((3, 3), dtype=np.uint8)
++
++    # Vertical region of interest covering the athlete and the track surface
++    y_top = int(round(60 * h / 540.0))
++    y_bot = int(round(395 * h / 540.0))
++    win_w = max(50, int(round(250 * w / 960.0)))
++    half_crop_w = max(30, int(round(150 * w / 960.0)))
++    min_comp_area = max(10, int(round(25 * (w * h) / (960.0 * 540.0))))
++    min_frame_area = max(80, int(round(250 * (w * h) / (960.0 * 540.0))))
++
++    frame_metrics = {}
++    frame_idx = 0
++
++    while True:
++        ret, frame = cap.read()
++        if not ret or frame is None:
++            break
++        frame_idx += 1
++
++        f_int = frame.astype(np.int16)
++        diff = np.maximum(0, np.maximum(bg_min - f_int, f_int - bg_max))
++        dist = np.linalg.norm(diff, axis=2)
++
++        mask = np.zeros((h, w), dtype=np.uint8)
++        mask[y_top:y_bot, :] = (dist[y_top:y_bot, :] > 28.0).astype(np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
++
++        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
++        clean_mask = np.zeros_like(mask)
++        for lbl in range(1, num_labels):
++            if stats[lbl, cv2.CC_STAT_AREA] >= min_comp_area:
++                clean_mask[labels == lbl] = 1
++
++        col_sums = clean_mask.sum(axis=0)
++        win_sums = np.convolve(col_sums, np.ones(win_w, dtype=int), mode="same")
++        best_x = int(np.argmax(win_sums))
++        best_area = int(win_sums[best_x])
++
++        if best_area >= min_frame_area:
++            x0 = max(0, best_x - half_crop_w)
++            x1 = min(w, best_x + half_crop_w)
++            ys, xs = np.where(clean_mask[:, x0:x1] > 0)
++            if len(ys) > 0:
++                xs = xs + x0
++                frame_metrics[frame_idx] = {
++                    "area": best_area,
++                    "x_mean": float(xs.mean()),
++                    "y_max": int(ys.max()),
++                    "y_p99": float(np.percentile(ys, 99)),
++                    "y_mean": float(ys.mean()),
++                }
++
++    cap.release()
++
++    if not frame_metrics:
++        raise RuntimeError("No athlete motion detected in video.")
++
++    active_frames = sorted(frame_metrics.keys())
++
++    # Hurdle is located near the horizontal center of the frame (x ~ 512 / 960).
++    # Find the jump apex where the athlete's lowest foot point (y_max) is highest (minimum y).
++    center_min_x = 0.25 * w
++    center_max_x = 0.78 * w
++    center_candidates = [
++        f for f in active_frames if center_min_x <= frame_metrics[f]["x_mean"] <= center_max_x
++    ]
++    if not center_candidates:
++        center_candidates = active_frames
++
++    f_apex = min(center_candidates, key=lambda f: (frame_metrics[f]["y_max"], frame_metrics[f]["y_mean"]))
++
++    # Ground contact threshold and vertical velocity threshold scaled to frame height
++    ground_y_min = int(round(340 * h / 540.0))
++    vel_thresh = 7.0 * h / 540.0
++
++    # 1. Detect takeoff frame (going backward from f_apex)
++    pre_frames = [f for f in active_frames if f_apex - 15 <= f < f_apex]
++    takeoff_frame = pre_frames[0] if pre_frames else max(0, f_apex - 5)
++
++    if pre_frames:
++        g_pre = max(frame_metrics[f]["y_max"] for f in pre_frames)
++        found_takeoff = False
++        for f in sorted(pre_frames, reverse=True):
++            y_cur = frame_metrics[f]["y_max"]
++            if y_cur >= max(ground_y_min, g_pre - 8):
++                if (f - 1) in frame_metrics:
++                    dy_prev = abs(frame_metrics[f - 1]["y_max"] - y_cur)
++                    if dy_prev <= vel_thresh:
++                        takeoff_frame = f
++                        found_takeoff = True
++                        break
++                else:
++                    takeoff_frame = f
++                    found_takeoff = True
++                    break
++        if not found_takeoff:
++            for f in sorted(pre_frames, reverse=True):
++                if frame_metrics[f]["y_max"] >= g_pre - 8:
++                    takeoff_frame = f
++                    break
++
++    # 2. Detect landing frame (going forward from f_apex)
++    post_frames = [f for f in active_frames if f_apex < f <= f_apex + 15]
++    land_frame = post_frames[-1] if post_frames else f_apex + 4
++
++    if post_frames:
++        g_post = max(frame_metrics[f]["y_max"] for f in post_frames[:8])
++        found_land = False
++        for f in sorted(post_frames):
++            y_cur = frame_metrics[f]["y_max"]
++            if y_cur >= max(ground_y_min, g_post - 8):
++                if (f + 1) in frame_metrics:
++                    dy_next = frame_metrics[f + 1]["y_max"] - y_cur
++                    if dy_next <= vel_thresh:
++                        land_frame = f
++                        found_land = True
++                        break
++                else:
++                    land_frame = f
++                    found_land = True
++                    break
++        if not found_land:
++            for f in sorted(post_frames):
++                if frame_metrics[f]["y_max"] >= g_post - 8:
++                    land_frame = f
++                    break
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    with open(output_path, "w") as f_out:
++        toml.dump(result, f_out)
++
++    if output_path != "/app/output.toml":
++        try:
++            with open("/app/output.toml", "w") as f_default:
++                toml.dump(result, f_default)
++        except OSError:
++            pass
++
++    return result
++
++
++def main():
++    video_path = "/app/example_video.mp4"
++    output_path = "/app/output.toml"
++
++    args = sys.argv[1:]
++    i = 0
++    pos_args = []
++    while i < len(args):
++        arg = args[i]
++        if arg in ("-i", "--input", "--video", "-v", "--file", "-f") and i + 1 < len(args):
++            video_path = args[i + 1]
++            i += 2
++        elif arg.startswith(("--input=", "--video=", "--file=")):
++            video_path = arg.split("=", 1)[1]
++            i += 1
++        elif arg in ("-o", "--output", "--out") and i + 1 < len(args):
++            output_path = args[i + 1]
++            i += 2
++        elif arg.startswith(("--output=", "--out=")):
++            output_path = arg.split("=", 1)[1]
++            i += 1
++        elif not arg.startswith("-"):
++            pos_args.append(arg)
++            i += 1
++        else:
++            i += 1
++
++    if len(pos_args) >= 1:
++        video_path = pos_args[0]
++    if len(pos_args) >= 2:
++        output_path = pos_args[1]
++
++    analyze_jump(video_path, output_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

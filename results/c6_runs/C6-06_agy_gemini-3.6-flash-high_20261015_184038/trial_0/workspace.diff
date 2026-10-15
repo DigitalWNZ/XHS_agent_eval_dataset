@@ -1,0 +1,539 @@
+diff --git a/scratch/test_async.py b/scratch/test_async.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_async.py
+@@ -0,0 +1,23 @@
++import asyncio
++import signal
++import sys
++import os
++
++cleanup_executed = []
++
++async def sample_task(task_id):
++    try:
++        print(f"Task {task_id} started")
++        await asyncio.sleep(2)
++        print(f"Task {task_id} finished work")
++    except asyncio.CancelledError:
++        print(f"Task {task_id} caught CancelledError, cleaning up...")
++        await asyncio.sleep(0.2)
++        cleanup_executed.append(task_id)
++        print(f"Task {task_id} cleanup done")
++        raise
++    finally:
++        print(f"Task {task_id} finally block executed")
++
++if __name__ == "__main__":
++    print("Test script")
+diff --git a/scratch/test_cleanup_handling.py b/scratch/test_cleanup_handling.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_cleanup_handling.py
+@@ -0,0 +1,23 @@
++import asyncio
++import signal
++import sys
++import os
++
++cleanup_log = []
++
++async def worker(task_id):
++    try:
++        print(f"Task {task_id} starting...")
++        await asyncio.sleep(10)
++    except asyncio.CancelledError:
++        print(f"Task {task_id} caught CancelledError, starting cleanup...")
++        try:
++            await asyncio.sleep(2)
++        except (asyncio.CancelledError, KeyboardInterrupt):
++            print(f"Task {task_id} cleanup interrupted, continuing cleanup...")
++            await asyncio.sleep(1)
++        cleanup_log.append(f"Task {task_id}")
++        print(f"Task {task_id} cleanup done")
++        raise
++    finally:
++        print(f"Task {task_id} inside finally")
+diff --git a/scratch/test_double_sigint.py b/scratch/test_double_sigint.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_double_sigint.py
+@@ -0,0 +1,52 @@
++import asyncio
++import os
++import signal
++import sys
++
++cleanup_log = []
++
++async def worker(task_id):
++    try:
++        print(f"Task {task_id} starting...")
++        await asyncio.sleep(10)
++    except asyncio.CancelledError:
++        print(f"Task {task_id} caught CancelledError, starting cleanup...")
++        await asyncio.sleep(2)  # Long cleanup
++        cleanup_log.append(f"Task {task_id}")
++        print(f"Task {task_id} cleaned up")
++        raise
++    finally:
++        print(f"Task {task_id} inside finally")
++
++async def run_tasks_tg(tasks, max_concurrent):
++    sem = asyncio.Semaphore(max_concurrent)
++    async def run_one(task_fn):
++        async with sem:
++            await task_fn()
++    async with asyncio.TaskGroup() as tg:
++        for t in tasks:
++            tg.create_task(run_one(t))
++
++async def runner():
++    tasks = [lambda: worker(1), lambda: worker(2)]
++    
++    async def send_sigint_twice():
++        await asyncio.sleep(0.5)
++        print("Sending SIGINT #1...")
++        os.kill(os.getpid(), signal.SIGINT)
++        await asyncio.sleep(0.5)
++        print("Sending SIGINT #2...")
++        os.kill(os.getpid(), signal.SIGINT)
++
++    asyncio.create_task(send_sigint_twice())
++    try:
++        await run_tasks_tg(tasks, 2)
++    finally:
++        print("Runner finally, cleanup_log:", cleanup_log)
++
++if __name__ == "__main__":
++    try:
++        asyncio.run(runner())
++    except KeyboardInterrupt:
++        print("Caught KeyboardInterrupt in main")
++        print("Final cleanup log:", cleanup_log)
+diff --git a/scratch/test_full_spec.py b/scratch/test_full_spec.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_full_spec.py
+@@ -0,0 +1,161 @@
++import asyncio
++import time
++
++# Prototype implementation of run_tasks
++
++async def run_tasks(tasks: list, max_concurrent: int) -> None:
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be greater than 0")
++    if not tasks:
++        return
++
++    queue = asyncio.Queue()
++    for task in tasks:
++        queue.put_nowait(task)
++
++    async def worker():
++        while not queue.empty():
++            try:
++                task_fn = queue.get_nowait()
++            except asyncio.QueueEmpty:
++                break
++            await task_fn()
++
++    num_workers = min(max_concurrent, len(tasks))
++    worker_tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
++
++    try:
++        await asyncio.gather(*worker_tasks)
++    except BaseException:
++        # Cancel all workers
++        for w in worker_tasks:
++            if not w.done():
++                w.cancel()
++
++        # Wait for all workers to complete their cleanup
++        while any(not w.done() for w in worker_tasks):
++            try:
++                await asyncio.gather(*[w for w in worker_tasks if not w.done()], return_exceptions=True)
++            except BaseException:
++                pass
++        raise
++
++
++# Tests
++
++async def test_basic():
++    completed = []
++    async def make_task(i):
++        async def t():
++            await asyncio.sleep(0.01)
++            completed.append(i)
++        return t
++
++    tasks = [await make_task(i) for i in range(5)]
++    await run_tasks(tasks, max_concurrent=2)
++    assert sorted(completed) == [0, 1, 2, 3, 4]
++    print("test_basic PASSED")
++
++async def test_max_concurrency():
++    active = 0
++    max_active = 0
++    lock = asyncio.Lock()
++
++    async def make_task():
++        nonlocal active, max_active
++        async with lock:
++            active += 1
++            if active > max_active:
++                max_active = active
++        await asyncio.sleep(0.05)
++        async with lock:
++            active -= 1
++
++    tasks = [make_task for _ in range(10)]
++    await run_tasks(tasks, max_concurrent=3)
++    assert max_active <= 3
++    assert active == 0
++    print(f"test_max_concurrency PASSED (max_active was {max_active})")
++
++async def test_task_cleanup_on_cancel():
++    cleanup_done = []
++
++    async def task_with_cleanup(i):
++        try:
++            await asyncio.sleep(10)
++        except asyncio.CancelledError:
++            await asyncio.sleep(0.05)  # simulate async cleanup work
++            cleanup_done.append(i)
++            raise
++
++    tasks = [lambda i=i: task_with_cleanup(i) for i in range(4)]
++    
++    main_job = asyncio.create_task(run_tasks(tasks, max_concurrent=2))
++    await asyncio.sleep(0.05)  # let first 2 tasks start
++    main_job.cancel()
++
++    try:
++        await main_job
++        assert False, "Should have raised CancelledError"
++    except asyncio.CancelledError:
++        pass
++
++    assert len(cleanup_done) == 2, f"Expected 2 cleanups, got {len(cleanup_done)}"
++    assert sorted(cleanup_done) == [0, 1]
++    print("test_task_cleanup_on_cancel PASSED")
++
++async def test_task_exception():
++    cleanup_done = []
++
++    async def failing_task():
++        await asyncio.sleep(0.02)
++        raise RuntimeError("Task failed!")
++
++    async def slow_task(i):
++        try:
++            await asyncio.sleep(10)
++        except asyncio.CancelledError:
++            await asyncio.sleep(0.02)
++            cleanup_done.append(i)
++            raise
++
++    tasks = [
++        failing_task,
++        lambda: slow_task(1),
++        lambda: slow_task(2),
++    ]
++
++    try:
++        await run_tasks(tasks, max_concurrent=3)
++        assert False, "Should have raised RuntimeError"
++    except RuntimeError as e:
++        assert str(e) == "Task failed!"
++
++    assert len(cleanup_done) == 2, f"Expected 2 cleanups, got {len(cleanup_done)}"
++    print("test_task_exception PASSED")
++
++async def test_empty_tasks():
++    await run_tasks([], 5)
++    print("test_empty_tasks PASSED")
++
++async def test_invalid_max_concurrent():
++    try:
++        await run_tasks([lambda: asyncio.sleep(0)], 0)
++        assert False, "Should have raised ValueError"
++    except ValueError:
++        pass
++
++    try:
++        await run_tasks([lambda: asyncio.sleep(0)], -1)
++        assert False, "Should have raised ValueError"
++    except ValueError:
++        pass
++    print("test_invalid_max_concurrent PASSED")
++
++if __name__ == "__main__":
++    asyncio.run(test_basic())
++    asyncio.run(test_max_concurrency())
++    asyncio.run(test_task_cleanup_on_cancel())
++    asyncio.run(test_task_exception())
++    asyncio.run(test_empty_tasks())
++    asyncio.run(test_invalid_max_concurrent())
+diff --git a/scratch/test_interrupt.py b/scratch/test_interrupt.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_interrupt.py
+@@ -0,0 +1,60 @@
++import asyncio
++import signal
++import time
++
++cleanup_log = []
++
++async def worker(task_id, duration):
++    try:
++        print(f"Task {task_id} starting...")
++        await asyncio.sleep(duration)
++        print(f"Task {task_id} completed successfully")
++    except asyncio.CancelledError:
++        print(f"Task {task_id} received CancelledError, starting cleanup...")
++        await asyncio.sleep(0.5)
++        cleanup_log.append(f"Task {task_id} cleaned up")
++        print(f"Task {task_id} cleanup done")
++        raise
++    finally:
++        print(f"Task {task_id} finally block executed")
++
++async def run_tasks_impl(tasks, max_concurrent):
++    sem = asyncio.Semaphore(max_concurrent)
++    active_tasks = set()
++
++    async def run_one(task_fn):
++        async with sem:
++            await task_fn()
++
++    tasks_to_run = []
++    try:
++        async with asyncio.TaskGroup() as tg:
++            for task_fn in tasks:
++                t = tg.create_task(run_one(task_fn))
++                active_tasks.add(t)
++    except ExceptionGroup as eg:
++        print("Caught ExceptionGroup:", eg)
++        raise
++
++async def main():
++    tasks = [
++        lambda: worker(1, 10),
++        lambda: worker(2, 10),
++        lambda: worker(3, 10),
++        lambda: worker(4, 10),
++    ]
++    
++    # We will cancel main task after 1 second to simulate Ctrl+C / Cancellation
++    main_task = asyncio.create_task(run_tasks_impl(tasks, max_concurrent=2))
++    await asyncio.sleep(1)
++    print("Cancelling main_task now...")
++    main_task.cancel()
++    try:
++        await main_task
++    except asyncio.CancelledError:
++        print("main_task cancelled error caught")
++    
++    print("Cleanup log:", cleanup_log)
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/scratch/test_robust.py b/scratch/test_robust.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_robust.py
+@@ -0,0 +1,104 @@
++import asyncio
++import os
++import signal
++import sys
++
++cleanup_log = []
++
++async def worker(task_id):
++    try:
++        print(f"Task {task_id} starting...")
++        await asyncio.sleep(10)
++    except asyncio.CancelledError:
++        print(f"Task {task_id} caught CancelledError, starting cleanup...")
++        await asyncio.sleep(1)
++        cleanup_log.append(f"Task {task_id}")
++        print(f"Task {task_id} cleaned up")
++        raise
++    finally:
++        print(f"Task {task_id} inside finally")
++
++async def robust_run_tasks(tasks, max_concurrent):
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be >= 1")
++    if not tasks:
++        return
++
++    # Create worker tasks with max_concurrent concurrency
++    # We can use a queue or semaphore.
++    # Let's trace worker pool with queue:
++    queue = asyncio.Queue()
++    for t in tasks:
++        queue.put_nowait(t)
++
++    active_tasks = set()
++    stop_flag = False
++
++    async def worker_loop():
++        while not stop_flag:
++            try:
++                task_fn = queue.get_nowait()
++            except asyncio.QueueEmpty:
++                break
++            try:
++                await task_fn()
++            finally:
++                queue.task_done()
++
++    num_workers = min(max_concurrent, len(tasks))
++    for _ in range(num_workers):
++        t = asyncio.create_task(worker_loop())
++        active_tasks.add(t)
++
++    first_exception = None
++
++    try:
++        # Await all worker tasks
++        await asyncio.gather(*active_tasks)
++    except BaseException as exc:
++        first_exception = exc
++        stop_flag = True
++        # Cancel all active worker tasks
++        for t in active_tasks:
++            if not t.done():
++                t.cancel()
++        
++        # Now wait for ALL worker tasks to complete, even if KeyboardInterrupt/CancelledError is raised again!
++        while active_tasks:
++            pending = [t for t in active_tasks if not t.done()]
++            if not pending:
++                break
++            try:
++                await asyncio.gather(*pending, return_exceptions=True)
++            except BaseException as secondary_exc:
++                # If interrupted again during wait, ensure remaining tasks are still cancelled
++                for t in pending:
++                    if not t.done():
++                        t.cancel()
++
++    if first_exception is not None:
++        raise first_exception
++
++async def runner():
++    tasks = [lambda: worker(1), lambda: worker(2)]
++    
++    async def send_sigint_twice():
++        await asyncio.sleep(0.3)
++        print("Sending SIGINT #1...")
++        os.kill(os.getpid(), signal.SIGINT)
++        await asyncio.sleep(0.3)
++        print("Sending SIGINT #2...")
++        os.kill(os.getpid(), signal.SIGINT)
++
++    asyncio.create_task(send_sigint_twice())
++    try:
++        await robust_run_tasks(tasks, 2)
++    finally:
++        print("Runner finally, cleanup_log:", cleanup_log)
++
++if __name__ == "__main__":
++    try:
++        asyncio.run(runner())
++    except KeyboardInterrupt:
++        print("Caught KeyboardInterrupt in main")
++        print("Final cleanup log:", cleanup_log)
+diff --git a/scratch/test_runner.py b/scratch/test_runner.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_runner.py
+@@ -0,0 +1,21 @@
++import asyncio
++import signal
++import os
++import sys
++
++# Test different implementation approaches
++
++async def test_normal():
++    print("Testing normal execution...")
++    executed = []
++    async def make_task(i):
++        async def task():
++            await asyncio.sleep(0.01)
++            executed.append(i)
++        return task
++
++    tasks = [await make_task(i) for i in range(10)]
++    # run_tasks implementation ...
++    
++if __name__ == "__main__":
++    asyncio.run(test_normal())
+diff --git a/scratch/test_sigint.py b/scratch/test_sigint.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_sigint.py
+@@ -0,0 +1,55 @@
++import asyncio
++import os
++import signal
++import sys
++
++cleanup_log = []
++
++async def worker(task_id):
++    try:
++        print(f"Task {task_id} starting...")
++        await asyncio.sleep(10)
++    except asyncio.CancelledError:
++        print(f"Task {task_id} caught CancelledError, cleaning up...")
++        await asyncio.sleep(0.5)
++        cleanup_log.append(f"Task {task_id}")
++        print(f"Task {task_id} cleaned up")
++        raise
++    except KeyboardInterrupt:
++        print(f"Task {task_id} caught KeyboardInterrupt, cleaning up...")
++        await asyncio.sleep(0.5)
++        cleanup_log.append(f"Task {task_id}")
++        print(f"Task {task_id} cleaned up")
++        raise
++    finally:
++        print(f"Task {task_id} inside finally")
++
++async def run_tasks_tg(tasks, max_concurrent):
++    sem = asyncio.Semaphore(max_concurrent)
++    async def run_one(task_fn):
++        async with sem:
++            await task_fn()
++    async with asyncio.TaskGroup() as tg:
++        for t in tasks:
++            tg.create_task(run_one(t))
++
++async def runner():
++    tasks = [lambda: worker(1), lambda: worker(2)]
++    # send SIGINT to ourselves in 0.5s
++    async def send_sigint():
++        await asyncio.sleep(0.5)
++        print("Sending SIGINT...")
++        os.kill(os.getpid(), signal.SIGINT)
++
++    asyncio.create_task(send_sigint())
++    try:
++        await run_tasks_tg(tasks, 2)
++    finally:
++        print("Runner finally, cleanup_log:", cleanup_log)
++
++if __name__ == "__main__":
++    try:
++        asyncio.run(runner())
++    except KeyboardInterrupt:
++        print("Caught KeyboardInterrupt in main")
++        print("Final cleanup log:", cleanup_log)

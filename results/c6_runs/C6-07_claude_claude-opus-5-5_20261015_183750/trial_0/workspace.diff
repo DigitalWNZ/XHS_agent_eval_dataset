@@ -1,0 +1,716 @@
+diff --git a/.changeset/persister-restore-state.md b/.changeset/persister-restore-state.md
+new file mode 100644
+index 000000000..625bf713a
+--- /dev/null
++++ b/.changeset/persister-restore-state.md
+@@ -0,0 +1,6 @@
++---
++'@tanstack/query-core': minor
++'@tanstack/query-persist-client-core': minor
++---
++
++feat: add `createPersisterRestoreResult` so fine-grained persisters can restore the full persisted query state (errors, failure counts, timestamps, invalidation and infinite query page params), and make `restoreQueries` preserve and merge persisted state
+diff --git a/packages/query-core/src/__tests__/persisterRestore.test.tsx b/packages/query-core/src/__tests__/persisterRestore.test.tsx
+new file mode 100644
+index 000000000..8a5bc135b
+--- /dev/null
++++ b/packages/query-core/src/__tests__/persisterRestore.test.tsx
+@@ -0,0 +1,156 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
++import { queryKey } from '@tanstack/query-test-utils'
++import {
++  InfiniteQueryObserver,
++  QueryCache,
++  QueryClient,
++  QueryObserver,
++  createPersisterRestoreResult,
++} from '..'
++import type { QueryState } from '..'
++
++function persistedState<TData>(
++  overrides: Partial<QueryState<TData, Error>>,
++): QueryState<TData, Error> {
++  return {
++    data: undefined,
++    dataUpdateCount: 0,
++    dataUpdatedAt: 0,
++    error: null,
++    errorUpdateCount: 0,
++    errorUpdatedAt: 0,
++    fetchFailureCount: 0,
++    fetchFailureReason: null,
++    fetchMeta: null,
++    isInvalidated: false,
++    status: 'pending',
++    fetchStatus: 'fetching',
++    ...overrides,
++  }
++}
++
++describe('createPersisterRestoreResult', () => {
++  let queryCache: QueryCache
++  let queryClient: QueryClient
++  const onSuccess = vi.fn()
++  const onSettled = vi.fn()
++
++  beforeEach(() => {
++    vi.useFakeTimers()
++    onSuccess.mockReset()
++    onSettled.mockReset()
++    queryCache = new QueryCache({ onSuccess, onSettled })
++    queryClient = new QueryClient({ queryCache })
++    queryClient.mount()
++  })
++
++  afterEach(() => {
++    queryClient.clear()
++    vi.useRealTimers()
++  })
++
++  test('should adopt the restored state including refetch errors', async () => {
++    const key = queryKey()
++    const error = new Error('persisted')
++    const state = persistedState<string>({
++      data: 'persisted',
++      dataUpdateCount: 3,
++      dataUpdatedAt: 1000,
++      error,
++      errorUpdateCount: 2,
++      errorUpdatedAt: 2000,
++      fetchFailureCount: 4,
++      fetchFailureReason: error,
++      isInvalidated: true,
++      status: 'error',
++    })
++    const queryFn = vi.fn(() => 'fresh')
++
++    await queryClient.prefetchQuery({
++      queryKey: key,
++      queryFn,
++      persister: () =>
++        createPersisterRestoreResult({ data: state.data, state }),
++    })
++
++    const query = queryCache.find({ queryKey: key })!
++    expect(queryFn).not.toHaveBeenCalled()
++    expect(onSuccess).not.toHaveBeenCalled()
++    expect(onSettled).not.toHaveBeenCalled()
++    expect(query.state).toEqual({ ...state, fetchStatus: 'idle' })
++
++    const observer = new QueryObserver(queryClient, {
++      queryKey: key,
++      queryFn,
++      enabled: false,
++    })
++    const result = observer.getCurrentResult()
++    expect(result.isRefetchError).toBe(true)
++    expect(result.data).toBe('persisted')
++    expect(result.error).toBe(error)
++    expect(result.failureCount).toBe(4)
++    expect(result.dataUpdatedAt).toBe(1000)
++    expect(result.errorUpdatedAt).toBe(2000)
++  })
++
++  test('should restore through an observer and end idle', async () => {
++    const key = queryKey()
++    const state = persistedState<string>({
++      data: 'persisted',
++      dataUpdateCount: 1,
++      dataUpdatedAt: 1234,
++      status: 'success',
++      fetchStatus: 'idle',
++    })
++
++    const observer = new QueryObserver(queryClient, {
++      queryKey: key,
++      queryFn: () => 'fresh',
++      staleTime: Infinity,
++      persister: () =>
++        Promise.resolve(
++          createPersisterRestoreResult({ data: state.data, state }),
++        ),
++    })
++    const unsubscribe = observer.subscribe(() => undefined)
++    await vi.advanceTimersByTimeAsync(0)
++
++    const result = observer.getCurrentResult()
++    expect(result.data).toBe('persisted')
++    expect(result.fetchStatus).toBe('idle')
++    expect(result.status).toBe('success')
++    expect(result.dataUpdatedAt).toBe(1234)
++    expect(onSuccess).not.toHaveBeenCalled()
++    unsubscribe()
++  })
++
++  test('should preserve infinite query page params', async () => {
++    const key = queryKey()
++    const data = { pages: ['a', 'b'], pageParams: [10, 20] }
++    const state = persistedState({
++      data,
++      dataUpdateCount: 2,
++      dataUpdatedAt: 5000,
++      status: 'success',
++    })
++    const queryFn = vi.fn(() => 'fresh')
++
++    const observer = new InfiniteQueryObserver(queryClient, {
++      queryKey: key,
++      queryFn,
++      initialPageParam: 0,
++      getNextPageParam: (_last, _all, lastParam: number) => lastParam + 10,
++      staleTime: Infinity,
++      persister: () => createPersisterRestoreResult({ data, state }),
++    })
++    const unsubscribe = observer.subscribe(() => undefined)
++    await vi.advanceTimersByTimeAsync(0)
++
++    const result = observer.getCurrentResult()
++    expect(queryFn).not.toHaveBeenCalled()
++    expect(result.data).toEqual(data)
++    expect(result.dataUpdatedAt).toBe(5000)
++    expect(result.hasNextPage).toBe(true)
++    unsubscribe()
++  })
++})
+diff --git a/packages/query-core/src/index.ts b/packages/query-core/src/index.ts
+index a4267aabc..1d862227b 100644
+--- a/packages/query-core/src/index.ts
++++ b/packages/query-core/src/index.ts
+@@ -40,6 +40,9 @@ export {
+ } from './utils'
+ export type { MutationFilters, QueryFilters, SkipToken, Updater } from './utils'
+ 
++export { createPersisterRestoreResult } from './persisterRestore'
++export type { PersisterRestoreResult } from './persisterRestore'
++
+ export { streamedQuery as experimental_streamedQuery } from './streamedQuery'
+ 
+ // Types
+diff --git a/packages/query-core/src/persisterRestore.ts b/packages/query-core/src/persisterRestore.ts
+new file mode 100644
+index 000000000..c62ce066d
+--- /dev/null
++++ b/packages/query-core/src/persisterRestore.ts
+@@ -0,0 +1,42 @@
++import type { QueryState } from './query'
++import type { DefaultError } from './types'
++
++const persisterRestoreResultMarker = Symbol('persisterRestoreResult')
++
++export interface PersisterRestoreResult<
++  TData = unknown,
++  TError = DefaultError,
++> {
++  readonly [persisterRestoreResultMarker]: true
++  data: TData
++  state: QueryState<TData, TError>
++}
++
++/**
++ * Creates a value that can be returned from a `persister` to signal that a
++ * persisted query snapshot was restored instead of freshly fetched.
++ * The provided `state` will be adopted as the query state as-is
++ * (apart from `fetchStatus`, which will be set to `idle`).
++ */
++export function createPersisterRestoreResult<
++  TData = unknown,
++  TError = DefaultError,
++>({
++  data,
++  state,
++}: {
++  data: TData
++  state: QueryState<TData, TError>
++}): PersisterRestoreResult<TData, TError> {
++  return { [persisterRestoreResultMarker]: true, data, state }
++}
++
++export function isPersisterRestoreResult(
++  value: unknown,
++): value is PersisterRestoreResult<unknown, unknown> {
++  return (
++    typeof value === 'object' &&
++    value !== null &&
++    (value as any)[persisterRestoreResultMarker] === true
++  )
++}
+diff --git a/packages/query-core/src/query.ts b/packages/query-core/src/query.ts
+index 7dfaa5877..0179bf43b 100644
+--- a/packages/query-core/src/query.ts
++++ b/packages/query-core/src/query.ts
+@@ -10,6 +10,8 @@ import {
+ import { notifyManager } from './notifyManager'
+ import { CancelledError, canFetch, createRetryer } from './retryer'
+ import { Removable } from './removable'
++import { isPersisterRestoreResult } from './persisterRestore'
++import type { PersisterRestoreResult } from './persisterRestore'
+ import type { QueryCache } from './queryCache'
+ import type { QueryClient } from './queryClient'
+ import type {
+@@ -126,6 +128,11 @@ interface InvalidateAction {
+   type: 'invalidate'
+ }
+ 
++interface RestoreAction<TData, TError> {
++  type: 'restore'
++  state: QueryState<TData, TError>
++}
++
+ interface PauseAction {
+   type: 'pause'
+ }
+@@ -147,6 +154,7 @@ export type Action<TData, TError> =
+   | FetchAction
+   | InvalidateAction
+   | PauseAction
++  | RestoreAction<TData, TError>
+   | SetStateAction<TData, TError>
+   | SuccessAction<TData>
+ 
+@@ -512,6 +520,25 @@ export class Query<
+ 
+     this.options.behavior?.onFetch(context, this as unknown as Query)
+ 
++    // Detect persisted snapshots returned by a `persister`, so that they can be
++    // adopted as-is instead of being treated like a fresh successful fetch
++    let restoreResult: PersisterRestoreResult<unknown, unknown> | undefined
++    const behaviorFetchFn = context.fetchFn
++    const unwrapRestoreResult = (value: unknown) => {
++      if (isPersisterRestoreResult(value)) {
++        restoreResult = value
++        return value.data
++      }
++      return value
++    }
++    context.fetchFn = () => {
++      restoreResult = undefined
++      const result = behaviorFetchFn()
++      return result instanceof Promise
++        ? result.then(unwrapRestoreResult)
++        : unwrapRestoreResult(result)
++    }
++
+     // Store state in case the current fetch needs to be reverted
+     this.#revertState = this.state
+ 
+@@ -555,6 +582,19 @@ export class Query<
+ 
+     try {
+       const data = await this.#retryer.start()
++
++      if (restoreResult) {
++        const { state } = restoreResult as PersisterRestoreResult<TData, TError>
++        this.#dispatch({
++          type: 'restore',
++          state: {
++            ...state,
++            data: replaceData(this.state.data, data, this.options),
++          },
++        })
++        return this.state.data as TData
++      }
++
+       // this is more of a runtime guard
+       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+       if (data === undefined) {
+@@ -678,6 +718,15 @@ export class Query<
+             ...state,
+             isInvalidated: true,
+           }
++        case 'restore':
++          // A restored snapshot is adopted as-is, it is not a fresh fetch
++          this.#revertState = undefined
++          return {
++            ...state,
++            ...action.state,
++            fetchStatus: 'idle',
++            fetchMeta: null,
++          }
+         case 'setState':
+           return {
+             ...state,
+diff --git a/packages/query-core/src/types.ts b/packages/query-core/src/types.ts
+index 4f3f4caed..80996f2e3 100644
+--- a/packages/query-core/src/types.ts
++++ b/packages/query-core/src/types.ts
+@@ -8,6 +8,7 @@ import type { RetryDelayValue, RetryValue } from './retryer'
+ import type { QueryFilters, QueryTypeFilter, SkipToken } from './utils'
+ import type { QueryCache } from './queryCache'
+ import type { MutationCache } from './mutationCache'
++import type { PersisterRestoreResult } from './persisterRestore'
+ 
+ export type NonUndefinedGuard<T> = T extends undefined ? never : T
+ 
+@@ -119,6 +120,11 @@ export type Enabled<
+   | boolean
+   | ((query: Query<TQueryFnData, TError, TData, TQueryKey>) => boolean)
+ 
++type PersisterResult<T> =
++  | T
++  | PersisterRestoreResult<any, any>
++  | Promise<T | PersisterRestoreResult<any, any>>
++
+ export type QueryPersister<
+   T = unknown,
+   TQueryKey extends QueryKey = QueryKey,
+@@ -128,12 +134,12 @@ export type QueryPersister<
+       queryFn: QueryFunction<T, TQueryKey, never>,
+       context: QueryFunctionContext<TQueryKey>,
+       query: Query,
+-    ) => T | Promise<T>
++    ) => PersisterResult<T>
+   : (
+       queryFn: QueryFunction<T, TQueryKey, TPageParam>,
+       context: QueryFunctionContext<TQueryKey>,
+       query: Query,
+-    ) => T | Promise<T>
++    ) => PersisterResult<T>
+ 
+ export type QueryFunctionContext<
+   TQueryKey extends QueryKey = QueryKey,
+diff --git a/packages/query-persist-client-core/src/__tests__/createPersister.test.ts b/packages/query-persist-client-core/src/__tests__/createPersister.test.ts
+index e9ff7eb8b..7303d7b8a 100644
+--- a/packages/query-persist-client-core/src/__tests__/createPersister.test.ts
++++ b/packages/query-persist-client-core/src/__tests__/createPersister.test.ts
+@@ -545,6 +545,160 @@ describe('createPersister', () => {
+   })
+ 
+   describe('restoreQueries', () => {
++    test('should preserve full query state when restoring in bulk', async () => {
++      const storage = getFreshStorage()
++      const { persister, client } = setupPersister(['foo'], { storage })
++      const error = { message: 'boom' }
++      const now = Date.now()
++      const states = {
++        a: {
++          data: 'a',
++          dataUpdateCount: 3,
++          dataUpdatedAt: now - 10,
++          error,
++          errorUpdateCount: 2,
++          errorUpdatedAt: now - 5,
++          fetchFailureCount: 2,
++          fetchFailureReason: error,
++          fetchMeta: null,
++          isInvalidated: true,
++          status: 'error',
++          fetchStatus: 'fetching',
++        },
++        b: {
++          data: { pages: [1, 2], pageParams: [0, 1] },
++          dataUpdateCount: 2,
++          dataUpdatedAt: now - 20,
++          error: null,
++          errorUpdateCount: 0,
++          errorUpdatedAt: 0,
++          fetchFailureCount: 0,
++          fetchFailureReason: null,
++          fetchMeta: null,
++          isInvalidated: false,
++          status: 'success',
++          fetchStatus: 'idle',
++        },
++      }
++      for (const [name, state] of Object.entries(states)) {
++        await storage.setItem(
++          `${PERSISTER_KEY_PREFIX}-${hashKey([name])}`,
++          JSON.stringify({
++            buster: '',
++            queryHash: hashKey([name]),
++            queryKey: [name],
++            state,
++          }),
++        )
++      }
++
++      await persister.restoreQueries(client)
++
++      expect(client.getQueryState(['a'])).toEqual({
++        ...states.a,
++        fetchStatus: 'idle',
++      })
++      expect(client.getQueryState(['b'])).toEqual(states.b)
++    })
++
++    test('should merge data and error freshness independently', async () => {
++      const storage = getFreshStorage()
++      const { persister, client } = setupPersister(['foo'], { storage })
++      const persistedError = { message: 'persisted' }
++
++      // live data is newer, persisted error is newer
++      client.setQueryData(['a'], 'live', { updatedAt: 2000 })
++      // persisted data is newer, live error is newer
++      client.setQueryData(['b'], 'old', { updatedAt: 1000 })
++      const liveError = new Error('live')
++      client
++        .getQueryCache()
++        .find({ queryKey: ['b'] })!
++        .setState({
++          error: liveError,
++          errorUpdatedAt: 4000,
++          errorUpdateCount: 1,
++          status: 'error',
++        })
++
++      const persisted = {
++        a: {
++          data: 'persisted',
++          dataUpdateCount: 1,
++          dataUpdatedAt: 1000,
++          error: persistedError,
++          errorUpdateCount: 5,
++          errorUpdatedAt: 3000,
++          fetchFailureCount: 5,
++          fetchFailureReason: persistedError,
++          fetchMeta: null,
++          isInvalidated: true,
++          status: 'error',
++          fetchStatus: 'idle',
++        },
++        b: {
++          data: 'persisted',
++          dataUpdateCount: 7,
++          dataUpdatedAt: 3000,
++          error: null,
++          errorUpdateCount: 0,
++          errorUpdatedAt: 0,
++          fetchFailureCount: 0,
++          fetchFailureReason: null,
++          fetchMeta: null,
++          isInvalidated: false,
++          status: 'success',
++          fetchStatus: 'idle',
++        },
++      }
++      for (const [name, state] of Object.entries(persisted)) {
++        await storage.setItem(
++          `${PERSISTER_KEY_PREFIX}-${hashKey([name])}`,
++          JSON.stringify({
++            buster: '',
++            queryHash: hashKey([name]),
++            queryKey: [name],
++            state: {
++              ...state,
++              dataUpdatedAt: Date.now() - 4000 + state.dataUpdatedAt,
++            },
++          }),
++        )
++      }
++      // align live timestamps with the persisted ones
++      const base = Date.now() - 4000
++      client
++        .getQueryCache()
++        .find({ queryKey: ['a'] })!
++        .setState({
++          dataUpdatedAt: base + 2000,
++        })
++      client
++        .getQueryCache()
++        .find({ queryKey: ['b'] })!
++        .setState({
++          dataUpdatedAt: base + 1000,
++        })
++
++      await persister.restoreQueries(client)
++
++      const a = client.getQueryState(['a'])!
++      expect(a.data).toBe('live')
++      expect(a.dataUpdatedAt).toBe(base + 2000)
++      expect(a.error).toEqual(persistedError)
++      expect(a.errorUpdatedAt).toBe(3000)
++      expect(a.fetchFailureCount).toBe(5)
++      expect(a.status).toBe('error')
++
++      const b = client.getQueryState(['b'])!
++      expect(b.data).toBe('persisted')
++      expect(b.dataUpdatedAt).toBe(base + 3000)
++      expect(b.dataUpdateCount).toBe(7)
++      expect(b.error).toBe(liveError)
++      expect(b.errorUpdatedAt).toBe(4000)
++      expect(b.status).toBe('error')
++    })
++
+     test('should properly clean storage from busted entries', async () => {
+       const storage = getFreshStorage()
+       const { persister, client, query, queryKey } = setupPersister(['foo'], {
+diff --git a/packages/query-persist-client-core/src/createPersister.ts b/packages/query-persist-client-core/src/createPersister.ts
+index 16fa8c431..1eca1185a 100644
+--- a/packages/query-persist-client-core/src/createPersister.ts
++++ b/packages/query-persist-client-core/src/createPersister.ts
+@@ -1,4 +1,5 @@
+ import {
++  createPersisterRestoreResult,
+   hashKey,
+   matchQuery,
+   notifyManager,
+@@ -77,6 +78,56 @@ export interface StoragePersisterOptions<TStorageValue = string> {
+ 
+ export const PERSISTER_KEY_PREFIX = 'tanstack-query'
+ 
++/**
++ * Merges a persisted query state into the state of a query that already
++ * lives in memory. Data freshness and error freshness are reconciled
++ * independently, so newer data is never discarded in favour of a newer error
++ * (and vice versa).
++ */
++function mergeQueryStates(
++  currentState: QueryState,
++  persistedState: QueryState,
++): QueryState {
++  const dataSource =
++    persistedState.dataUpdatedAt > currentState.dataUpdatedAt
++      ? persistedState
++      : currentState
++  const errorSource =
++    persistedState.errorUpdatedAt > currentState.errorUpdatedAt
++      ? persistedState
++      : currentState
++
++  if (dataSource === errorSource) {
++    return {
++      ...dataSource,
++      fetchStatus: currentState.fetchStatus,
++      fetchMeta: currentState.fetchMeta,
++    }
++  }
++
++  const error = errorSource.error
++  const hasError = error !== null
++
++  return {
++    ...currentState,
++    data: dataSource.data,
++    dataUpdateCount: dataSource.dataUpdateCount,
++    dataUpdatedAt: dataSource.dataUpdatedAt,
++    error,
++    errorUpdateCount: errorSource.errorUpdateCount,
++    errorUpdatedAt: errorSource.errorUpdatedAt,
++    fetchFailureCount: errorSource.fetchFailureCount,
++    fetchFailureReason: errorSource.fetchFailureReason,
++    isInvalidated:
++      dataSource.isInvalidated || (hasError && errorSource.isInvalidated),
++    status: hasError
++      ? 'error'
++      : dataSource.data !== undefined
++        ? 'success'
++        : 'pending',
++  }
++}
++
+ /**
+  * Warning: experimental feature.
+  * This utility function enables fine-grained query persistence.
+@@ -126,6 +177,17 @@ export function experimental_createQueryPersister<TStorageValue = string>({
+     queryHash: string,
+     afterRestoreMacroTask?: (persistedQuery: PersistedQuery) => void,
+   ) {
++    const persistedQuery = await retrievePersistedQuery(
++      queryHash,
++      afterRestoreMacroTask,
++    )
++    return persistedQuery?.state.data as T | undefined
++  }
++
++  async function retrievePersistedQuery(
++    queryHash: string,
++    afterRestoreMacroTask?: (persistedQuery: PersistedQuery) => void,
++  ): Promise<PersistedQuery | undefined> {
+     if (storage != null) {
+       const storageKey = `${prefix}-${queryHash}`
+       try {
+@@ -149,7 +211,7 @@ export function experimental_createQueryPersister<TStorageValue = string>({
+               )
+             }
+             // We must resolve the promise here, as otherwise we will have `loading` state in the app until `queryFn` resolves
+-            return persistedQuery.state.data as T
++            return persistedQuery
+           }
+         }
+       } catch (err) {
+@@ -209,13 +271,13 @@ export function experimental_createQueryPersister<TStorageValue = string>({
+ 
+     // Try to restore only if we do not have any data in the cache and we have persister defined
+     if (matchesFilter && query.state.data === undefined && storage != null) {
+-      const restoredData = await retrieveQuery(
++      const persistedQuery = await retrievePersistedQuery(
+         query.queryHash,
+-        (persistedQuery: PersistedQuery) => {
+-          // Set proper updatedAt, since resolving in the first pass overrides those values
++        (restoredQuery: PersistedQuery) => {
++          // Keep timestamps in sync even if the persister is invoked outside of `query.fetch`
+           query.setState({
+-            dataUpdatedAt: persistedQuery.state.dataUpdatedAt,
+-            errorUpdatedAt: persistedQuery.state.errorUpdatedAt,
++            dataUpdatedAt: restoredQuery.state.dataUpdatedAt,
++            errorUpdatedAt: restoredQuery.state.errorUpdatedAt,
+           })
+ 
+           if (
+@@ -227,8 +289,13 @@ export function experimental_createQueryPersister<TStorageValue = string>({
+         },
+       )
+ 
+-      if (restoredData !== undefined) {
+-        return Promise.resolve(restoredData as T)
++      if (persistedQuery && persistedQuery.state.data !== undefined) {
++        // Hand over the whole persisted snapshot, so that the query adopts
++        // the persisted state instead of treating it as a fresh fetch
++        return createPersisterRestoreResult({
++          data: persistedQuery.state.data,
++          state: persistedQuery.state,
++        })
+       }
+     }
+ 
+@@ -270,6 +337,36 @@ export function experimental_createQueryPersister<TStorageValue = string>({
+     }
+   }
+ 
++  function restorePersistedQuery(
++    queryClient: QueryClient,
++    persistedQuery: PersistedQuery,
++  ) {
++    const queryCache = queryClient.getQueryCache()
++    const persistedState: QueryState = {
++      ...persistedQuery.state,
++      fetchStatus: 'idle',
++      fetchMeta: null,
++    }
++    const existingQuery = queryCache.get(persistedQuery.queryHash)
++
++    if (!existingQuery) {
++      queryCache.build(
++        queryClient,
++        {
++          ...queryClient.getDefaultOptions().hydrate?.queries,
++          queryKey: persistedQuery.queryKey,
++          queryHash: persistedQuery.queryHash,
++        },
++        persistedState,
++      )
++      return
++    }
++
++    existingQuery.setState(
++      mergeQueryStates(existingQuery.state, persistedState),
++    )
++  }
++
+   async function restoreQueries(
+     queryClient: QueryClient,
+     filters: Pick<QueryFilters, 'queryKey' | 'exact'> = {},
+@@ -303,13 +400,7 @@ export function experimental_createQueryPersister<TStorageValue = string>({
+             }
+           }
+ 
+-          queryClient.setQueryData(
+-            persistedQuery.queryKey,
+-            persistedQuery.state.data,
+-            {
+-              updatedAt: persistedQuery.state.dataUpdatedAt,
+-            },
+-          )
++          restorePersistedQuery(queryClient, persistedQuery)
+         }
+       }
+     } else if (process.env.NODE_ENV === 'development') {

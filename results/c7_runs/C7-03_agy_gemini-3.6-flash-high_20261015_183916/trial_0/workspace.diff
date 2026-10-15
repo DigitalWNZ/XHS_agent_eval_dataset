@@ -1,0 +1,129 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..e78b056de4 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1762,7 +1762,18 @@ def prefetch_related_objects(model_instances, *related_lookups):
+ 
+             obj_to_fetch = None
+             if prefetcher is not None:
+-                obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
++                if lookup.queryset is not None:
++                    to_attr, as_attr = lookup.get_current_to_attr(level)
++                    attr_name = lookup.to_attr if as_attr else to_attr
++                    if as_attr:
++                        obj_to_fetch = [obj for obj in obj_list if attr_name not in obj.__dict__]
++                    else:
++                        obj_to_fetch = [
++                            obj for obj in obj_list
++                            if attr_name not in getattr(obj, '_prefetched_objects_cache', {})
++                        ]
++                else:
++                    obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
+ 
+             if obj_to_fetch:
+                 obj_list, additional_lookups = prefetch_one_level(
+@@ -1794,7 +1805,7 @@ def prefetch_related_objects(model_instances, *related_lookups):
+                     if through_attr in getattr(obj, '_prefetched_objects_cache', ()):
+                         # If related objects have been prefetched, use the
+                         # cache rather than the object's through_attr.
+-                        new_obj = list(obj._prefetched_objects_cache.get(through_attr))
++                        new_obj = obj._prefetched_objects_cache.get(through_attr)
+                     else:
+                         try:
+                             new_obj = getattr(obj, through_attr)
+@@ -1805,7 +1816,7 @@ def prefetch_related_objects(model_instances, *related_lookups):
+                     # We special-case `list` rather than something more generic
+                     # like `Iterable` because we don't want to accidentally match
+                     # user models that define __iter__.
+-                    if isinstance(new_obj, list):
++                    if isinstance(new_obj, (list, QuerySet)):
+                         new_obj_list.extend(new_obj)
+                     else:
+                         new_obj_list.append(new_obj)
+@@ -1889,23 +1900,19 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+     # The 'values to be matched' must be hashable as they will be used
+     # in a dictionary.
+ 
++    rel_qs = lookup.get_current_queryset(level)
++    additional_lookups = []
++    if rel_qs is not None:
++        additional_lookups = [
++            copy.copy(additional_lookup) for additional_lookup
++            in getattr(rel_qs, '_prefetch_related_lookups', ())
++        ]
++        if additional_lookups:
++            rel_qs = rel_qs._chain()
++            rel_qs._prefetch_related_lookups = ()
++
+     rel_qs, rel_obj_attr, instance_attr, single, cache_name, is_descriptor = (
+-        prefetcher.get_prefetch_queryset(instances, lookup.get_current_queryset(level)))
+-    # We have to handle the possibility that the QuerySet we just got back
+-    # contains some prefetch_related lookups. We don't want to trigger the
+-    # prefetch_related functionality by evaluating the query. Rather, we need
+-    # to merge in the prefetch_related lookups.
+-    # Copy the lookups in case it is a Prefetch object which could be reused
+-    # later (happens in nested prefetch_related).
+-    additional_lookups = [
+-        copy.copy(additional_lookup) for additional_lookup
+-        in getattr(rel_qs, '_prefetch_related_lookups', ())
+-    ]
+-    if additional_lookups:
+-        # Don't need to clone because the manager should have given us a fresh
+-        # instance, so we access an internal instead of using public interface
+-        # for performance reasons.
+-        rel_qs._prefetch_related_lookups = ()
++        prefetcher.get_prefetch_queryset(instances, rel_qs))
+ 
+     all_related_objects = list(rel_qs)
+ 
+diff --git a/tests/defer_regress/tests.py b/tests/defer_regress/tests.py
+index ccd6556c80..21e12eeda7 100644
+--- a/tests/defer_regress/tests.py
++++ b/tests/defer_regress/tests.py
+@@ -3,7 +3,7 @@ from operator import attrgetter
+ from django.contrib.contenttypes.models import ContentType
+ from django.contrib.sessions.backends.db import SessionStore
+ from django.db import models
+-from django.db.models import Count
++from django.db.models import Count, Prefetch
+ from django.test import TestCase, override_settings
+ 
+ from .models import (
+@@ -14,6 +14,37 @@ from .models import (
+ 
+ 
+ class DeferRegressionTest(TestCase):
++    def test_only_related_queryset(self):
++        item = Item.objects.create(name="first", value=42)
++        OneToOneItem.objects.create(item=item, name="oto")
++        queryset = Item.objects.only("name").prefetch_related(
++            Prefetch(
++                "one_to_one_item",
++                queryset=OneToOneItem.objects.prefetch_related(
++                    Prefetch("item", queryset=Item.objects.only("value"))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            item = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(item.one_to_one_item.item.value, 42)
++
++        # ForeignKey relation.
++        RelatedItem.objects.create(item=item)
++        queryset = Item.objects.only("name").prefetch_related(
++            Prefetch(
++                "relateditem_set",
++                queryset=RelatedItem.objects.prefetch_related(
++                    Prefetch("item", queryset=Item.objects.only("value"))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            item = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(item.relateditem_set.all()[0].item.value, 42)
++
+     def test_basic(self):
+         # Deferred fields should really be deferred and not accidentally use
+         # the field's default value just because they aren't passed to __init__

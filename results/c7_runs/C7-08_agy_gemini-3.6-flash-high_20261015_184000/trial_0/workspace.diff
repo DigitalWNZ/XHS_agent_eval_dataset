@@ -1,0 +1,127 @@
+diff --git a/requests/sessions.py b/requests/sessions.py
+index 3f59cab9..dc64a3c7 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -29,7 +29,7 @@ from .adapters import HTTPAdapter
+ 
+ from .utils import (
+     requote_uri, get_environ_proxies, get_netrc_auth, should_bypass_proxies,
+-    get_auth_from_url, rewind_body, resolve_proxies
++    get_auth_from_url, rewind_body, resolve_proxies, select_proxy
+ )
+ 
+ from .status_codes import codes
+@@ -282,19 +282,16 @@ class SessionRedirectMixin(object):
+         :rtype: dict
+         """
+         headers = prepared_request.headers
+-        scheme = urlparse(prepared_request.url).scheme
+         new_proxies = resolve_proxies(prepared_request, proxies, self.trust_env)
+ 
+         if 'Proxy-Authorization' in headers:
+             del headers['Proxy-Authorization']
+ 
+-        try:
+-            username, password = get_auth_from_url(new_proxies[scheme])
+-        except KeyError:
+-            username, password = None, None
+-
+-        if username and password:
+-            headers['Proxy-Authorization'] = _basic_auth_str(username, password)
++        proxy = select_proxy(prepared_request.url, new_proxies)
++        if proxy:
++            username, password = get_auth_from_url(proxy)
++            if username:
++                headers['Proxy-Authorization'] = _basic_auth_str(username, password)
+ 
+         return new_proxies
+ 
+diff --git a/requests/utils.py b/requests/utils.py
+index 1c2ae4e0..0208983e 100644
+--- a/requests/utils.py
++++ b/requests/utils.py
+@@ -851,7 +851,9 @@ def resolve_proxies(request, proxies, trust_env=True):
+     no_proxy = proxies.get('no_proxy')
+     new_proxies = proxies.copy()
+ 
+-    if trust_env and not should_bypass_proxies(url, no_proxy=no_proxy):
++    if should_bypass_proxies(url, no_proxy=no_proxy):
++        new_proxies = {}
++    elif trust_env:
+         environ_proxies = get_environ_proxies(url, no_proxy=no_proxy)
+ 
+         proxy = environ_proxies.get(scheme, environ_proxies.get('all'))
+@@ -988,14 +990,18 @@ def get_auth_from_url(url):
+ 
+     :rtype: (str,str)
+     """
+-    parsed = urlparse(url)
++    if not url:
++        return ('', '')
+ 
+     try:
+-        auth = (unquote(parsed.username), unquote(parsed.password))
+-    except (AttributeError, TypeError):
+-        auth = ('', '')
++        parsed = urlparse(url)
+ 
+-    return auth
++        username = parsed.username or ''
++        password = parsed.password or ''
++
++        return (unquote(username), unquote(password))
++    except (AttributeError, TypeError):
++        return ('', '')
+ 
+ 
+ # Moved outside of function to avoid recompile every call
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index c2186b88..f5352166 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -22,7 +22,7 @@ from requests.utils import (
+     requote_uri, select_proxy, should_bypass_proxies, super_len,
+     to_key_val_list, to_native_string,
+     unquote_header_value, unquote_unreserved,
+-    urldefragauth, add_dict_to_cookiejar, set_environ)
++    urldefragauth, add_dict_to_cookiejar, set_environ, resolve_proxies)
+ from requests._internal_utils import unicode_is_ascii
+ 
+ from .compat import StringIO, cStringIO
+@@ -396,6 +396,10 @@ ENCODED_PASSWORD = compat.quote(PASSWORD, '')
+             'http://complex.url.com/path?query=yes',
+             ('', '')
+         ),
++        (
++            'http://user@complex.url.com/path?query=yes',
++            ('user', '')
++        ),
+     ))
+ def test_get_auth_from_url(url, auth):
+     assert get_auth_from_url(url) == auth
+@@ -799,3 +803,25 @@ def test_set_environ_raises_exception():
+             raise Exception('Expected exception')
+ 
+     assert 'Expected exception' in str(exception.value)
++
++
++def test_resolve_proxies_no_proxy_bypass():
++    class FakeRequest:
++        url = 'http://example.com'
++
++    proxies = {'http': 'http://user:pass@proxy:8080', 'no_proxy': 'example.com'}
++    resolved = resolve_proxies(FakeRequest(), proxies)
++    assert resolved == {}
++
++
++def test_rebuild_proxies_all_scheme():
++    from requests.sessions import Session
++    from requests.models import Request
++
++    proxies = {'all': 'http://user:pass@proxy:8080'}
++    req = Request('GET', 'https://example.org/').prepare()
++    session = Session()
++    new_proxies = session.rebuild_proxies(req, proxies)
++    assert new_proxies == {'all': 'http://user:pass@proxy:8080'}
++    assert req.headers.get('Proxy-Authorization') == 'Basic dXNlcjpwYXNz'
++

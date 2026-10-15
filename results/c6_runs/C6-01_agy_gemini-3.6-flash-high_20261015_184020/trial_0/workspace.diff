@@ -1,0 +1,316 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,311 @@
++#!/usr/bin/env python3
++import sys
++import os
++import re
++import html
++
++
++def find_tag_end(content, start_pos):
++    in_quote = None
++    p = start_pos
++    n = len(content)
++    while p < n:
++        c = content[p]
++        if in_quote:
++            if c == in_quote:
++                in_quote = None
++        else:
++            if c in ('"', "'"):
++                in_quote = c
++            elif c == '>':
++                return p + 1
++        p += 1
++    return n
++
++
++def is_dangerous_attr(name, val):
++    name_lower = name.lower()
++    if name_lower.startswith("on"):
++        return True
++    if val is None:
++        return False
++
++    val_unescaped = val
++    for _ in range(5):
++        temp = html.unescape(val_unescaped)
++        if temp == val_unescaped:
++            break
++        val_unescaped = temp
++
++    val_clean = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", val_unescaped).strip()
++    val_no_backslash = val_clean.replace("\\", "")
++    val_lower = val_no_backslash.lower()
++
++    if ":" in val_lower:
++        prefix = val_lower.split(":", 1)[0]
++        prefix_clean = re.sub(r"[\s\x00-\x1f\x7f-\x9f]", "", prefix)
++        if prefix_clean in ("javascript", "vbscript"):
++            return True
++        if prefix_clean == "data":
++            data_rest = val_lower.split(":", 1)[1].lstrip()
++            if data_rest.startswith((
++                "text/html",
++                "text/javascript",
++                "application/javascript",
++                "application/ecmascript",
++                "image/svg+xml"
++            )):
++                return True
++
++    if name_lower == "style":
++        if re.search(r"(?:expression|behavior|-moz-binding)\s*\(", val_lower):
++            return True
++        if re.search(r"(?:javascript|vbscript)\s*:", val_lower):
++            return True
++
++    if re.search(r"url\s*\(\s*['\"]?\s*(?:javascript|vbscript):", val_lower):
++        return True
++    if re.search(r";\s*url\s*=\s*(?:javascript|vbscript):", val_lower):
++        return True
++
++    if re.search(r"<\s*script", val_lower):
++        return True
++
++    return False
++
++
++def sanitize_tag_attributes(tag_str, tag_name):
++    m_name = re.match(r'^\s*<\s*/?\s*([a-zA-Z0-9:-]+)', tag_str)
++    if not m_name:
++        return tag_str
++
++    tag_name_end = m_name.end()
++    attrs_to_remove = []
++
++    p = tag_name_end
++    n = len(tag_str)
++
++    while p < n:
++        while p < n and tag_str[p] in (' ', '\t', '\r', '\n', '\f'):
++            p += 1
++
++        if p >= n or tag_str[p] in ('>', '/'):
++            break
++
++        attr_name_start = p
++        while p < n and tag_str[p] not in (' ', '\t', '\r', '\n', '\f', '=', '>', '/', '"', "'"):
++            p += 1
++        attr_name_end = p
++
++        attr_name = tag_str[attr_name_start:attr_name_end]
++        if not attr_name:
++            p += 1
++            continue
++
++        p_temp = p
++        while p_temp < n and tag_str[p_temp] in (' ', '\t', '\r', '\n', '\f'):
++            p_temp += 1
++
++        attr_val = None
++        attr_end = attr_name_end
++
++        if p_temp < n and tag_str[p_temp] == '=':
++            p = p_temp + 1
++            while p < n and tag_str[p] in (' ', '\t', '\r', '\n', '\f'):
++                p += 1
++
++            if p < n and tag_str[p] in ('"', "'"):
++                quote_char = tag_str[p]
++                val_start = p + 1
++                p = val_start
++                while p < n and tag_str[p] != quote_char:
++                    p += 1
++                val_end = p
++                attr_val = tag_str[val_start:val_end]
++                if p < n:
++                    p += 1
++                attr_end = p
++            else:
++                val_start = p
++                while p < n and tag_str[p] not in (' ', '\t', '\r', '\n', '\f', '>', '/'):
++                    p += 1
++                val_end = p
++                attr_val = tag_str[val_start:val_end]
++                attr_end = val_end
++        else:
++            p = attr_name_end
++            attr_end = attr_name_end
++
++        if is_dangerous_attr(attr_name, attr_val):
++            lead_start = attr_name_start
++            while lead_start > tag_name_end and tag_str[lead_start - 1] in (' ', '\t', '\r', '\n'):
++                lead_start -= 1
++            attrs_to_remove.append((lead_start, attr_end))
++
++    if not attrs_to_remove:
++        return tag_str
++
++    res = []
++    last_idx = 0
++    for start, end in attrs_to_remove:
++        res.append(tag_str[last_idx:start])
++        last_idx = end
++    res.append(tag_str[last_idx:])
++
++    return "".join(res)
++
++
++def sanitize_style_content(style_content):
++    style_content = re.sub(
++        r'url\s*\(\s*[\'"]?\s*(?:javascript|vbscript):[^)]*\)',
++        'none',
++        style_content,
++        flags=re.IGNORECASE
++    )
++    style_content = re.sub(
++        r'expression\s*\([^)]*\)',
++        'none',
++        style_content,
++        flags=re.IGNORECASE
++    )
++    style_content = re.sub(
++        r'-moz-binding\s*:[^;}]*',
++        '',
++        style_content,
++        flags=re.IGNORECASE
++    )
++    return style_content
++
++
++def sanitize_html(html_text):
++    result = []
++    i = 0
++    n = len(html_text)
++    last_copied = 0
++
++    while i < n:
++        next_lt = html_text.find('<', i)
++        if next_lt == -1:
++            result.append(html_text[last_copied:])
++            break
++
++        result.append(html_text[last_copied:next_lt])
++        tag_start = next_lt
++
++        # Check comment
++        if html_text[tag_start:tag_start+4] == '<!--':
++            end_comment = html_text.find('-->', tag_start+4)
++            if end_comment != -1:
++                comment_end = end_comment + 3
++                comment_body = html_text[tag_start:comment_end]
++                if re.search(r'<\s*script\b', comment_body, re.IGNORECASE):
++                    cleaned_comment = re.sub(
++                        r'<\s*script\b[^>]*>.*?</\s*script\s*>',
++                        '',
++                        comment_body,
++                        flags=re.IGNORECASE | re.DOTALL
++                    )
++                    result.append(cleaned_comment)
++                else:
++                    result.append(comment_body)
++                i = comment_end
++                last_copied = i
++                continue
++            else:
++                result.append(html_text[tag_start:])
++                last_copied = n
++                break
++
++        # Check DOCTYPE / CDATA / XML
++        if html_text[tag_start:tag_start+2] in ('<!', '<?'):
++            decl_end = find_tag_end(html_text, tag_start)
++            result.append(html_text[tag_start:decl_end])
++            i = decl_end
++            last_copied = i
++            continue
++
++        # Check script tag
++        if re.match(r'^\s*script\b', html_text[tag_start+1:], re.IGNORECASE):
++            start_tag_end = find_tag_end(html_text, tag_start)
++            start_tag_content = html_text[tag_start:start_tag_end]
++            if re.search(r'/\s*>$', start_tag_content):
++                i = start_tag_end
++                last_copied = i
++                continue
++            else:
++                m_close = re.search(r'</\s*script\b[^>]*>', html_text[start_tag_end:], re.IGNORECASE)
++                if m_close:
++                    script_end = start_tag_end + m_close.end()
++                    i = script_end
++                    last_copied = i
++                    continue
++                else:
++                    i = n
++                    last_copied = n
++                    break
++
++        # Check style tag
++        if re.match(r'^\s*style\b', html_text[tag_start+1:], re.IGNORECASE):
++            start_tag_end = find_tag_end(html_text, tag_start)
++            start_tag_content = html_text[tag_start:start_tag_end]
++            if re.search(r'/\s*>$', start_tag_content):
++                sanitized_tag = sanitize_tag_attributes(start_tag_content, "style")
++                result.append(sanitized_tag)
++                i = start_tag_end
++                last_copied = i
++                continue
++            else:
++                m_close = re.search(r'</\s*style\b[^>]*>', html_text[start_tag_end:], re.IGNORECASE)
++                if m_close:
++                    style_inner_start = start_tag_end
++                    style_inner_end = start_tag_end + m_close.start()
++                    style_end = start_tag_end + m_close.end()
++
++                    sanitized_start_tag = sanitize_tag_attributes(start_tag_content, "style")
++                    style_body = html_text[style_inner_start:style_inner_end]
++                    sanitized_body = sanitize_style_content(style_body)
++                    close_tag = html_text[style_inner_end:style_end]
++
++                    result.append(sanitized_start_tag + sanitized_body + close_tag)
++                    i = style_end
++                    last_copied = i
++                    continue
++
++        # Check other tags
++        m_tag = re.match(r'^\s*(/?)\s*([a-zA-Z0-9:-]+)', html_text[tag_start+1:])
++        if m_tag:
++            tag_name = m_tag.group(2)
++            tag_end = find_tag_end(html_text, tag_start)
++            raw_tag_str = html_text[tag_start:tag_end]
++            sanitized_tag = sanitize_tag_attributes(raw_tag_str, tag_name)
++            result.append(sanitized_tag)
++            i = tag_end
++            last_copied = i
++            continue
++
++        result.append('<')
++        i = tag_start + 1
++        last_copied = i
++
++    return "".join(result)
++
++
++def main():
++    if len(sys.argv) < 2:
++        sys.exit(1)
++
++    file_path = sys.argv[1]
++    if not os.path.isfile(file_path):
++        sys.exit(1)
++
++    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
++        content = f.read()
++
++    sanitized = sanitize_html(content)
++
++    with open(file_path, "w", encoding="utf-8") as f:
++        f.write(sanitized)
++
++
++if __name__ == "__main__":
++    main()

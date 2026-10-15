@@ -42,6 +42,11 @@ LEVEL = {"perfect": "P", "accept": "A", "bad": "B", "na": "–"}
 _METRICS = None
 
 
+def _trial_key(path: str) -> str:
+    """`cX_runs/<run>/trial_N`: matches run summaries written on other machines (cloud workers) too."""
+    return "/".join(os.path.normpath(path).split(os.sep)[-3:])
+
+
 def run_metrics():
     """trial_dir -> {elapsed_seconds, num_turns, usage} from the run summaries results/c*_<agent>_<model>_<ts>.json."""
     global _METRICS
@@ -55,7 +60,7 @@ def run_metrics():
             for r in d.get("entries", []) if isinstance(d, dict) else []:
                 for t in r.get("trials", []):
                     if t.get("trial_dir"):
-                        _METRICS[os.path.abspath(t["trial_dir"])] = t
+                        _METRICS[_trial_key(t["trial_dir"])] = t
     return _METRICS
 
 
@@ -105,7 +110,7 @@ def load(category, since, until="99999999_999999"):
                      no_code=(diff == 0 and not patch), trial_dir=os.path.relpath(t, XHS))
             if q["no_code"]:  # rubric: no code change -> "na", excluded from D2 (the judge sometimes says "bad")
                 q["quality_score"] = None
-            mt = run_metrics().get(os.path.abspath(t), {})
+            mt = run_metrics().get(_trial_key(t), {})
             usage = mt.get("usage") or {}
             calls, step_toks = trajectory_stats(t + "/trajectory.jsonl")
             q.update(elapsed=mt.get("elapsed_seconds"), turns=mt.get("num_turns"), tool_calls=calls,

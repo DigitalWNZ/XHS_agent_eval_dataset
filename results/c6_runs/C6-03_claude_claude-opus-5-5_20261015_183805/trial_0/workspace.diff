@@ -1,0 +1,127 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""Detect hurdle jump takeoff and landing frames in a fixed-camera video.
++
++Approach: background subtraction against the first (empty) frame, then track
++the lowest foreground point (the athlete's feet) in every frame. A frame is
++"grounded" when the feet are near the track level. The flight phase that
++carries the athlete across the hurdle gives the takeoff (last grounded frame
++before it) and the landing (first grounded frame after it).
++"""
++import sys
++
++import cv2
++import numpy as np
++
++try:
++    import toml
++except ImportError:  # minimal fallback writer for flat integer tables
++    toml = None
++
++HURDLE_X = 490          # x position of the hurdle in the fixed camera view
++DIFF_THRESH = 60        # summed BGR abs difference to count as foreground
++MIN_AREA = 300          # minimum blob area to keep
++GROUND_TOL = 10         # px above ground level still considered "on ground"
++OUTPUT_PATH = "/app/output.toml"
++
++
++def read_frames(path):
++    cap = cv2.VideoCapture(path)
++    frames = []
++    while True:
++        ok, frame = cap.read()
++        if not ok:
++            break
++        frames.append(frame)
++    cap.release()
++    return frames
++
++
++def analyze_frames(frames):
++    bg = cv2.GaussianBlur(frames[0], (5, 5), 0).astype(np.int16)
++    kernel = np.ones((5, 5), np.uint8)
++    info = []  # per frame: (bottom_y, bottom_x, center_x) or None
++    for f in frames:
++        g = cv2.GaussianBlur(f, (5, 5), 0).astype(np.int16)
++        mask = (np.abs(g - bg).sum(axis=2) > DIFF_THRESH).astype(np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
++        n, labels, stats, cents = cv2.connectedComponentsWithStats(mask)
++        keep = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= MIN_AREA]
++        total = sum(stats[i, cv2.CC_STAT_AREA] for i in keep)
++        if not keep or total < 1500:
++            info.append(None)
++            continue
++        # Restrict to blobs near the main body (largest blob) to reject noise.
++        main = max(keep, key=lambda i: stats[i, cv2.CC_STAT_AREA])
++        mx = cents[main][0]
++        keep = [i for i in keep if abs(cents[i][0] - mx) < 200]
++        sel = np.isin(labels, keep)
++        ys, xs = np.nonzero(sel)
++        by = ys.max()
++        bx = int(np.median(xs[ys >= by - 3]))
++        info.append((int(by), bx, float(xs.mean())))
++    return info
++
++
++def find_jump(info):
++    present = [i for i, v in enumerate(info) if v is not None]
++    if not present:
++        return 0, 0
++    bottoms = np.array([info[i][0] for i in present])
++    ground = np.percentile(bottoms, 90)
++    grounded = {i: info[i][0] >= ground - GROUND_TOL for i in present}
++
++    # Contiguous runner segment(s); build flight gaps between grounded frames.
++    gnd = [i for i in present if grounded[i]]
++    candidates = []
++    for a, b in zip(gnd, gnd[1:]):
++        if b - a < 2:
++            continue
++        # Make sure the runner is visible throughout the gap.
++        if any(info[k] is None for k in range(a, b + 1)):
++            continue
++        xa, xb = info[a][2], info[b][2]
++        crosses = (xa - HURDLE_X) * (xb - HURDLE_X) <= 0
++        fa, fb = info[a][1], info[b][1]
++        feet_straddle = (fa - HURDLE_X) * (fb - HURDLE_X) < 0
++        candidates.append((crosses or feet_straddle, feet_straddle, b - a, a, b))
++    if not candidates:
++        # Fallback: span of airborne-ish frames around hurdle crossing
++        best = min(present, key=lambda i: abs(info[i][2] - HURDLE_X))
++        return max(best - 4, 0), best + 4
++    candidates.sort(reverse=True)
++    _, _, _, a, b = candidates[0]
++    return a, b
++
++
++def main():
++    path = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    frames = read_frames(path)
++    info = analyze_frames(frames)
++    takeoff, land = find_jump(info)
++    result = {
++        "jump_takeoff_frame_number": int(takeoff),
++        "jump_land_frame_number": int(land),
++    }
++    if toml is not None:
++        text = toml.dumps(result)
++    else:
++        text = "".join(f"{k} = {v}\n" for k, v in result.items())
++    with open(OUTPUT_PATH, "w") as fh:
++        fh.write(text)
++    print(text, end="")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

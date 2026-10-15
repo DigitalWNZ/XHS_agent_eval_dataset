@@ -393,6 +393,7 @@ def load_state(run_id: str) -> dict:
 def cmd_run(a) -> int:
     ents = entries()
     tasks = plan_tasks(a, ents)
+    tasks.sort(key=lambda t: -t["max_run_s"])  # longest first: Batch starts tasks in index order
     base = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     run_id = "xhs-" + base.strftime("%Y%m%d-%H%M%S")
     for i, t in enumerate(tasks):  # unique run timestamps: merged run folders never collide

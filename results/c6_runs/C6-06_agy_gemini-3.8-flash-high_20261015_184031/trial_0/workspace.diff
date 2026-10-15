@@ -1,0 +1,156 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,151 @@
++from __future__ import annotations
++
++import asyncio
++from collections.abc import Awaitable, Callable
++import inspect
++import signal
++import threading
++from typing import Any
++
++__all__ = ["run_tasks"]
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]],
++    max_concurrent: int,
++) -> None:
++    """Run tasks with a maximum concurrency limit, ensuring cleanup runs on cancellation.
++
++    Parameters
++    ----------
++    tasks : list[Callable[[], Awaitable[None]]]
++        List of callables returning awaitables to be run.
++    max_concurrent : int
++        Maximum number of tasks to run concurrently.
++    """
++    if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or max_concurrent < 1:
++        raise ValueError("max_concurrent must be a positive integer greater than or equal to 1")
++
++    if not isinstance(tasks, list):
++        try:
++            tasks = list(tasks)
++        except TypeError:
++            pass
++
++    if not tasks:
++        return
++
++    task_iter = iter(tasks)
++    stop_event = asyncio.Event()
++    worker_tasks: list[asyncio.Task[Any]] = []
++    first_exception: BaseException | None = None
++    interrupted = False
++    interrupt_count = 0
++    cancelled = False
++
++    loop = asyncio.get_running_loop()
++    current_task = asyncio.current_task()
++    old_handler = None
++
++    def sigint_handler(signum: int, frame: Any) -> None:
++        nonlocal interrupted, interrupt_count
++        interrupted = True
++        interrupt_count += 1
++        stop_event.set()
++
++        if interrupt_count == 1:
++            if current_task is not None and not current_task.done():
++                current_task.cancel()
++                try:
++                    loop.call_soon_threadsafe(lambda: None)
++                except RuntimeError:
++                    pass
++            return
++
++        # Subsequent interrupt: invoke previous handler or force raise KeyboardInterrupt
++        if callable(old_handler):
++            old_handler(signum, frame)
++        else:
++            raise KeyboardInterrupt()
++
++    if threading.current_thread() is threading.main_thread():
++        try:
++            old_handler = signal.signal(signal.SIGINT, sigint_handler)
++        except (ValueError, AttributeError):
++            old_handler = None
++
++    async def worker() -> None:
++        nonlocal first_exception
++        worker_task = asyncio.current_task()
++
++        while not stop_event.is_set():
++            if worker_task is not None and worker_task.cancelling() > 0:
++                break
++
++            try:
++                item = next(task_iter)
++            except StopIteration:
++                break
++
++            try:
++                if callable(item):
++                    coro = item()
++                elif inspect.isawaitable(item):
++                    coro = item
++                else:
++                    raise TypeError(f"Task must be callable or awaitable, got {type(item).__name__}")
++
++                if inspect.isawaitable(coro):
++                    await coro
++            except BaseException as exc:
++                if first_exception is None and not isinstance(exc, asyncio.CancelledError):
++                    first_exception = exc
++                stop_event.set()
++
++                # Cancel other active workers
++                for w in worker_tasks:
++                    if w is not worker_task and not w.cancelling() and not w.done():
++                        w.cancel()
++
++                # Prevent KeyboardInterrupt/SystemExit from crashing the event loop before cleanup
++                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
++                    return
++                raise
++
++    try:
++        num_workers = min(max_concurrent, len(tasks))
++        for _ in range(num_workers):
++            worker_tasks.append(asyncio.create_task(worker()))
++
++        while any(not w.done() for w in worker_tasks):
++            try:
++                await asyncio.wait(worker_tasks)
++            except (asyncio.CancelledError, KeyboardInterrupt) as exc:
++                if isinstance(exc, KeyboardInterrupt):
++                    interrupted = True
++                else:
++                    cancelled = True
++                stop_event.set()
++                for w in worker_tasks:
++                    if not w.cancelling() and not w.done():
++                        w.cancel()
++    finally:
++        if old_handler is not None:
++            try:
++                signal.signal(signal.SIGINT, old_handler)
++            except (ValueError, AttributeError):
++                pass
++
++        # Retrieve exceptions on worker tasks to avoid 'Task exception was never retrieved' warnings
++        for w in worker_tasks:
++            if not w.cancelled():
++                w.exception()
++
++    if interrupted or isinstance(first_exception, KeyboardInterrupt):
++        raise KeyboardInterrupt()
++    if isinstance(first_exception, SystemExit):
++        raise first_exception
++    if first_exception is not None:
++        raise first_exception
++    if cancelled or (current_task is not None and current_task.cancelling() > 0):
++        raise asyncio.CancelledError()

@@ -1,0 +1,388 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,383 @@
++#!/usr/bin/env python3
++import sys
++import re
++import html
++
++def remove_script_tags(html_str):
++    """
++    Remove all <script>...</script> tags, including self-closing and unclosed tags,
++    preserving all other HTML content and structure.
++    Repeats until no script tags remain to handle nested bypass attempts.
++    """
++    old_html = None
++    while old_html != html_str:
++        old_html = html_str
++        pos = 0
++        new_chars = []
++        while pos < len(html_str):
++            m = re.search(r'<\s*script(?=[\s/>]|$)', html_str[pos:], re.IGNORECASE)
++            if not m:
++                new_chars.append(html_str[pos:])
++                break
++                
++            start_script = pos + m.start()
++            new_chars.append(html_str[pos:start_script])
++            
++            # Find the end of the opening <script ...> tag
++            i = start_script + len(m.group(0))
++            quote = None
++            is_self_closing = False
++            tag_end = len(html_str)
++            while i < len(html_str):
++                ch = html_str[i]
++                if quote:
++                    if ch == quote:
++                        quote = None
++                else:
++                    if ch in ('"', "'", "`"):
++                        quote = ch
++                    elif ch == '>':
++                        if i > 0 and html_str[i-1] == '/':
++                            is_self_closing = True
++                        tag_end = i + 1
++                        break
++                i += 1
++            else:
++                tag_end = len(html_str)
++                pos = tag_end
++                break
++                
++            if is_self_closing:
++                pos = tag_end
++                continue
++                
++            # Find matching closing </script\s*>
++            close_m = re.search(r'<\s*/\s*script\s*>', html_str[tag_end:], re.IGNORECASE)
++            if close_m:
++                pos = tag_end + close_m.end()
++            else:
++                # Unclosed script tag consumes until EOF
++                pos = len(html_str)
++                break
++                
++        html_str = "".join(new_chars)
++        
++    return html_str
++
++def find_tag_end(html_str, start_pos):
++    """
++    Finds the closing '>' of an HTML tag, ignoring '>' inside quotes.
++    """
++    i = start_pos
++    quote = None
++    while i < len(html_str):
++        ch = html_str[i]
++        if quote:
++            if ch == quote:
++                quote = None
++        else:
++            if ch in ('"', "'", "`"):
++                quote = ch
++            elif ch == '>':
++                return i + 1
++        i += 1
++    return len(html_str)
++
++def is_dangerous_url(val):
++    """
++    Checks if a URL attribute value executes JavaScript.
++    Handles entity decoding, control chars, null bytes, and data: URIs.
++    """
++    if not val:
++        return False
++    # Clean null entities
++    s = re.sub(r'&#0+;?|&#[xX]0+;|&#[xX]0+(?![0-9a-fA-F])', '', val)
++    s = html.unescape(s)
++    s = html.unescape(s)
++    s = re.sub(r'[\x00\ufffd]', '', s)
++    
++    colon_idx = s.find(':')
++    if colon_idx != -1:
++        scheme_raw = s[:colon_idx]
++        scheme = re.sub(r'[\s\x00-\x20\\]', '', scheme_raw).lower()
++        if scheme in ('javascript', 'vbscript', 'livescript'):
++            return True
++        if scheme == 'data':
++            data_content = s[colon_idx + 1:].lower()
++            if 'text/html' in data_content or 'script' in data_content or 'image/svg' in data_content:
++                return True
++            if 'base64' in data_content:
++                try:
++                    import base64
++                    b64_part = data_content.split('base64', 1)[1].lstrip(',;: \t\r\n')
++                    decoded_b64 = base64.b64decode(b64_part + '===').decode('latin1', errors='ignore').lower()
++                    if 'script' in decoded_b64 or 'javascript:' in decoded_b64:
++                        return True
++                except Exception:
++                    pass
++    return False
++
++def is_dangerous_style(val):
++    """
++    Checks if a CSS style attribute contains JavaScript expressions or URLs.
++    """
++    if not val:
++        return False
++    s = html.unescape(val)
++    s = re.sub(r'[\x00\ufffd]', '', s)
++    s_cleaned = re.sub(r'[\s\x00-\x20\\]', '', s)
++    if re.search(r'javascript\s*:', s_cleaned, re.IGNORECASE):
++        return True
++    if re.search(r'expression\s*\(', s, re.IGNORECASE):
++        return True
++    if re.search(r'behavior\s*:', s, re.IGNORECASE):
++        return True
++    if re.search(r'-moz-binding\s*:', s, re.IGNORECASE):
++        return True
++    return False
++
++def is_dangerous(tag_name, attr_name, val, has_val):
++    """
++    Determines if an attribute is dangerous and must be removed.
++    """
++    attr_lower = attr_name.lower()
++    
++    # Event handlers: on*
++    if re.match(r"^on[a-zA-Z_]", attr_lower):
++        return True
++    
++    # Actionable URL attributes
++    url_attrs = {
++        'href', 'src', 'action', 'formaction', 'data', 'codebase',
++        'poster', 'background', 'xlink:href', 'usemap', 'longdesc',
++        'cite', 'profile', 'icon', 'manifest', 'archive', 'ping',
++        'values', 'to', 'from', 'dynsrc', 'lowsrc'
++    }
++    
++    if attr_lower in url_attrs:
++        if is_dangerous_url(val):
++            return True
++            
++    # For <param name="src" value="..."> or similar in <object>
++    if tag_name == 'param' and attr_lower == 'value':
++        if is_dangerous_url(val):
++            return True
++            
++    # Inline style
++    if attr_lower == 'style':
++        if is_dangerous_style(val):
++            return True
++            
++    # <meta http-equiv="refresh" content="...">
++    if tag_name == 'meta' and attr_lower == 'content':
++        # Refresh attacks: url=javascript:... or ;javascript:...
++        if re.search(r'url\s*=\s*[\'"`]?\s*javascript\s*:|^\s*javascript\s*:|;\s*javascript\s*:', val, re.IGNORECASE):
++            return True
++            
++    # iframe srcdoc
++    if attr_lower == 'srcdoc':
++        if re.search(r'<\s*script|javascript\s*:|on[a-zA-Z]+\s*=', val, re.IGNORECASE):
++            return True
++            
++    return False
++
++def tokenize_and_filter_tag(tag_str, is_dangerous_attr_fn):
++    """
++    Parses attributes of an HTML tag, filtering out dangerous attributes
++    while preserving non-dangerous attributes and original formatting.
++    """
++    m = re.match(r"^<([a-zA-Z0-9:-]+)", tag_str)
++    if not m:
++        return tag_str
++    
++    tag_name = m.group(1).lower()
++    prefix = m.group(0)
++    
++    trail_m = re.search(r"(\s*/?>)$", tag_str)
++    if not trail_m:
++        return tag_str
++    
++    suffix = trail_m.group(1)
++    body = tag_str[len(prefix):-len(suffix)]
++    
++    pos = 0
++    new_body_pieces = []
++    
++    while pos < len(body):
++        # 1. Leading whitespace / slashes
++        ws_start = pos
++        while pos < len(body) and body[pos] in " \t\r\n\x0c/":
++            pos += 1
++        leading_ws = body[ws_start:pos]
++        
++        if pos >= len(body):
++            new_body_pieces.append(leading_ws)
++            break
++            
++        # 2. Check for unexpected characters
++        if body[pos] in "\"'`>=/":
++            new_body_pieces.append(leading_ws + body[pos])
++            pos += 1
++            continue
++            
++        # 3. Attribute name
++        name_start = pos
++        while pos < len(body) and body[pos] not in " \t\r\n\x0c\"'`>=/":
++            pos += 1
++        attr_name = body[name_start:pos]
++        
++        # 4. Optional whitespace after name
++        ws2_start = pos
++        while pos < len(body) and body[pos] in " \t\r\n\x0c":
++            pos += 1
++            
++        # 5. Optional '=' and value
++        val = ""
++        has_val = False
++        
++        if pos < len(body) and body[pos] == '=':
++            has_val = True
++            pos += 1 # skip '='
++            while pos < len(body) and body[pos] in " \t\r\n\x0c":
++                pos += 1
++                
++            if pos < len(body):
++                quote_char = body[pos]
++                if quote_char in ('"', "'", "`"):
++                    pos += 1 # skip opening quote
++                    val_start = pos
++                    while pos < len(body) and body[pos] != quote_char:
++                        pos += 1
++                    val = body[val_start:pos]
++                    if pos < len(body) and body[pos] == quote_char:
++                        pos += 1 # skip closing quote
++                else:
++                    val_start = pos
++                    while pos < len(body) and body[pos] not in " \t\r\n\x0c>":
++                        pos += 1
++                    val = body[val_start:pos]
++        else:
++            pos = ws2_start
++            
++        attr_full_text = body[ws_start:pos]
++        
++        if is_dangerous_attr_fn(tag_name, attr_name, val, has_val):
++            # Drop dangerous attribute
++            pass
++        else:
++            new_body_pieces.append(attr_full_text)
++            
++    return prefix + "".join(new_body_pieces) + suffix
++
++def filter_all_tags(html_str):
++    """
++    Scans the HTML document, processing all tags while preserving
++    comments, DOCTYPE, CDATA, closing tags, and text content verbatim.
++    """
++    pos = 0
++    result = []
++    
++    while pos < len(html_str):
++        lt_idx = html_str.find('<', pos)
++        if lt_idx == -1:
++            result.append(html_str[pos:])
++            break
++            
++        result.append(html_str[pos:lt_idx])
++        pos = lt_idx
++        
++        # Comments
++        if html_str.startswith('<!--', pos):
++            end_comment = html_str.find('-->', pos + 4)
++            if end_comment != -1:
++                result.append(html_str[pos:end_comment + 3])
++                pos = end_comment + 3
++            else:
++                end_comment = html_str.find('--!>', pos + 4)
++                if end_comment != -1:
++                    result.append(html_str[pos:end_comment + 4])
++                    pos = end_comment + 4
++                else:
++                    result.append(html_str[pos:])
++                    pos = len(html_str)
++            continue
++            
++        # CDATA
++        if html_str.startswith('<![CDATA[', pos):
++            end_cdata = html_str.find(']]>', pos + 9)
++            if end_cdata != -1:
++                result.append(html_str[pos:end_cdata + 3])
++                pos = end_cdata + 3
++            else:
++                result.append(html_str[pos:])
++                pos = len(html_str)
++            continue
++            
++        # DOCTYPE / Declarations
++        if html_str.startswith('<!', pos):
++            end_decl = find_tag_end(html_str, pos)
++            result.append(html_str[pos:end_decl])
++            pos = end_decl
++            continue
++            
++        # Processing instructions
++        if html_str.startswith('<?', pos):
++            end_pi = html_str.find('?>', pos + 2)
++            if end_pi != -1:
++                result.append(html_str[pos:end_pi + 2])
++                pos = end_pi + 2
++            else:
++                result.append(html_str[pos:])
++                pos = len(html_str)
++            continue
++            
++        # Closing tags
++        if html_str.startswith('</', pos):
++            end_close = find_tag_end(html_str, pos)
++            result.append(html_str[pos:end_close])
++            pos = end_close
++            continue
++            
++        # Opening / self-closing tags
++        m_tag = re.match(r'^<([a-zA-Z0-9:-]+)', html_str[pos:])
++        if m_tag:
++            tag_end = find_tag_end(html_str, pos)
++            tag_str = html_str[pos:tag_end]
++            filtered_tag = tokenize_and_filter_tag(tag_str, is_dangerous)
++            result.append(filtered_tag)
++            pos = tag_end
++            continue
++            
++        result.append(html_str[pos])
++        pos += 1
++        
++    return "".join(result)
++
++def sanitize_html(html_str):
++    """
++    Repeatedly cleans script tags and dangerous attributes until fixed point.
++    """
++    while True:
++        new_html = remove_script_tags(html_str)
++        new_html = filter_all_tags(new_html)
++        if new_html == html_str:
++            break
++        html_str = new_html
++    return html_str
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: python filter.py <html_file>", file=sys.stderr)
++        sys.exit(1)
++        
++    filepath = sys.argv[1]
++    with open(filepath, 'r', encoding='utf-8', errors='surrogateescape', newline='') as f:
++        content = f.read()
++        
++    filtered = sanitize_html(content)
++    
++    with open(filepath, 'w', encoding='utf-8', errors='surrogateescape', newline='') as f:
++        f.write(filtered)
++
++if __name__ == '__main__':
++    main()

@@ -1,0 +1,305 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,300 @@
++#!/usr/bin/env python3
++import sys
++import re
++import html
++import os
++
++DANGEROUS_SCHEMES = (
++    'javascript:',
++    'vbscript:',
++    'data:text/html',
++    'data:text/javascript',
++    'data:application/javascript',
++    'data:image/svg+xml',
++)
++
++def find_tag_end(s, start_pos):
++    i = start_pos
++    n = len(s)
++    in_quote = None
++    while i < n:
++        c = s[i]
++        if in_quote:
++            if c == in_quote:
++                in_quote = None
++        else:
++            if c in ('"', "'"):
++                in_quote = c
++            elif c == '>':
++                return i + 1
++        i += 1
++    return n
++
++def remove_script_tags(html_text):
++    # Rerun script tag removal until fixed point to handle nested script tags
++    prev = None
++    while prev != html_text:
++        prev = html_text
++        
++        # 1. Standard <script...> ... </script>
++        pattern = re.compile(r'<script[\s/>]', re.IGNORECASE)
++        match = pattern.search(html_text)
++        if match:
++            start_pos = match.start()
++            tag_end = find_tag_end(html_text, start_pos)
++            
++            start_tag_content = html_text[start_pos:tag_end]
++            if start_tag_content.rstrip().endswith('/>'):
++                html_text = html_text[:start_pos] + html_text[tag_end:]
++                continue
++                
++            end_script_pattern = re.compile(r'</script\s*>', re.IGNORECASE)
++            end_match = end_script_pattern.search(html_text, tag_end)
++            if end_match:
++                end_pos = end_match.end()
++            else:
++                end_pos = len(html_text)
++                
++            html_text = html_text[:start_pos] + html_text[end_pos:]
++            continue
++
++        # 2. Catch any unclosed or malformed <script...
++        html_text = re.sub(r'<script\b[^>]*$', '', html_text, flags=re.IGNORECASE | re.DOTALL)
++        
++    return html_text
++
++def clean_css_expression(css_text):
++    pos = 0
++    pattern = re.compile(r'expression\s*\(', re.IGNORECASE)
++    while True:
++        m = pattern.search(css_text, pos)
++        if not m:
++            break
++        start_idx = m.start()
++        paren_depth = 1
++        curr = m.end()
++        n = len(css_text)
++        while curr < n and paren_depth > 0:
++            if css_text[curr] == '(':
++                paren_depth += 1
++            elif css_text[curr] == ')':
++                paren_depth -= 1
++            curr += 1
++        css_text = css_text[:start_idx] + 'none' + css_text[curr:]
++        pos = start_idx + 4
++    return css_text
++
++def clean_css_urls(css_text):
++    def replace_url(match):
++        full_match = match.group(0)
++        inner = match.group(1).strip()
++        if (inner.startswith('"') and inner.endswith('"')) or (inner.startswith("'") and inner.endswith("'")):
++            inner = inner[1:-1].strip()
++        
++        unescaped = html.unescape(inner)
++        clean_val = re.sub(r'[\s\x00-\x1f]', '', unescaped).lower()
++        for scheme in DANGEROUS_SCHEMES:
++            if clean_val.startswith(scheme):
++                return 'none'
++        return full_match
++
++    url_pat = re.compile(r'url\s*\(\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^\)]*)\s*\)', re.IGNORECASE)
++    return url_pat.sub(replace_url, css_text)
++
++def clean_style_content(css_text):
++    css_text = clean_css_urls(css_text)
++    css_text = clean_css_expression(css_text)
++    css_text = re.sub(r'-moz-binding\s*:[^;}]*;?', '', css_text, flags=re.IGNORECASE)
++    css_text = re.sub(r'behavior\s*:[^;}]*;?', '', css_text, flags=re.IGNORECASE)
++    return css_text
++
++def is_value_dangerous(raw_val):
++    if not raw_val:
++        return False
++    val = raw_val
++    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
++        val = val[1:-1]
++    unescaped = html.unescape(val)
++    clean_val = re.sub(r'[\s\x00-\x1f]', '', unescaped).lower()
++    for scheme in DANGEROUS_SCHEMES:
++        if clean_val.startswith(scheme) or (';url=' + scheme) in clean_val or ('url=' + scheme) in clean_val:
++            return True
++    return False
++
++def clean_tag_attributes(tag_str):
++    m = re.match(r"^<([a-zA-Z0-9:-]+)(\s.*?)?(/?)>$", tag_str, re.DOTALL)
++    if not m:
++        return tag_str
++    
++    tag_name, attr_body, self_closing = m.group(1), m.group(2), m.group(3)
++    if not attr_body or not attr_body.strip():
++        return tag_str
++    
++    pos = 0
++    n = len(attr_body)
++    new_attr_parts = []
++    
++    while pos < n:
++        ws_start = pos
++        while pos < n and attr_body[pos].isspace():
++            pos += 1
++        ws_str = attr_body[ws_start:pos]
++        
++        if pos >= n:
++            new_attr_parts.append(ws_str)
++            break
++            
++        attr_start = pos
++        while pos < n and not attr_body[pos].isspace() and attr_body[pos] not in ("=", "/", ">"):
++            pos += 1
++        attr_name = attr_body[attr_start:pos]
++        
++        while pos < n and attr_body[pos].isspace():
++            pos += 1
++            
++        attr_val = ""
++        has_eq = False
++        if pos < n and attr_body[pos] == "=":
++            has_eq = True
++            pos += 1
++            while pos < n and attr_body[pos].isspace():
++                pos += 1
++            if pos < n:
++                quote_char = attr_body[pos]
++                if quote_char in ('"', "'"):
++                    val_start = pos
++                    pos += 1
++                    while pos < n and attr_body[pos] != quote_char:
++                        pos += 1
++                    if pos < n:
++                        pos += 1
++                    attr_val = attr_body[val_start:pos]
++                else:
++                    val_start = pos
++                    while pos < n and not attr_body[pos].isspace() and attr_body[pos] not in ("/", ">"):
++                        pos += 1
++                    attr_val = attr_body[val_start:pos]
++        
++        full_attr_str = attr_body[attr_start:pos]
++        
++        is_dangerous = False
++        attr_name_lower = attr_name.lower()
++        
++        # 1. Check event handlers
++        if attr_name_lower.startswith("on") and len(attr_name_lower) > 2:
++            is_dangerous = True
++            
++        # 2. Check dangerous values (URIs)
++        if not is_dangerous and attr_val:
++            if is_value_dangerous(attr_val):
++                is_dangerous = True
++                
++        # 3. Check style attribute
++        if not is_dangerous and attr_name_lower == "style" and attr_val:
++            raw_v = attr_val[1:-1] if (attr_val.startswith('"') or attr_val.startswith("'")) else attr_val
++            cleaned_v = clean_style_content(raw_v)
++            if cleaned_v != raw_v:
++                q = attr_val[0] if attr_val.startswith(('"', "'")) else '"'
++                full_attr_str = f'{attr_name}={q}{cleaned_v}{q}'
++                
++        # 4. Check srcdoc attribute
++        if not is_dangerous and attr_name_lower == "srcdoc" and attr_val:
++            raw_v = attr_val[1:-1] if (attr_val.startswith('"') or attr_val.startswith("'")) else attr_val
++            unescaped = html.unescape(raw_v).lower()
++            if "<script" in unescaped or "javascript:" in unescaped or re.search(r"on\w+\s*=", unescaped):
++                is_dangerous = True
++
++        if not is_dangerous:
++            new_attr_parts.append(ws_str + full_attr_str)
++            
++    return f"<{tag_name}{''.join(new_attr_parts)}{self_closing}>"
++
++def clean_html(html_text):
++    # Step 1: Remove script tags
++    html_text = remove_script_tags(html_text)
++    
++    # Step 2: Parse and clean non-script tags
++    i = 0
++    n = len(html_text)
++    result = []
++    
++    while i < n:
++        if html_text[i] == '<':
++            # Check comment
++            if html_text.startswith('<!--', i):
++                end_comment = html_text.find('-->', i + 4)
++                if end_comment != -1:
++                    comment_str = html_text[i : end_comment + 3]
++                    i = end_comment + 3
++                else:
++                    comment_str = html_text[i:]
++                    i = n
++                result.append(comment_str)
++                continue
++                
++            # Check doctype or declaration
++            if html_text.startswith('<!', i) or html_text.startswith('<?', i):
++                tag_end = find_tag_end(html_text, i)
++                decl_str = html_text[i:tag_end]
++                i = tag_end
++                result.append(decl_str)
++                continue
++                
++            # Check if valid tag (< followed by / or a letter)
++            if i + 1 < n and (html_text[i+1] == '/' or html_text[i+1].isalpha()):
++                tag_end = find_tag_end(html_text, i)
++                tag_str = html_text[i:tag_end]
++                
++                # Extract tag name
++                tag_m = re.match(r'^</?([a-zA-Z0-9:-]+)', tag_str)
++                if tag_m:
++                    tag_name = tag_m.group(1).lower()
++                    
++                    if tag_name == 'style' and not tag_str.startswith('</'):
++                        end_style_pat = re.compile(r'</style\s*>', re.IGNORECASE)
++                        end_style_m = end_style_pat.search(html_text, tag_end)
++                        if end_style_m:
++                            style_content = html_text[tag_end : end_style_m.start()]
++                            cleaned_style_content = clean_style_content(style_content)
++                            end_style_str = html_text[end_style_m.start() : end_style_m.end()]
++                            
++                            cleaned_head_tag = clean_tag_attributes(tag_str)
++                            result.append(cleaned_head_tag + cleaned_style_content + end_style_str)
++                            i = end_style_m.end()
++                            continue
++                        else:
++                            style_content = html_text[tag_end:]
++                            cleaned_style_content = clean_style_content(style_content)
++                            cleaned_head_tag = clean_tag_attributes(tag_str)
++                            result.append(cleaned_head_tag + cleaned_style_content)
++                            i = n
++                            continue
++                    else:
++                        cleaned_tag = clean_tag_attributes(tag_str)
++                        result.append(cleaned_tag)
++                        i = tag_end
++                        continue
++                        
++        result.append(html_text[i])
++        i += 1
++        
++    return "".join(result)
++
++def main():
++    if len(sys.argv) < 2:
++        sys.exit(1)
++        
++    filepath = sys.argv[1]
++    if not os.path.exists(filepath):
++        sys.exit(1)
++        
++    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
++        content = f.read()
++        
++    cleaned = clean_html(content)
++    
++    with open(filepath, 'w', encoding='utf-8') as f:
++        f.write(cleaned)
++
++if __name__ == '__main__':
++    main()

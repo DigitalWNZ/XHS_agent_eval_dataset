@@ -1,0 +1,267 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,262 @@
++#!/usr/bin/env python3
++import sys
++import re
++import html
++
++URL_ATTRIBUTES = {
++    'href', 'src', 'action', 'formaction', 'data', 'poster',
++    'xlink:href', 'background', 'dynsrc', 'lowsrc', 'codebase',
++    'cite', 'manifest', 'longdesc', 'usemap', 'profile', 'icon',
++    'content'
++}
++
++def remove_script_tags(text: str) -> str:
++    """
++    Remove all <script ...> ... </script> tags (case-insensitive)
++    including self-closing and unclosed script tags.
++    Repeat until no script tags remain.
++    """
++    script_pattern = re.compile(r'<script(?=[\s/>]|$)', re.IGNORECASE)
++    
++    while True:
++        match = script_pattern.search(text)
++        if not match:
++            break
++        start_idx = match.start()
++        
++        pos = match.end()
++        in_sq = False
++        in_dq = False
++        open_tag_end = -1
++        is_self_closing = False
++        
++        while pos < len(text):
++            ch = text[pos]
++            if ch == '"' and not in_sq:
++                in_dq = not in_dq
++            elif ch == "'" and not in_dq:
++                in_sq = not in_sq
++            elif not in_sq and not in_dq:
++                if text[pos:pos+2] == '/>':
++                    open_tag_end = pos + 2
++                    is_self_closing = True
++                    break
++                elif ch == '>':
++                    open_tag_end = pos + 1
++                    break
++            pos += 1
++            
++        if open_tag_end == -1:
++            # Unclosed opening tag <script ... till EOF
++            text = text[:start_idx]
++            continue
++            
++        if is_self_closing:
++            end_idx = open_tag_end
++        else:
++            close_pattern = re.compile(r'</script\s*>', re.IGNORECASE)
++            close_match = close_pattern.search(text, open_tag_end)
++            if close_match:
++                end_idx = close_match.end()
++            else:
++                end_idx = len(text)
++                
++        text = text[:start_idx] + text[end_idx:]
++        
++    return text
++
++
++def is_dangerous_attribute(attr_name: str, attr_val: str | None) -> bool:
++    if not attr_name:
++        return False
++        
++    attr_name_clean = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', attr_name).lower()
++    
++    # Rule 1: All on* event handlers (e.g., onclick, onload, onerror)
++    if attr_name_clean.startswith('on'):
++        return True
++        
++    if attr_val is None:
++        return False
++        
++    unescaped_val = html.unescape(attr_val)
++    val_clean = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', unescaped_val).lower()
++    
++    # Rule 2: Protocol check for javascript: / vbscript: / data: (HTML / SVG)
++    if val_clean.startswith('javascript:') or val_clean.startswith('vbscript:'):
++        return True
++    if val_clean.startswith('data:text/html') or val_clean.startswith('data:image/svg+xml'):
++        return True
++        
++    # Rule 3: URL attributes or style attribute containing javascript: / vbscript: / expression(
++    if attr_name_clean in URL_ATTRIBUTES or attr_name_clean == 'style':
++        if 'javascript:' in val_clean or 'vbscript:' in val_clean or 'expression(' in val_clean:
++            return True
++            
++    return False
++
++
++def clean_tag(tag_str: str) -> str:
++    """
++    Parses attributes in tag_str and removes dangerous attributes.
++    Preserves exact tag formatting for everything else.
++    """
++    if not tag_str.startswith('<') or len(tag_str) < 2:
++        return tag_str
++        
++    # Skip comments, doctypes, processing instructions
++    if tag_str.startswith('<!--') or tag_str.startswith('<!') or tag_str.startswith('<?'):
++        return tag_str
++        
++    pos = 1
++    if tag_str[1] == '/':
++        pos = 2
++        
++    tag_name_start = pos
++    while pos < len(tag_str) and tag_str[pos] not in (' ', '\t', '\n', '\r', '\f', '/', '>'):
++        pos += 1
++    tag_name = tag_str[tag_name_start:pos]
++    if not tag_name:
++        return tag_str
++        
++    ranges_to_remove = []
++    
++    while pos < len(tag_str):
++        attr_space_start = pos
++        while pos < len(tag_str) and tag_str[pos] in (' ', '\t', '\n', '\r', '\f'):
++            pos += 1
++            
++        if pos >= len(tag_str) or tag_str[pos] in ('>', '/'):
++            break
++            
++        attr_name_start = pos
++        while pos < len(tag_str) and tag_str[pos] not in (' ', '\t', '\n', '\r', '\f', '=', '>', '/', '"', "'"):
++            pos += 1
++            
++        attr_name = tag_str[attr_name_start:pos]
++        if not attr_name:
++            pos += 1
++            continue
++            
++        eq_pos = pos
++        while eq_pos < len(tag_str) and tag_str[eq_pos] in (' ', '\t', '\n', '\r', '\f'):
++            eq_pos += 1
++            
++        attr_val = None
++        
++        if eq_pos < len(tag_str) and tag_str[eq_pos] == '=':
++            val_space_pos = eq_pos + 1
++            while val_space_pos < len(tag_str) and tag_str[val_space_pos] in (' ', '\t', '\n', '\r', '\f'):
++                val_space_pos += 1
++                
++            if val_space_pos < len(tag_str) and tag_str[val_space_pos] in ('"', "'"):
++                quote_char = tag_str[val_space_pos]
++                val_start = val_space_pos + 1
++                val_end = tag_str.find(quote_char, val_start)
++                if val_end == -1:
++                    val_end = len(tag_str)
++                    attr_end = val_end
++                else:
++                    attr_end = val_end + 1
++                attr_val = tag_str[val_start:val_end]
++                pos = attr_end
++            else:
++                val_start = val_space_pos
++                val_end = val_start
++                while val_end < len(tag_str) and tag_str[val_end] not in (' ', '\t', '\n', '\r', '\f', '>'):
++                    val_end += 1
++                attr_val = tag_str[val_start:val_end]
++                attr_end = val_end
++                pos = attr_end
++        else:
++            pos = eq_pos
++            attr_end = pos
++            
++        if is_dangerous_attribute(attr_name, attr_val):
++            remove_start = attr_space_start if attr_space_start < attr_name_start else attr_name_start
++            ranges_to_remove.append((remove_start, attr_end))
++        elif attr_name.lower() == 'srcdoc' and attr_val:
++            unescaped_srcdoc = html.unescape(attr_val)
++            cleaned_srcdoc = clean_html(unescaped_srcdoc)
++            if cleaned_srcdoc != unescaped_srcdoc:
++                # If srcdoc contained dangerous scripts, mark for removal
++                remove_start = attr_space_start if attr_space_start < attr_name_start else attr_name_start
++                ranges_to_remove.append((remove_start, attr_end))
++
++    res = list(tag_str)
++    for start, end in reversed(ranges_to_remove):
++        res[start:end] = []
++        
++    return "".join(res)
++
++
++def clean_html(text: str) -> str:
++    text = remove_script_tags(text)
++    
++    result = []
++    pos = 0
++    length = len(text)
++    
++    while pos < length:
++        tag_start = text.find('<', pos)
++        if tag_start == -1:
++            result.append(text[pos:])
++            break
++            
++        result.append(text[pos:tag_start])
++        
++        if text.startswith('<!--', tag_start):
++            comment_end = text.find('-->', tag_start + 4)
++            if comment_end == -1:
++                result.append(text[tag_start:])
++                break
++            else:
++                result.append(text[tag_start:comment_end + 3])
++                pos = comment_end + 3
++                continue
++                
++        tag_end = tag_start + 1
++        in_sq = False
++        in_dq = False
++        found_end = False
++        
++        while tag_end < length:
++            ch = text[tag_end]
++            if ch == '"' and not in_sq:
++                in_dq = not in_dq
++            elif ch == "'" and not in_dq:
++                in_sq = not in_sq
++            elif not in_sq and not in_dq and ch == '>':
++                tag_end += 1
++                found_end = True
++                break
++            tag_end += 1
++            
++        if not found_end:
++            tag_str = text[tag_start:]
++            result.append(clean_tag(tag_str))
++            break
++        else:
++            tag_str = text[tag_start:tag_end]
++            result.append(clean_tag(tag_str))
++            pos = tag_end
++            
++    return "".join(result)
++
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: filter.py <path_to_html_file>", file=sys.stderr)
++        sys.exit(1)
++        
++    filepath = sys.argv[1]
++    with open(filepath, 'r', encoding='utf-8', errors='surrogateescape') as f:
++        content = f.read()
++        
++    cleaned = clean_html(content)
++    
++    with open(filepath, 'w', encoding='utf-8', errors='surrogateescape') as f:
++        f.write(cleaned)
++
++if __name__ == '__main__':
++    main()

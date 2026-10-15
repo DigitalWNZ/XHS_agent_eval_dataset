@@ -1,0 +1,168 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,156 @@
++import sys
++import argparse
++import cv2
++import numpy as np
++
++def analyze_video(video_path):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Cannot open video file: {video_path}")
++        
++    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
++    
++    mog2 = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=25, detectShadows=False)
++    
++    raw_detections = []
++    
++    for f in range(total_frames):
++        ret, frame = cap.read()
++        if not ret:
++            break
++        
++        fgmask = mog2.apply(frame)
++        fgmask[:120, :] = 0
++        fgmask[450:, :] = 0
++        
++        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
++        mask_clean = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
++        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
++        
++        cnts, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++        
++        candidates = []
++        for c in cnts:
++            area = cv2.contourArea(c)
++            if area > 350:
++                x, y, w, h = cv2.boundingRect(c)
++                candidates.append({
++                    'contour': c,
++                    'bbox': (x, y, w, h),
++                    'area': area,
++                    'cx': x + w / 2.0,
++                    'cy': y + h / 2.0,
++                    'bot_y': y + h,
++                    'top_y': y
++                })
++        raw_detections.append({'frame': f, 'candidates': candidates})
++        
++    cap.release()
++    
++    tracks = []
++    for f_info in raw_detections:
++        f = f_info['frame']
++        cands = f_info['candidates']
++        cands.sort(key=lambda c: c['area'], reverse=True)
++        
++        matched_track_indices = set()
++        for cand in cands:
++            best_track_idx = None
++            best_dist = 130.0
++            
++            for t_idx, track in enumerate(tracks):
++                if t_idx in matched_track_indices:
++                    continue
++                last_state = track['states'][-1]
++                dt = f - last_state['frame']
++                if 1 <= dt <= 4:
++                    if len(track['states']) >= 2:
++                        dt_prev = last_state['frame'] - track['states'][-2]['frame']
++                        vx = (last_state['cx'] - track['states'][-2]['cx']) / float(dt_prev) if dt_prev > 0 else 0.0
++                        vy = (last_state['cy'] - track['states'][-2]['cy']) / float(dt_prev) if dt_prev > 0 else 0.0
++                    else:
++                        vx, vy = 0.0, 0.0
++                    expected_cx = last_state['cx'] + vx * dt
++                    expected_cy = last_state['cy'] + vy * dt
++                    
++                    dist = np.hypot(cand['cx'] - expected_cx, cand['cy'] - expected_cy)
++                    if dist < best_dist:
++                        best_dist = dist
++                        best_track_idx = t_idx
++                        
++            if best_track_idx is not None:
++                tracks[best_track_idx]['states'].append({
++                    'frame': f,
++                    'cx': cand['cx'], 'cy': cand['cy'],
++                    'bot_y': cand['bot_y'], 'top_y': cand['top_y'],
++                    'bbox': cand['bbox'], 'area': cand['area']
++                })
++                matched_track_indices.add(best_track_idx)
++            else:
++                tracks.append({
++                    'states': [{
++                        'frame': f,
++                        'cx': cand['cx'], 'cy': cand['cy'],
++                        'bot_y': cand['bot_y'], 'top_y': cand['top_y'],
++                        'bbox': cand['bbox'], 'area': cand['area']
++                    }]
++                })
++                
++    valid_tracks = [t for t in tracks if len(t['states']) >= 8]
++    if not valid_tracks:
++        raise ValueError("No athlete track found in video")
++        
++    valid_tracks.sort(key=lambda t: (len(t['states']), abs(t['states'][-1]['cx'] - t['states'][0]['cx'])), reverse=True)
++    runner_track = valid_tracks[0]['states']
++    
++    bot_ys = np.array([s['bot_y'] for s in runner_track], dtype=float)
++    frames = np.array([s['frame'] for s in runner_track], dtype=int)
++    
++    ground_y = np.percentile(bot_ys, 85)
++    elevations = ground_y - bot_ys
++    
++    smooth_elevations = np.copy(elevations)
++    for i in range(1, len(elevations) - 1):
++        smooth_elevations[i] = np.median(elevations[i-1:i+2])
++        
++    peak_idx = int(np.argmax(smooth_elevations))
++    peak_elev = elevations[peak_idx]
++    
++    thresh_elev = max(10.0, min(18.0, 0.12 * peak_elev))
++    
++    takeoff_idx = peak_idx
++    while takeoff_idx > 0 and elevations[takeoff_idx] > thresh_elev:
++        takeoff_idx -= 1
++    takeoff_frame = int(frames[takeoff_idx])
++    
++    land_idx = peak_idx
++    while land_idx < len(runner_track) - 1 and elevations[land_idx] > thresh_elev:
++        land_idx += 1
++    land_frame = int(frames[land_idx])
++    
++    return takeoff_frame, land_frame
++
++def main():
++    parser = argparse.ArgumentParser(description="Analyze hurdle jump video and extract takeoff and landing frame numbers.")
++    parser.add_argument("video_positional", nargs="?", default=None, help="Input MP4 video file path")
++    parser.add_argument("-v", "--video", "--input", "-i", dest="video_optional", default=None, help="Input MP4 video file path")
++    parser.add_argument("-o", "--output", dest="output_path", default="/app/output.toml", help="Output TOML file path")
++    
++    args = parser.parse_args()
++    
++    video_path = args.video_optional or args.video_positional or "/app/example_video.mp4"
++    output_path = args.output_path
++    
++    takeoff_frame, land_frame = analyze_video(video_path)
++    
++    toml_content = f"jump_takeoff_frame_number = {takeoff_frame}\njump_land_frame_number = {land_frame}\n"
++    
++    with open(output_path, "w", encoding="utf-8") as f:
++        f.write(toml_content)
++        
++    print(f"Successfully processed {video_path}")
++    print(f"Written output to {output_path}:")
++    print(toml_content.strip())
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

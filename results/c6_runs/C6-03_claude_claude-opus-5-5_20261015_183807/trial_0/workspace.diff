@@ -1,0 +1,143 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""Detect hurdle jump takeoff and landing frames in an MP4 video.
++
++Usage: python3 jump_analyzer.py <video.mp4> [output.toml]
++"""
++import sys
++
++import cv2
++import numpy as np
++
++try:
++    import toml
++except ImportError:  # fall back to writing the two integer fields by hand
++    toml = None
++
++HURDLE_X = 495          # approximate x of the hurdle in the fixed camera view
++DIFF_THRESH = 40
++MIN_AREA = 2500
++BORDER = 3
++
++
++def read_frames(path):
++    cap = cv2.VideoCapture(path)
++    frames = []
++    while True:
++        ok, f = cap.read()
++        if not ok:
++            break
++        frames.append(cv2.GaussianBlur(f, (5, 5), 0).astype(np.float32))
++    cap.release()
++    return frames
++
++
++def build_background(frames):
++    step = max(1, len(frames) // 60)
++    sample = np.stack(frames[::step])
++    bg = np.median(sample, axis=0)
++    return bg
++
++
++def detect(frames, bg):
++    """Return per-frame (bottom_y, center_x, valid) for the athlete blob."""
++    h, w = bg.shape[:2]
++    bg_med = np.median(bg.reshape(-1, 3), 0)
++    k_open = np.ones((3, 3), np.uint8)
++    k_close = np.ones((9, 9), np.uint8)
++    out = []
++    for f in frames:
++        gain = bg_med / np.maximum(np.median(f.reshape(-1, 3), 0), 1.0)
++        d = np.abs(f * gain - bg).max(axis=2)
++        m = (d > DIFF_THRESH).astype(np.uint8)
++        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open)
++        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_close)
++        n, _, st, cen = cv2.connectedComponentsWithStats(m)
++        if n <= 1:
++            out.append((None, None, False))
++            continue
++        k = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
++        x, y, bw, bh, area = st[k]
++        valid = (area >= MIN_AREA and bh >= 80 and x > BORDER
++                 and x + bw < w - BORDER and y + bh < h - BORDER)
++        out.append((int(y + bh), float(cen[k][0]), bool(valid)))
++    return out
++
++
++def find_jump(det):
++    idx = [i for i, d in enumerate(det) if d[2]]
++    if len(idx) < 3:
++        n = len(det)
++        return max(0, n // 2 - 4), min(n - 1, n // 2 + 4)
++    bottoms = np.array([det[i][0] for i in idx], dtype=float)
++    # ground level: median foot position among frames near the lowest envelope
++    top = np.percentile(bottoms, 90)
++    ground = np.median(bottoms[bottoms >= top - 60])
++    thresh = ground - 20.0
++    air = {i: det[i][0] < thresh for i in idx}
++
++    # runs of consecutive valid airborne frames
++    runs = []
++    cur = []
++    for i in idx:
++        if air[i] and (not cur or i == cur[-1] + 1):
++            cur.append(i)
++        else:
++            if cur:
++                runs.append(cur)
++            cur = [i] if air[i] else []
++    if cur:
++        runs.append(cur)
++    if not runs:
++        i = idx[int(np.argmin(bottoms))]
++        return max(0, i - 1), i + 1
++
++    def score(run):
++        xs = [det[i][1] for i in run]
++        lo, hi = min(xs), max(xs)
++        crosses = lo - 60 <= HURDLE_X <= hi + 60
++        dist = 0 if crosses else min(abs(lo - HURDLE_X), abs(hi - HURDLE_X))
++        depth = ground - min(det[i][0] for i in run)
++        return (crosses, len(run), depth, -dist)
++
++    best = max(runs, key=score)
++    takeoff = best[0] - 1
++    land = best[-1] + 1
++    return max(0, takeoff), min(len(det) - 1, land)
++
++
++def main():
++    video = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    out_path = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++    frames = read_frames(video)
++    if not frames:
++        raise SystemExit("could not read video: %s" % video)
++    bg = build_background(frames)
++    det = detect(frames, bg)
++    takeoff, land = find_jump(det)
++    result = {
++        "jump_takeoff_frame_number": int(takeoff),
++        "jump_land_frame_number": int(land),
++    }
++    if toml is not None:
++        text = toml.dumps(result)
++    else:
++        text = "".join("%s = %d\n" % kv for kv in result.items())
++    with open(out_path, "w") as fh:
++        fh.write(text)
++    print(text, end="")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 61

@@ -1,0 +1,434 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,63 @@
++import asyncio
++from collections.abc import Awaitable, Callable
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]],
++    max_concurrent: int,
++) -> None:
++    """
++    Runs a list of async task functions with at most max_concurrent running concurrently.
++    If interrupted or cancelled, ensures running tasks get a chance to run cleanup.
++    """
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be greater than 0")
++
++    tasks_list = list(tasks)
++    if not tasks_list:
++        return
++
++    queue: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue()
++    for task_fn in tasks_list:
++        queue.put_nowait(task_fn)
++
++    stop_workers = False
++    first_exception: BaseException | None = None
++
++    async def worker_loop() -> None:
++        nonlocal stop_workers, first_exception
++        while not stop_workers:
++            try:
++                task_fn = queue.get_nowait()
++            except asyncio.QueueEmpty:
++                break
++
++            try:
++                res = task_fn()
++                await res
++            except BaseException as exc:
++                if first_exception is None:
++                    first_exception = exc
++                stop_workers = True
++                raise
++
++    num_workers = int(min(max_concurrent, len(tasks_list)))
++    worker_tasks = [asyncio.create_task(worker_loop()) for _ in range(num_workers)]
++
++    try:
++        await asyncio.gather(*worker_tasks)
++    except BaseException as exc:
++        stop_workers = True
++        if first_exception is None:
++            first_exception = exc
++
++        for wt in worker_tasks:
++            if not wt.done():
++                wt.cancel()
++
++        try:
++            await asyncio.shield(asyncio.gather(*worker_tasks, return_exceptions=True))
++        except asyncio.CancelledError:
++            await asyncio.gather(*worker_tasks, return_exceptions=True)
++
++        if first_exception is not None:
++            raise first_exception
+diff --git a/scratch/test_run.py b/scratch/test_run.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_run.py
+@@ -0,0 +1,124 @@
++import asyncio
++import time
++from typing import Callable, Awaitable
++
++async def run_tasks(tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int) -> None:
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be positive")
++    if not tasks:
++        return
++
++    queue: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue()
++    for t in tasks:
++        queue.put_nowait(t)
++
++    stop_workers = False
++    first_exception: BaseException | None = None
++
++    async def worker():
++        nonlocal stop_workers, first_exception
++        while not stop_workers:
++            try:
++                task_fn = queue.get_nowait()
++            except asyncio.QueueEmpty:
++                break
++
++            try:
++                await task_fn()
++            except BaseException as exc:
++                if first_exception is None:
++                    first_exception = exc
++                stop_workers = True
++                raise
++
++    num_workers = min(max_concurrent, len(tasks))
++    worker_tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
++
++    try:
++        await asyncio.gather(*worker_tasks)
++    except BaseException as exc:
++        stop_workers = True
++        if first_exception is None:
++            first_exception = exc
++
++        for wt in worker_tasks:
++            if not wt.done():
++                wt.cancel()
++
++        try:
++            await asyncio.shield(asyncio.gather(*worker_tasks, return_exceptions=True))
++        except asyncio.CancelledError:
++            await asyncio.gather(*worker_tasks, return_exceptions=True)
++
++        raise first_exception
++
++async def test_async_cleanup_on_cancel():
++    cleanup_run = []
++
++    async def worker(id):
++        try:
++            await asyncio.sleep(10)
++        finally:
++            print(f"Task {id} starting async cleanup")
++            await asyncio.sleep(0.1)
++            print(f"Task {id} finished async cleanup")
++            cleanup_run.append(id)
++
++    tasks = [lambda i=i: worker(i) for i in range(3)]
++    t = asyncio.create_task(run_tasks(tasks, 2))
++    await asyncio.sleep(0.05)
++    t.cancel()
++    try:
++        await t
++    except asyncio.CancelledError:
++        print("Caught CancelledError as expected")
++
++    assert len(cleanup_run) == 2, f"Expected 2 cleanups, got {len(cleanup_run)}: {cleanup_run}"
++    print(f"Async cleanup test passed! cleanups={cleanup_run}")
++
++async def test_exception_in_task():
++    cleanup_run = []
++
++    async def worker_bad():
++        await asyncio.sleep(0.05)
++        raise RuntimeError("Task failed")
++
++    async def worker_good(id):
++        try:
++            await asyncio.sleep(10)
++        finally:
++            cleanup_run.append(id)
++
++    tasks = [worker_bad] + [lambda i=i: worker_good(i) for i in range(2)]
++    try:
++        await run_tasks(tasks, 2)
++        assert False, "Should have raised RuntimeError"
++    except RuntimeError as e:
++        assert str(e) == "Task failed"
++        print("Caught task exception as expected")
++
++    assert len(cleanup_run) == 1, f"Expected 1 cleanup, got {len(cleanup_run)}: {cleanup_run}"
++    print(f"Exception in task test passed! cleanups={cleanup_run}")
++
++async def test_sync_exception_in_task_fn():
++    def bad_task_fn():
++        raise ValueError("Sync error during task creation")
++
++    async def good_task(id):
++        await asyncio.sleep(0.01)
++
++    tasks = [bad_task_fn, lambda: good_task(1)]
++    try:
++        await run_tasks(tasks, 2)
++        assert False, "Should have raised ValueError"
++    except ValueError as e:
++        assert str(e) == "Sync error during task creation"
++        print("Caught sync exception in task_fn as expected")
++
++async def main():
++    await test_async_cleanup_on_cancel()
++    await test_exception_in_task()
++    await test_sync_exception_in_task_fn()
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/scratch/test_sigint.py b/scratch/test_sigint.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_sigint.py
+@@ -0,0 +1,78 @@
++import asyncio
++import signal
++import sys
++import os
++from typing import Callable, Awaitable
++
++async def run_tasks(tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int) -> None:
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be greater than 0")
++
++    tasks_list = list(tasks)
++    if not tasks_list:
++        return
++
++    queue: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue()
++    for t in tasks_list:
++        queue.put_nowait(t)
++
++    stop_workers = False
++    first_exception: BaseException | None = None
++
++    async def worker():
++        nonlocal stop_workers, first_exception
++        while not stop_workers:
++            try:
++                task_fn = queue.get_nowait()
++            except asyncio.QueueEmpty:
++                break
++
++            try:
++                await task_fn()
++            except BaseException as exc:
++                if first_exception is None:
++                    first_exception = exc
++                stop_workers = True
++                raise
++
++    num_workers = int(min(max_concurrent, len(tasks_list)))
++    worker_tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
++
++    try:
++        await asyncio.gather(*worker_tasks)
++    except BaseException as exc:
++        stop_workers = True
++        if first_exception is None:
++            first_exception = exc
++
++        for wt in worker_tasks:
++            if not wt.done():
++                wt.cancel()
++
++        try:
++            await asyncio.shield(asyncio.gather(*worker_tasks, return_exceptions=True))
++        except asyncio.CancelledError:
++            await asyncio.gather(*worker_tasks, return_exceptions=True)
++
++        raise first_exception
++
++async def worker(id):
++    try:
++        print(f"WORKER_{id}_STARTED", flush=True)
++        await asyncio.sleep(10)
++    finally:
++        print(f"WORKER_{id}_CLEANUP_STARTED", flush=True)
++        await asyncio.sleep(0.1)
++        print(f"WORKER_{id}_CLEANUP_FINISHED", flush=True)
++
++async def main():
++    tasks = [lambda i=i: worker(i) for i in range(4)]
++    try:
++        await run_tasks(tasks, 2)
++    except KeyboardInterrupt:
++        print("MAIN_CAUGHT_KEYBOARD_INTERRUPT", flush=True)
++    except asyncio.CancelledError:
++        print("MAIN_CAUGHT_CANCELLED_ERROR", flush=True)
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/scratch/test_suite.py b/scratch/test_suite.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_suite.py
+@@ -0,0 +1,149 @@
++import asyncio
++import os
++import signal
++import sys
++from run import run_tasks
++
++async def test_import_and_basic():
++    print("Running test_import_and_basic...")
++    results = []
++
++    async def make_task(id):
++        await asyncio.sleep(0.01)
++        results.append(id)
++
++    tasks = [lambda i=i: make_task(i) for i in range(5)]
++    await run_tasks(tasks, 2)
++    assert len(results) == 5, f"Expected 5 results, got {len(results)}"
++    assert sorted(results) == [0, 1, 2, 3, 4]
++    print("PASSED: test_import_and_basic")
++
++async def test_empty_tasks():
++    print("Running test_empty_tasks...")
++    await run_tasks([], 5)
++    print("PASSED: test_empty_tasks")
++
++async def test_invalid_max_concurrent():
++    print("Running test_invalid_max_concurrent...")
++    try:
++        await run_tasks([lambda: asyncio.sleep(0)], 0)
++        assert False, "Should have raised ValueError for max_concurrent=0"
++    except ValueError:
++        pass
++
++    try:
++        await run_tasks([lambda: asyncio.sleep(0)], -2)
++        assert False, "Should have raised ValueError for max_concurrent=-2"
++    except ValueError:
++        pass
++    print("PASSED: test_invalid_max_concurrent")
++
++async def test_concurrency_limit():
++    print("Running test_concurrency_limit...")
++    current_concurrent = 0
++    max_observed_concurrent = 0
++    lock = asyncio.Lock()
++
++    async def worker(i):
++        nonlocal current_concurrent, max_observed_concurrent
++        async with lock:
++            current_concurrent += 1
++            if current_concurrent > max_observed_concurrent:
++                max_observed_concurrent = current_concurrent
++        await asyncio.sleep(0.05)
++        async with lock:
++            current_concurrent -= 1
++
++    tasks = [lambda i=i: worker(i) for i in range(20)]
++    await run_tasks(tasks, 3)
++    assert max_observed_concurrent <= 3, f"Max concurrent exceeded limit: {max_observed_concurrent}"
++    print(f"PASSED: test_concurrency_limit (max observed: {max_observed_concurrent})")
++
++async def test_cleanup_on_cancellation():
++    print("Running test_cleanup_on_cancellation...")
++    cleaned_up = set()
++
++    async def task_with_cleanup(id):
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.02)
++            cleaned_up.add(id)
++
++    tasks = [lambda i=i: task_with_cleanup(i) for i in range(5)]
++    t = asyncio.create_task(run_tasks(tasks, 2))
++    await asyncio.sleep(0.05)
++    t.cancel()
++    try:
++        await t
++    except asyncio.CancelledError:
++        pass
++
++    # Should clean up the 2 tasks that were currently running
++    assert len(cleaned_up) == 2, f"Expected 2 cleaned up tasks, got {len(cleaned_up)}: {cleaned_up}"
++    print(f"PASSED: test_cleanup_on_cancellation (cleaned up: {cleaned_up})")
++
++async def test_sigint_keyboard_interrupt():
++    print("Running test_sigint_keyboard_interrupt...")
++    cleaned_up = set()
++
++    async def task_with_cleanup(id):
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.02)
++            cleaned_up.add(id)
++
++    async def send_sigint():
++        await asyncio.sleep(0.05)
++        os.kill(os.getpid(), signal.SIGINT)
++
++    sigint_task = asyncio.create_task(send_sigint())
++    tasks = [lambda i=i: task_with_cleanup(i) for i in range(5)]
++    try:
++        await run_tasks(tasks, 2)
++        assert False, "Should have raised exception due to SIGINT"
++    except (KeyboardInterrupt, asyncio.CancelledError):
++        pass
++
++    sigint_task.cancel()
++    assert len(cleaned_up) == 2, f"Expected 2 cleaned up tasks, got {len(cleaned_up)}: {cleaned_up}"
++    print(f"PASSED: test_sigint_keyboard_interrupt (cleaned up: {cleaned_up})")
++
++async def test_task_exception_propagation():
++    print("Running test_task_exception_propagation...")
++    cleaned_up = set()
++
++    async def failing_task():
++        await asyncio.sleep(0.02)
++        raise RuntimeError("Task internal error")
++
++    async def normal_task(id):
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.01)
++            cleaned_up.add(id)
++
++    tasks = [lambda: normal_task(1), failing_task, lambda: normal_task(2)]
++    try:
++        await run_tasks(tasks, 2)
++        assert False, "Should have raised RuntimeError"
++    except RuntimeError as e:
++        assert str(e) == "Task internal error"
++
++    assert 1 in cleaned_up, "Running task 1 should have run cleanup"
++    print("PASSED: test_task_exception_propagation")
++
++async def main():
++    await test_import_and_basic()
++    await test_empty_tasks()
++    await test_invalid_max_concurrent()
++    await test_concurrency_limit()
++    await test_cleanup_on_cancellation()
++    await test_sigint_keyboard_interrupt()
++    await test_task_exception_propagation()
++    print("\nALL TESTS PASSED SUCCESSFULLY!")
++
++if __name__ == "__main__":
++    asyncio.run(main())

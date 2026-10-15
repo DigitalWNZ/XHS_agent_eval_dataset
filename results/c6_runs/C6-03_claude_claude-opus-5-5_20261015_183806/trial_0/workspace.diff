@@ -1,0 +1,135 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""Detect hurdle jump takeoff and landing frames in an MP4 video.
++
++Usage: python3 jump_analyzer.py <video.mp4> [output.toml]
++"""
++import sys
++
++import cv2
++import numpy as np
++try:
++    import toml
++except ImportError:  # fall back to writing TOML by hand
++    toml = None
++
++HURDLE_X = 490          # x position (pixels) of the hurdle in 960x540 video
++DIFF_THRESH = 30
++MIN_AREA = 800
++MERGE_DX = 140         # px horizontal radius for merging blob fragments
++AIR_MARGIN = 8          # px the feet must rise above ground level to count as airborne
++
++
++def read_frames(path):
++    cap = cv2.VideoCapture(path)
++    frames = []
++    while True:
++        ok, f = cap.read()
++        if not ok:
++            break
++        frames.append(f)
++    cap.release()
++    return frames
++
++
++def prep(frame):
++    if frame.shape[1] != 960 or frame.shape[0] != 540:
++        frame = cv2.resize(frame, (960, 540))
++    return cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
++
++
++def athlete_boxes(frames):
++    """Per-frame (cx, bottom, area) of the largest foreground blob, or None."""
++    bg = prep(frames[0]).astype(np.int16)
++    k_open = np.ones((3, 3), np.uint8)
++    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
++    out = [None]
++    for f in frames[1:]:
++        g = prep(f).astype(np.int16)
++        m = (np.abs(g - bg) > DIFF_THRESH).astype(np.uint8)
++        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open)
++        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_close)
++        n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
++        if n <= 1:
++            out.append(None)
++            continue
++        i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
++        area = stats[i, cv2.CC_STAT_AREA]
++        if area < MIN_AREA:
++            out.append(None)
++            continue
++        # Merge nearby fragments (legs/feet often separate from the torso).
++        cx = cent[i][0]
++        keep = [j for j in range(1, n)
++                if stats[j, cv2.CC_STAT_AREA] >= 40
++                and abs(cent[j][0] - cx) <= MERGE_DX]
++        mask = np.isin(lab, keep)
++        ys, xs = np.nonzero(mask)
++        bottom = float(np.percentile(ys, 99.5))
++        out.append((float(xs.mean()), bottom, int(len(ys))))
++    return out
++
++
++def analyze(path):
++    frames = read_frames(path)
++    if len(frames) < 3:
++        return 0, 0
++    boxes = athlete_boxes(frames)
++    present = [i for i, b in enumerate(boxes) if b is not None]
++    if not present:
++        return 0, len(frames) - 1
++
++    # Frame where the athlete is closest to the hurdle (the jump apex region).
++    cross = min(present, key=lambda i: abs(boxes[i][0] - HURDLE_X))
++
++    # Ground level (lowest foot position) on each side of the crossing; the
++    # foot of the takeoff and landing legs can sit at slightly different depths.
++    before = [i for i in present if cross - 20 <= i <= cross]
++    after = [i for i in present if cross <= i <= cross + 20]
++    ground_before = max(boxes[i][1] for i in before)
++    ground_after = max(boxes[i][1] for i in after)
++
++    def on_ground(i, ground):
++        b = boxes[i]
++        return b is not None and b[1] >= ground - AIR_MARGIN
++
++    # Apex: highest foot position near the crossing (definitely airborne).
++    near = [i for i in present if abs(i - cross) <= 8]
++    apex = min(near, key=lambda i: boxes[i][1])
++
++    takeoff = apex
++    while takeoff > 0 and not on_ground(takeoff, ground_before):
++        takeoff -= 1
++    land = apex
++    while land < len(frames) - 1 and not on_ground(land, ground_after):
++        land += 1
++    return takeoff, land
++
++
++def main():
++    path = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    out = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++    takeoff, land = analyze(path)
++    with open(out, "w") as fh:
++        data = {"jump_takeoff_frame_number": int(takeoff),
++                "jump_land_frame_number": int(land)}
++        if toml is not None:
++            toml.dump(data, fh)
++        else:
++            fh.write("".join(f"{k} = {v}\n" for k, v in data.items()))
++    print(f"takeoff={takeoff} land={land}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

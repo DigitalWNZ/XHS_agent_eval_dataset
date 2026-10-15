@@ -1,0 +1,69 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,64 @@
++import asyncio
++from typing import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int
++) -> None:
++    """Run async task factories with at most ``max_concurrent`` running at once.
++
++    If this coroutine is cancelled (e.g. KeyboardInterrupt under asyncio.run),
++    every running task is cancelled and awaited so its cleanup code
++    (``finally`` blocks, ``async with`` exits, etc.) runs to completion before
++    the cancellation propagates. Tasks that have not started are never started.
++
++    If tasks raise exceptions, the remaining tasks still run; the first
++    exception is re-raised once everything has finished.
++    """
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be >= 1")
++
++    pending = list(tasks)
++    if not pending:
++        return
++
++    queue_iter = iter(pending)
++    errors: list[BaseException] = []
++
++    async def worker() -> None:
++        for factory in queue_iter:
++            try:
++                await factory()
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:  # keep other tasks going
++                errors.append(exc)
++
++    workers = [
++        asyncio.create_task(worker())
++        for _ in range(min(max_concurrent, len(pending)))
++    ]
++
++    try:
++        await asyncio.wait(workers)
++    except BaseException:
++        # Cancelled (KeyboardInterrupt / outer cancel): cancel running tasks
++        # and wait for their cleanup to finish, even if cancelled again.
++        for w in workers:
++            w.cancel()
++        while True:
++            try:
++                await asyncio.gather(*workers, return_exceptions=True)
++                break
++            except asyncio.CancelledError:
++                for w in workers:
++                    w.cancel()
++                if all(w.done() for w in workers):
++                    break
++        raise
++
++    for w in workers:
++        if not w.cancelled() and w.exception() is not None:
++            errors.append(w.exception())
++    if errors:
++        raise errors[0]

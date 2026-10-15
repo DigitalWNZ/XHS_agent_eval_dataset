@@ -1,0 +1,255 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..eaa44eef3a 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -142,10 +142,6 @@ class ForwardManyToOneDescriptor:
+ 
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+-        if not remote_field.multiple:
+-            for rel_obj in queryset:
+-                instance = instances_dict[rel_obj_attr(rel_obj)]
+-                remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+ 
+     def get_object(self, instance):
+@@ -373,11 +369,6 @@ class ReverseOneToOneDescriptor:
+         query = {'%s__in' % self.related.field.name: instances}
+         queryset = queryset.filter(**query)
+ 
+-        # Since we're going to assign directly in the cache,
+-        # we must manage the reverse relation cache manually.
+-        for rel_obj in queryset:
+-            instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -643,11 +634,6 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             query = {'%s__in' % self.field.name: instances}
+             queryset = queryset.filter(**query)
+ 
+-            # Since we just bypassed this class' get_queryset(), we must manage
+-            # the reverse relation manually.
+-            for rel_obj in queryset:
+-                instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..0908fcf850 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1762,7 +1762,10 @@ def prefetch_related_objects(model_instances, *related_lookups):
+ 
+             obj_to_fetch = None
+             if prefetcher is not None:
+-                obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
++                if lookup.get_current_queryset(level) is not None:
++                    obj_to_fetch = obj_list
++                else:
++                    obj_to_fetch = [obj for obj in obj_list if not is_fetched(obj)]
+ 
+             if obj_to_fetch:
+                 obj_list, additional_lookups = prefetch_one_level(
+@@ -1842,7 +1845,18 @@ def get_prefetcher(instance, through_attr, to_attr):
+             # get_prefetch_queryset() method.
+             if hasattr(rel_obj_descriptor, 'get_prefetch_queryset'):
+                 prefetcher = rel_obj_descriptor
+-                is_fetched = rel_obj_descriptor.is_cached
++                if through_attr != to_attr:
++                    is_fetched = has_to_attr_attribute
++                else:
++                    def is_cached_without_defer(instance):
++                        if not rel_obj_descriptor.is_cached(instance):
++                            return False
++                        try:
++                            cached_val = getattr(instance, through_attr)
++                            return cached_val is None or not bool(cached_val.get_deferred_fields())
++                        except (AttributeError, exceptions.ObjectDoesNotExist):
++                            return True
++                    is_fetched = is_cached_without_defer
+             else:
+                 # descriptor doesn't support prefetching, so we go ahead and get
+                 # the attribute on the instance rather than the class to
+@@ -1931,6 +1945,31 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+     # Whether or not we're prefetching the last part of the lookup.
+     leaf = len(lookup.prefetch_through.split(LOOKUP_SEP)) - 1 == level
+ 
++    rel_field = None
++    if hasattr(prefetcher, 'field'):
++        if hasattr(prefetcher.field, 'remote_field') and not prefetcher.field.remote_field.multiple:
++            rel_field = prefetcher.field.remote_field
++        elif hasattr(prefetcher, 'model') and prefetcher.field.model == prefetcher.model:
++            rel_field = prefetcher.field
++    elif hasattr(prefetcher, 'related'):
++        rel_field = prefetcher.related.field
++
++    if rel_field is not None:
++        rel_field_name = rel_field.name
++        skip_reverse = any(
++            (lookup_item.prefetch_through.split(LOOKUP_SEP)[0]
++             if isinstance(lookup_item, Prefetch) else lookup_item.split(LOOKUP_SEP)[0]) == rel_field_name
++            for lookup_item in additional_lookups
++        )
++        if not skip_reverse and not leaf:
++            through_attrs = lookup.prefetch_through.split(LOOKUP_SEP)
++            if through_attrs[level + 1] == rel_field_name:
++                next_qs = lookup.get_current_queryset(level + 1)
++                if next_qs is not None or any(bool(obj.get_deferred_fields()) for obj in instances):
++                    skip_reverse = True
++    else:
++        skip_reverse = True
++
+     for obj in instances:
+         instance_attr_val = instance_attr(obj)
+         vals = rel_obj_cache.get(instance_attr_val, [])
+@@ -1963,6 +2002,11 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+                 # since we have merged this into the current work.
+                 qs._prefetch_done = True
+                 obj._prefetched_objects_cache[cache_name] = qs
++
++        if not skip_reverse:
++            for rel_obj in vals:
++                if not rel_field.is_cached(rel_obj):
++                    rel_field.set_cached_value(rel_obj, obj)
+     return all_related_objects, additional_lookups
+ 
+ 
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..05f4e6e226 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -839,6 +839,131 @@ class CustomPrefetchTests(TestCase):
+         with self.assertRaisesMessage(ValueError, msg):
+             Prefetch('houses', House.objects.raw('select pk from house'))
+ 
++    def test_only_related_queryset(self):
++        queryset = House.objects.only('name').prefetch_related(
++            Prefetch(
++                'rooms',
++                queryset=Room.objects.prefetch_related(
++                    Prefetch('house', queryset=House.objects.only('address'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            house = queryset.first()
++        self.assertIn('address', house.get_deferred_fields())
++        room_house = house.rooms.all()[0].house
++        self.assertIn('name', room_house.get_deferred_fields())
++        self.assertNotIn('address', room_house.get_deferred_fields())
++        with self.assertNumQueries(0):
++            self.assertEqual(room_house.address, '123 Main St')
++        with self.assertNumQueries(1):
++            self.assertEqual(room_house.name, 'House 1')
++
++        # OneToOne forward, then ReverseOneToOne back
++        queryset = House.objects.only('name', 'main_room').prefetch_related(
++            Prefetch(
++                'main_room',
++                queryset=Room.objects.prefetch_related(
++                    Prefetch('main_room_of', queryset=House.objects.only('address', 'main_room'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            house = queryset.first()
++        self.assertIn('address', house.get_deferred_fields())
++        inner_house = house.main_room.main_room_of
++        self.assertIn('name', inner_house.get_deferred_fields())
++        self.assertNotIn('address', inner_house.get_deferred_fields())
++        with self.assertNumQueries(0):
++            self.assertEqual(inner_house.address, '123 Main St')
++        with self.assertNumQueries(1):
++            self.assertEqual(inner_house.name, 'House 1')
++
++        # ReverseOneToOne, then OneToOne forward back
++        queryset = Room.objects.filter(main_room_of__isnull=False).only('name').prefetch_related(
++            Prefetch(
++                'main_room_of',
++                queryset=House.objects.prefetch_related(
++                    Prefetch('main_room', queryset=Room.objects.only('name'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            room = queryset.first()
++        inner_room = room.main_room_of.main_room
++        self.assertNotIn('name', inner_room.get_deferred_fields())
++        with self.assertNumQueries(0):
++            self.assertEqual(inner_room.name, 'Dining room')
++
++        # ReverseOneToOne, then OneToOne forward back with flattened Prefetch
++        queryset = Room.objects.filter(main_room_of__isnull=False).only('name').prefetch_related(
++            Prefetch('main_room_of__main_room', queryset=Room.objects.only('name'))
++        )
++        with self.assertNumQueries(3):
++            room = queryset.first()
++        inner_room = room.main_room_of.main_room
++        self.assertNotIn('name', inner_room.get_deferred_fields())
++        with self.assertNumQueries(0):
++            self.assertEqual(inner_room.name, 'Dining room')
++
++        lesson = LessonEntry.objects.create(name1='L1', name2='L2')
++        word = WordEntry.objects.create(lesson_entry=lesson, name='W1')
++
++        # ForeignKey reverse, then forward back with nested Prefetch
++        queryset = LessonEntry.objects.only('name1').prefetch_related(
++            Prefetch(
++                'wordentry_set',
++                queryset=WordEntry.objects.prefetch_related(
++                    Prefetch('lesson_entry', queryset=LessonEntry.objects.only('name2'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            lesson_obj = queryset.first()
++        self.assertEqual(lesson_obj.get_deferred_fields(), {'name2'})
++        word_obj = lesson_obj.wordentry_set.all()[0]
++        self.assertEqual(word_obj.lesson_entry.get_deferred_fields(), {'name1'})
++        with self.assertNumQueries(0):
++            self.assertEqual(word_obj.lesson_entry.name2, 'L2')
++        with self.assertNumQueries(1):
++            self.assertEqual(word_obj.lesson_entry.name1, 'L1')
++
++        # ForeignKey reverse, then forward back with flattened Prefetch
++        queryset = LessonEntry.objects.only('name1').prefetch_related(
++            Prefetch('wordentry_set__lesson_entry', queryset=LessonEntry.objects.only('name2'))
++        )
++        with self.assertNumQueries(3):
++            lesson_obj = queryset.first()
++        self.assertEqual(lesson_obj.get_deferred_fields(), {'name2'})
++        word_obj = lesson_obj.wordentry_set.all()[0]
++        self.assertEqual(word_obj.lesson_entry.get_deferred_fields(), {'name1'})
++        with self.assertNumQueries(0):
++            self.assertEqual(word_obj.lesson_entry.name2, 'L2')
++        with self.assertNumQueries(1):
++            self.assertEqual(word_obj.lesson_entry.name1, 'L1')
++
++        # ForeignKey reverse, then forward back with flattened prefetch and no custom queryset
++        queryset = LessonEntry.objects.only('name1').prefetch_related('wordentry_set__lesson_entry')
++        with self.assertNumQueries(3):
++            lesson_obj = queryset.first()
++        self.assertEqual(lesson_obj.get_deferred_fields(), {'name2'})
++        word_obj = lesson_obj.wordentry_set.all()[0]
++        self.assertEqual(word_obj.lesson_entry.get_deferred_fields(), set())
++        with self.assertNumQueries(0):
++            self.assertEqual(word_obj.lesson_entry.name2, 'L2')
++            self.assertEqual(word_obj.lesson_entry.name1, 'L1')
++
++        # ForeignKey reverse, then forward back with flattened prefetch, not deferred
++        queryset = LessonEntry.objects.filter(pk=lesson.pk).prefetch_related('wordentry_set__lesson_entry')
++        with self.assertNumQueries(2):
++            lesson_obj = queryset.first()
++        self.assertEqual(lesson_obj.get_deferred_fields(), set())
++        word_obj = lesson_obj.wordentry_set.all()[0]
++        self.assertEqual(word_obj.lesson_entry.get_deferred_fields(), set())
++        with self.assertNumQueries(0):
++            self.assertEqual(word_obj.lesson_entry.name2, 'L2')
++            self.assertEqual(word_obj.lesson_entry.name1, 'L1')
++
+     def test_to_attr_doesnt_cache_through_attr_as_list(self):
+         house = House.objects.prefetch_related(
+             Prefetch('rooms', queryset=Room.objects.all(), to_attr='to_rooms'),

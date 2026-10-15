@@ -1,0 +1,213 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,201 @@
++import cv2
++import numpy as np
++import toml
++import sys
++import os
++
++def analyze_video(video_path):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Cannot open video file: {video_path}")
++        
++    frames = []
++    while True:
++        ret, f = cap.read()
++        if not ret:
++            break
++        frames.append(f)
++    cap.release()
++    
++    if len(frames) < 10:
++        raise ValueError("Video too short or unreadable")
++        
++    bg = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
++    num_frames = len(frames)
++    
++    frame_metrics = []
++    
++    for i in range(num_frames):
++        f_gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
++        diff = cv2.absdiff(f_gray, bg)
++        
++        # Track region (y <= 380)
++        diff_track = diff[0:380, :]
++        _, thresh = cv2.threshold(diff_track, 25, 255, cv2.THRESH_BINARY)
++        
++        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
++        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
++        
++        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++        
++        # Find runner candidates
++        runner_cnts = []
++        for c in contours:
++            a = cv2.contourArea(c)
++            if a > 250:
++                x, y, w, h = cv2.boundingRect(c)
++                if h > 40 and w < 350 and (h / max(1, w)) > 0.4:
++                    runner_cnts.append((a, x, y, w, h, c))
++                    
++        if runner_cnts:
++            all_pts = np.vstack([c[5] for c in runner_cnts]).reshape(-1, 2)
++            min_x = np.min(all_pts[:, 0])
++            max_x = np.max(all_pts[:, 0])
++            min_y = np.min(all_pts[:, 1])
++            max_y = np.max(all_pts[:, 1])
++            
++            w = max_x - min_x
++            h = max_y - min_y
++            cx = (min_x + max_x) / 2.0
++            
++            # Ground pixels in track contact zone [340, 375]
++            crop = thresh[0:375, min_x:max_x]
++            pts = np.argwhere(crop > 0)
++            ground_px = np.sum((pts[:, 0] >= 340) & (pts[:, 0] <= 375)) if len(pts) > 0 else 0
++            
++            frame_metrics.append({
++                'frame': i,
++                'present': True,
++                'cx': cx,
++                'x': min_x, 'y': min_y, 'w': w, 'h': h,
++                'feet_y': max_y,
++                'ground_px': ground_px
++            })
++        else:
++            frame_metrics.append({
++                'frame': i,
++                'present': False,
++                'cx': None,
++                'feet_y': None,
++                'ground_px': 0
++            })
++            
++    # Track runner horizontal motion to filter out static background noise
++    moving_runner_frames = []
++    for i in range(len(frame_metrics)):
++        m = frame_metrics[i]
++        if m['present']:
++            prev_m = frame_metrics[i-1] if i > 0 else None
++            next_m = frame_metrics[i+1] if i < len(frame_metrics)-1 else None
++            
++            moving = False
++            if prev_m and prev_m['present'] and abs(m['cx'] - prev_m['cx']) > 3:
++                moving = True
++            if next_m and next_m['present'] and abs(m['cx'] - next_m['cx']) > 3:
++                moving = True
++                
++            if moving:
++                moving_runner_frames.append(m)
++                
++    if not moving_runner_frames:
++        moving_runner_frames = [m for m in frame_metrics if m['present']]
++        
++    # Group moving runner frames into contiguous passes
++    passes = []
++    curr_pass = []
++    for m in moving_runner_frames:
++        if not curr_pass:
++            curr_pass.append(m)
++        else:
++            if m['frame'] <= curr_pass[-1]['frame'] + 2:
++                curr_pass.append(m)
++            else:
++                if len(curr_pass) >= 5:
++                    passes.append(curr_pass)
++                curr_pass = [m]
++    if len(curr_pass) >= 5:
++        passes.append(curr_pass)
++        
++    if not passes:
++        raise ValueError("Could not track runner motion pass across video")
++        
++    # Pick the pass that crosses the center / hurdle region
++    main_pass = None
++    for p in passes:
++        x_coords = [m['cx'] for m in p]
++        if min(x_coords) < 550 and max(x_coords) > 350:
++            main_pass = p
++            break
++            
++    if main_pass is None:
++        main_pass = max(passes, key=len)
++        
++    GROUND_Y = 365.0
++    
++    airborne_seqs = []
++    curr_seq = []
++    
++    for m in main_pass:
++        clearance = GROUND_Y - m['feet_y']
++        is_in_bounds = (100 <= m['cx'] <= 850)
++        
++        # Airborne when ground contact is broken (ground_px < 30) AND clearance is present, or high clearance (> 45)
++        is_airborne = is_in_bounds and ((m['ground_px'] < 30 and clearance > 20) or clearance > 45)
++        
++        if is_airborne:
++            curr_seq.append(m)
++        else:
++            if curr_seq:
++                peak_clearance = max(GROUND_Y - item['feet_y'] for item in curr_seq)
++                if len(curr_seq) >= 4 and peak_clearance > 50:
++                    airborne_seqs.append(curr_seq)
++                curr_seq = []
++    if curr_seq:
++        peak_clearance = max(GROUND_Y - item['feet_y'] for item in curr_seq)
++        if len(curr_seq) >= 4 and peak_clearance > 50:
++            airborne_seqs.append(curr_seq)
++            
++    if not airborne_seqs:
++        in_bounds_pass = [m for m in main_pass if 100 <= m['cx'] <= 850]
++        best_frame = max(in_bounds_pass or main_pass, key=lambda item: GROUND_Y - item['feet_y'])
++        takeoff_frame = max(0, best_frame['frame'] - 4)
++        land_frame = min(num_frames - 1, best_frame['frame'] + 4)
++        return takeoff_frame, land_frame
++        
++    # Pick the airborne sequence with highest peak clearance
++    best_jump_seq = max(airborne_seqs, key=lambda seq: max(GROUND_Y - item['feet_y'] for item in seq))
++    
++    first_air = best_jump_seq[0]['frame']
++    last_air = best_jump_seq[-1]['frame']
++    
++    takeoff_frame = first_air - 1 if first_air > 0 else first_air
++    land_frame = last_air + 1 if last_air < num_frames - 1 else last_air
++    
++    return int(takeoff_frame), int(land_frame)
++
++def main():
++    input_video = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    output_toml = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++    
++    if not os.path.exists(input_video) and os.path.exists("/app/example_video.mp4"):
++        input_video = "/app/example_video.mp4"
++        
++    print(f"Analyzing video: {input_video}")
++    takeoff_frame, land_frame = analyze_video(input_video)
++    
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame)
++    }
++    
++    print(f"Detected Takeoff Frame: {takeoff_frame}")
++    print(f"Detected Land Frame: {land_frame}")
++    
++    os.makedirs(os.path.dirname(output_toml) or ".", exist_ok=True)
++    with open(output_toml, "w") as f:
++        toml.dump(result, f)
++        
++    print(f"Output saved to {output_toml}")
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

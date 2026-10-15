@@ -1,0 +1,209 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..8290265e96 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -145,7 +145,8 @@ class ForwardManyToOneDescriptor:
+         if not remote_field.multiple:
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                remote_field.set_cached_value(rel_obj, instance)
++                if not remote_field.is_cached(rel_obj):
++                    remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+ 
+     def get_object(self, instance):
+@@ -377,7 +378,8 @@ class ReverseOneToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
+             instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
++            if not self.related.field.is_cached(rel_obj):
++                self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -647,7 +649,8 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             # the reverse relation manually.
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
++                if not self.field.is_cached(rel_obj):
++                    setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..6dd64d214c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,169 @@
++import os
++import django
++from django.conf import settings
++
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++            '__main__',
++        ],
++    )
++    django.setup()
++
++from django.db import models, connection
++from django.db.models import Prefetch
++from django.test.utils import CaptureQueriesContext
++import django.db.models.fields.related_descriptors as descriptors
++
++# Monkeypatch
++def patched_roto_get_prefetch_queryset(self, instances, queryset=None):
++    if queryset is None:
++        queryset = self.get_queryset()
++    queryset._add_hints(instance=instances[0])
++
++    rel_obj_attr = self.related.field.get_local_related_value
++    instance_attr = self.related.field.get_foreign_related_value
++    instances_dict = {instance_attr(inst): inst for inst in instances}
++    query = {'%s__in' % self.related.field.name: instances}
++    queryset = queryset.filter(**query)
++
++    for rel_obj in queryset:
++        instance = instances_dict[rel_obj_attr(rel_obj)]
++        if not self.related.field.is_cached(rel_obj):
++            self.related.field.set_cached_value(rel_obj, instance)
++    return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
++
++def patched_fmto_get_prefetch_queryset(self, instances, queryset=None):
++    if queryset is None:
++        queryset = self.get_queryset()
++    queryset._add_hints(instance=instances[0])
++
++    rel_obj_attr = self.field.get_foreign_related_value
++    instance_attr = self.field.get_local_related_value
++    instances_dict = {instance_attr(inst): inst for inst in instances}
++    related_field = self.field.foreign_related_fields[0]
++    remote_field = self.field.remote_field
++
++    if remote_field.is_hidden() or len(self.field.foreign_related_fields) == 1:
++        query = {'%s__in' % related_field.name: {instance_attr(inst)[0] for inst in instances}}
++    else:
++        query = {'%s__in' % self.field.related_query_name(): instances}
++    queryset = queryset.filter(**query)
++
++    if not remote_field.multiple:
++        for rel_obj in queryset:
++            instance = instances_dict[rel_obj_attr(rel_obj)]
++            if not remote_field.is_cached(rel_obj):
++                remote_field.set_cached_value(rel_obj, instance)
++    return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
++
++descriptors.ReverseOneToOneDescriptor.get_prefetch_queryset = patched_roto_get_prefetch_queryset
++descriptors.ForwardManyToOneDescriptor.get_prefetch_queryset = patched_fmto_get_prefetch_queryset
++
++orig_crmtom = descriptors.create_reverse_many_to_one_manager
++def patched_crmtom(superclass, rel):
++    rel_manager = orig_crmtom(superclass, rel)
++    def patched_gpq(self, instances, queryset=None):
++        if queryset is None:
++            queryset = super(rel_manager, self).get_queryset()
++
++        queryset._add_hints(instance=instances[0])
++        queryset = queryset.using(queryset._db or self._db)
++
++        rel_obj_attr = self.field.get_local_related_value
++        instance_attr = self.field.get_foreign_related_value
++        instances_dict = {instance_attr(inst): inst for inst in instances}
++        query = {'%s__in' % self.field.name: instances}
++        queryset = queryset.filter(**query)
++
++        for rel_obj in queryset:
++            instance = instances_dict[rel_obj_attr(rel_obj)]
++            if not self.field.is_cached(rel_obj):
++                setattr(rel_obj, self.field.name, instance)
++        cache_name = self.field.remote_field.get_cache_name()
++        return queryset, rel_obj_attr, instance_attr, False, cache_name, False
++    rel_manager.get_prefetch_queryset = patched_gpq
++    return rel_manager
++
++descriptors.create_reverse_many_to_one_manager = patched_crmtom
++
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    class Meta:
++        app_label = '__main__'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    class Meta:
++        app_label = '__main__'
++
++class UserFK(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(
++        max_length=10, choices=[("ADMIN", "Admin"), ("REGULAR", "Regular")]
++    )
++    class Meta:
++        app_label = '__main__'
++
++class ProfileFK(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.ForeignKey(UserFK, on_delete=models.CASCADE)
++    class Meta:
++        app_label = '__main__'
++
++with connection.schema_editor() as editor:
++    editor.create_model(User)
++    editor.create_model(Profile)
++    editor.create_model(UserFK)
++    editor.create_model(ProfileFK)
++
++user1 = User.objects.create(email="test@example.com", kind="ADMIN")
++Profile.objects.create(user=user1, full_name="Test Tester")
++
++print("--- Test 3: User.objects.only('email').prefetch_related(Prefetch('profile__user', queryset=User.objects.only('kind'))) ---")
++queryset = User.objects.only("email").prefetch_related(
++    Prefetch("profile__user", queryset=User.objects.only("kind"))
++)
++with CaptureQueriesContext(connection) as ctx:
++    user = queryset.first()
++
++print("Initial queries:", len(ctx))
++for q in ctx:
++    print("  ", q['sql'])
++print("user.profile.user.kind:", user.profile.user.kind)
++print("user.profile.user.get_deferred_fields():", user.profile.user.get_deferred_fields())
++with CaptureQueriesContext(connection) as ctx:
++    _ = user.profile.user.kind
++print("Accessing kind queries:", len(ctx))
++
++print("\n--- Test 4: UserFK.objects.only('email').prefetch_related(Prefetch('profilefk_set__user', queryset=UserFK.objects.only('kind'))) ---")
++user2 = UserFK.objects.create(email="test@example.com", kind="ADMIN")
++ProfileFK.objects.create(user=user2, full_name="Test Tester")
++
++queryset = UserFK.objects.only("email").prefetch_related(
++    Prefetch("profilefk_set__user", queryset=UserFK.objects.only("kind"))
++)
++with CaptureQueriesContext(connection) as ctx:
++    user_fk = queryset.first()
++
++print("Initial queries:", len(ctx))
++for q in ctx:
++    print("  ", q['sql'])
++prof_fk = user_fk.profilefk_set.all()[0]
++print("prof_fk.user.kind:", prof_fk.user.kind)
++print("prof_fk.user.get_deferred_fields():", prof_fk.user.get_deferred_fields())
++with CaptureQueriesContext(connection) as ctx:
++    _ = prof_fk.user.kind
++print("Accessing kind queries:", len(ctx))

@@ -1,0 +1,354 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,349 @@
++#!/usr/bin/env python3
++"""HTML JavaScript and XSS Filter.
++
++Removes JavaScript from HTML files in-place while preserving
++formatting, legitimate HTML structure, tables, headers, and
++non-dangerous attributes.
++"""
++
++import sys
++import os
++import re
++import html
++import base64
++import urllib.parse
++
++
++def is_dangerous_attribute(name, val):
++    """Determine whether an attribute name or value contains executable JavaScript."""
++    name_clean = name.strip().lower()
++
++    # 1. Inline event handlers (e.g. onclick, onload, onerror, onmouseover)
++    if re.match(r'^on[a-zA-Z]', name_clean):
++        return True
++
++    if val is None:
++        return False
++
++    # Decode HTML entities (e.g. &#106;avascript:)
++    val_decoded = html.unescape(val)
++    val_decoded = html.unescape(val_decoded)
++
++    # Normalize by stripping whitespace, control characters, nulls
++    val_clean = re.sub(r'[\s\x00-\x20\xa0\u2000-\u200b]+', '', val_decoded).lower()
++
++    # 2. Script URI schemes
++    if val_clean.startswith(('javascript:', 'vbscript:', 'livescript:')):
++        return True
++
++    # 3. meta http-equiv="refresh" with javascript URL
++    if 'javascript:' in val_clean:
++        if re.search(r'url\s*=\s*javascript:', val_decoded, re.I):
++            return True
++        if name_clean == 'style':
++            return True
++
++    # 4. style attribute with expression(...)
++    if name_clean == 'style':
++        if re.search(r'expression\s*\(', val_decoded, re.I):
++            return True
++
++    # 5. srcdoc containing script elements or event handlers
++    if name_clean == 'srcdoc':
++        if re.search(r'<\s*script\b|on[a-zA-Z]+\s*=|javascript\s*:', val_decoded, re.I):
++            return True
++
++    # 6. data: URIs containing script elements or event handlers
++    if val_clean.startswith('data:'):
++        # Check raw decoded
++        if re.search(r'<\s*script\b|on[a-zA-Z]+\s*=|javascript\s*:', val_decoded, re.I):
++            return True
++        # Check percent-unquoted
++        unquoted = urllib.parse.unquote(val_decoded)
++        if re.search(r'<\s*script\b|on[a-zA-Z]+\s*=|javascript\s*:', unquoted, re.I):
++            return True
++        # Check base64 decoded
++        if ';base64,' in val_decoded:
++            try:
++                b64_part = val_decoded.split(';base64,', 1)[1]
++                decoded_b64 = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
++                if re.search(r'<\s*script\b|on[a-zA-Z]+\s*=|javascript\s*:', decoded_b64, re.I):
++                    return True
++            except Exception:
++                pass
++
++    return False
++
++
++def clean_tag_attributes(text, tag_start, tag_close_idx):
++    """Remove dangerous attributes from an HTML tag while preserving exact formatting."""
++    p = tag_start + 1
++    if p < tag_close_idx and text[p] == '/':
++        p += 1
++    name_start = p
++    while p < tag_close_idx and not text[p].isspace() and text[p] not in ('>', '/'):
++        p += 1
++    tag_name_end = p
++
++    removals = []
++
++    while p < tag_close_idx:
++        ws_start = p
++        while p < tag_close_idx and text[p].isspace():
++            p += 1
++        if p >= tag_close_idx:
++            break
++        if text[p] == '/' and p + 1 <= tag_close_idx:
++            if text[p:tag_close_idx].strip() == '/':
++                break
++
++        name_start = p
++        while p < tag_close_idx and not text[p].isspace() and text[p] not in ('=', '>', '/', '"', "'"):
++            p += 1
++        attr_name = text[name_start:p]
++        if not attr_name:
++            p += 1
++            continue
++
++        save_p = p
++        while p < tag_close_idx and text[p].isspace():
++            p += 1
++        if p < tag_close_idx and text[p] == '=':
++            p += 1
++            while p < tag_close_idx and text[p].isspace():
++                p += 1
++            if p < tag_close_idx and text[p] in ('"', "'"):
++                q = text[p]
++                v_start = p + 1
++                p += 1
++                while p < tag_close_idx and text[p] != q:
++                    p += 1
++                v_end = p
++                attr_val = text[v_start:v_end]
++                if p < tag_close_idx and text[p] == q:
++                    p += 1
++            else:
++                v_start = p
++                while p < tag_close_idx and not text[p].isspace() and text[p] != '>':
++                    if text[p] == '/' and p + 1 < tag_close_idx and text[p + 1] == '>':
++                        break
++                    p += 1
++                v_end = p
++                attr_val = text[v_start:v_end]
++        else:
++            p = save_p
++            attr_val = None
++
++        attr_end = p
++
++        if is_dangerous_attribute(attr_name, attr_val):
++            repl = ""
++            # Prevent fusing tag name and subsequent attribute if no whitespace separates them
++            if ws_start == tag_name_end and attr_end < tag_close_idx:
++                if not text[attr_end].isspace() and text[attr_end] not in ('>', '/'):
++                    repl = " "
++            removals.append((ws_start, attr_end, repl))
++
++    tag_content = list(text[tag_start:tag_close_idx])
++    for start, end, repl in sorted(removals, key=lambda x: x[0], reverse=True):
++        rel_start = start - tag_start
++        rel_end = end - tag_start
++        tag_content[rel_start:rel_end] = list(repl)
++
++    return "".join(tag_content)
++
++
++def find_tag_closing_bracket(text, start_idx):
++    """Find index of tag closing '>' taking quotes into account."""
++    in_q = None
++    i = start_idx
++    n = len(text)
++    while i < n:
++        c = text[i]
++        if in_q:
++            if c == in_q:
++                in_q = None
++        elif c in ('"', "'"):
++            in_q = c
++        elif c == '>':
++            return i
++        i += 1
++    return n
++
++
++def filter_html_once(text):
++    """Perform a single pass of HTML filtering."""
++    output = []
++    i = 0
++    n = len(text)
++
++    while i < n:
++        if text[i] != '<':
++            next_lt = text.find('<', i)
++            if next_lt == -1:
++                output.append(text[i:])
++                break
++            output.append(text[i:next_lt])
++            i = next_lt
++            continue
++
++        # Encountered '<'
++        # 1. HTML Comment <!-- ... -->
++        if text.startswith('<!--', i):
++            if text.startswith('<!-->', i):
++                output.append('<!-->')
++                i += 5
++                continue
++            if text.startswith('<!--->', i):
++                output.append('<!--->')
++                i += 6
++                continue
++            p1 = text.find('-->', i + 4)
++            p2 = text.find('--!>', i + 4)
++            ends = [p for p in (p1, p2) if p != -1]
++            if ends:
++                min_end = min(ends)
++                end_idx = min_end + (3 if min_end == p1 else 4)
++            else:
++                end_idx = n
++            output.append(text[i:end_idx])
++            i = end_idx
++            continue
++
++        # 2. CDATA <![CDATA[ ... ]]>
++        if text.startswith('<![CDATA[', i):
++            cdata_end = text.find(']]>', i + 9)
++            if cdata_end != -1:
++                end_idx = cdata_end + 3
++            else:
++                end_idx = n
++            output.append(text[i:end_idx])
++            i = end_idx
++            continue
++
++        # 3. Doctype and markup declarations <! ... >
++        if text.startswith('<!', i):
++            end_idx = find_tag_closing_bracket(text, i)
++            if end_idx < n:
++                output.append(text[i:end_idx + 1])
++                i = end_idx + 1
++            else:
++                output.append(text[i:])
++                i = n
++            continue
++
++        # 4. Closing tags </ ... >
++        if text.startswith('</', i):
++            if re.match(r'^</script[\s>]', text[i:], re.I):
++                end_idx = find_tag_closing_bracket(text, i)
++                i = end_idx + 1 if end_idx < n else n
++                continue
++            end_idx = find_tag_closing_bracket(text, i)
++            if end_idx < n:
++                output.append(text[i:end_idx + 1])
++                i = end_idx + 1
++            else:
++                output.append(text[i:])
++                i = n
++            continue
++
++        # 5. Script element <script ...> ... </script>
++        if re.match(r'^<script[\s/>]', text[i:], re.I):
++            open_end = find_tag_closing_bracket(text, i)
++            if open_end >= n:
++                # Unclosed script tag consumes to EOF
++                i = n
++                continue
++            open_tag = text[i:open_end + 1]
++            if open_tag.rstrip().endswith('/>'):
++                # Self-closing script tag
++                i = open_end + 1
++                continue
++            # Search for closing </script>
++            m = re.search(r'</script[\s>]', text[open_end + 1:], re.I)
++            if m:
++                close_start = open_end + 1 + m.start()
++                close_end = find_tag_closing_bracket(text, close_start)
++                i = close_end + 1 if close_end < n else n
++            else:
++                # No closing tag, consumes to EOF
++                i = n
++            continue
++
++        # 6. Style element <style ...> ... </style>
++        if re.match(r'^<style[\s/>]', text[i:], re.I):
++            open_end = find_tag_closing_bracket(text, i)
++            if open_end >= n:
++                output.append(clean_tag_attributes(text, i, n))
++                i = n
++                continue
++            cleaned_open = clean_tag_attributes(text, i, open_end) + text[open_end]
++            output.append(cleaned_open)
++            open_tag = text[i:open_end + 1]
++            if open_tag.rstrip().endswith('/>'):
++                i = open_end + 1
++                continue
++            m = re.search(r'</style[\s>]', text[open_end + 1:], re.I)
++            if m:
++                close_start = open_end + 1 + m.start()
++                close_end = find_tag_closing_bracket(text, close_start)
++                output.append(text[open_end + 1:close_start])
++                output.append(text[close_start:close_end + 1 if close_end < n else n])
++                i = close_end + 1 if close_end < n else n
++            else:
++                output.append(text[open_end + 1:])
++                i = n
++            continue
++
++        # 7. Regular HTML tag
++        m_tag = re.match(r'^<[a-zA-Z][a-zA-Z0-9:-]*', text[i:])
++        if m_tag:
++            open_end = find_tag_closing_bracket(text, i)
++            if open_end < n:
++                cleaned_tag = clean_tag_attributes(text, i, open_end) + text[open_end]
++                output.append(cleaned_tag)
++                i = open_end + 1
++            else:
++                cleaned_tag = clean_tag_attributes(text, i, n)
++                output.append(cleaned_tag)
++                i = n
++            continue
++
++        # 8. Character '<' that does not begin a tag
++        output.append(text[i])
++        i += 1
++
++    return "".join(output)
++
++
++def filter_html(text):
++    """Filter JavaScript from HTML until convergence."""
++    for _ in range(10):
++        new_text = filter_html_once(text)
++        if new_text == text:
++            break
++        text = new_text
++    return text
++
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: filter.py <html-file>", file=sys.stderr)
++        sys.exit(1)
++
++    filepath = sys.argv[1]
++    if not os.path.exists(filepath):
++        print(f"Error: File '{filepath}' not found.", file=sys.stderr)
++        sys.exit(1)
++
++    with open(filepath, 'r', encoding='utf-8', errors='surrogateescape', newline='') as f:
++        content = f.read()
++
++    filtered = filter_html(content)
++
++    with open(filepath, 'w', encoding='utf-8', errors='surrogateescape', newline='') as f:
++        f.write(filtered)
++
++
++if __name__ == '__main__':
++    main()

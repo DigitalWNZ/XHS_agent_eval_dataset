@@ -1,0 +1,207 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python3
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_video(video_path: str) -> tuple[int, int]:
++    cap = cv2.VideoCapture(video_path)
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if not frames:
++        return 0, 0
++
++    bg = frames[0]
++    h, w = bg.shape[:2]
++
++    # Static lower-track region for estimating any slight camera shake
++    y_ref1, y_ref2 = int(h * 0.75), int(h * 0.98)
++    x_ref1, x_ref2 = int(w * 0.10), int(w * 0.90)
++    bg_ref_gray = cv2.cvtColor(bg[y_ref1:y_ref2, x_ref1:x_ref2], cv2.COLOR_BGR2GRAY).astype(np.float32)
++
++    kernel_env = np.ones((5, 5), np.uint8)
++    kernel_open = np.ones((3, 3), np.uint8)
++
++    # Track region of interest vertically (runner body and feet on track)
++    y_roi_top = int(h * 0.07)
++    y_roi_bot = int(h * 0.80)
++
++    active_frames = []
++    x_meds = []
++    y_maxs = []
++
++    for idx, frame in enumerate(frames):
++        if idx == 0:
++            continue
++
++        # Estimate camera shift relative to frame 0
++        f_ref_gray = cv2.cvtColor(frame[y_ref1:y_ref2, x_ref1:x_ref2], cv2.COLOR_BGR2GRAY).astype(np.float32)
++        (dx, dy), _ = cv2.phaseCorrelate(bg_ref_gray, f_ref_gray)
++        dx = float(np.clip(dx, -8.0, 8.0))
++        dy = float(np.clip(dy, -8.0, 8.0))
++
++        if abs(dx) > 0.1 or abs(dy) > 0.1:
++            M = np.float32([[1, 0, dx], [0, 1, dy]])
++            bg_aligned = cv2.warpAffine(bg, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
++        else:
++            bg_aligned = bg
++
++        bg_min = cv2.erode(bg_aligned, kernel_env).astype(np.int16)
++        bg_max = cv2.dilate(bg_aligned, kernel_env).astype(np.int16)
++
++        fi = frame.astype(np.int16)
++        diff_low = np.maximum(0, bg_min - fi)
++        diff_high = np.maximum(0, fi - bg_max)
++        diff = np.maximum(diff_low, diff_high).max(axis=2)
++
++        mask = np.zeros((h, w), dtype=np.uint8)
++        mask[y_roi_top:y_roi_bot, :] = (diff[y_roi_top:y_roi_bot, :] > 28).astype(np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
++
++        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
++        clean = np.zeros_like(mask)
++        for lbl in range(1, num_labels):
++            if stats[lbl, cv2.CC_STAT_AREA] >= 15:
++                clean[labels == lbl] = 1
++
++        if clean.sum() >= 300:
++            ys, xs = np.where(clean > 0)
++            x_med = float(np.median(xs))
++            in_box = (xs >= x_med - 180) & (xs <= x_med + 180)
++            ys_box = ys[in_box]
++            if len(ys_box) >= 200:
++                active_frames.append(idx)
++                x_meds.append(x_med)
++                y_maxs.append(int(ys_box.max()))
++
++    if not active_frames:
++        return 0, 0
++
++    active_frames = np.array(active_frames)
++    x_meds = np.array(x_meds)
++    y_maxs = np.array(y_maxs)
++
++    # Hurdle is positioned near the center horizontally (x ~ 0.32w to 0.72w)
++    # Find the apex of the jump over the hurdle where lowest foot point y_max is minimum (highest in air)
++    hurdle_zone = (x_meds >= w * 0.32) & (x_meds <= w * 0.72)
++    if np.any(hurdle_zone):
++        zone_indices = np.where(hurdle_zone)[0]
++        peak_rel_idx = int(zone_indices[np.argmin(y_maxs[zone_indices])])
++    else:
++        peak_rel_idx = int(np.argmin(y_maxs))
++
++    t_peak = int(active_frames[peak_rel_idx])
++    y_peak = int(y_maxs[peak_rel_idx])
++
++    frame_to_ymax = dict(zip(active_frames.tolist(), y_maxs.tolist()))
++
++    # Walk backwards from t_peak to isolate the takeoff stance plateau
++    pre_frames = []
++    y_ground_takeoff = y_peak
++    for t in range(t_peak - 1, max(0, t_peak - 20), -1):
++        if t not in frame_to_ymax:
++            continue
++        ym = frame_to_ymax[t]
++        if ym > y_ground_takeoff:
++            y_ground_takeoff = ym
++        elif y_ground_takeoff >= y_peak + 60 and ym < y_ground_takeoff - 12:
++            break
++        pre_frames.append(t)
++
++    if pre_frames:
++        ground_pre = [t for t in pre_frames if frame_to_ymax[t] >= y_ground_takeoff - 5]
++        takeoff_frame = int(max(ground_pre)) if ground_pre else int(pre_frames[0])
++    else:
++        takeoff_frame = max(0, t_peak - 5)
++
++    # Walk forwards from t_peak to isolate the landing stance plateau
++    post_frames = []
++    y_ground_land = y_peak
++    for t in range(t_peak + 1, min(len(frames), t_peak + 20)):
++        if t not in frame_to_ymax:
++            continue
++        ym = frame_to_ymax[t]
++        if ym > y_ground_land:
++            y_ground_land = ym
++        elif y_ground_land >= y_peak + 60 and ym < y_ground_land - 12:
++            break
++        post_frames.append(t)
++
++    if post_frames:
++        ground_post = [t for t in post_frames if frame_to_ymax[t] >= y_ground_land - 5]
++        land_frame = int(min(ground_post)) if ground_post else int(post_frames[0])
++    else:
++        land_frame = t_peak + 4
++
++    return int(takeoff_frame), int(land_frame)
++
++
++def main():
++    args = sys.argv[1:]
++    video_path = "/app/example_video.mp4"
++    output_paths = ["/app/output.toml"]
++
++    i = 0
++    pos_args = []
++    while i < len(args):
++        arg = args[i]
++        if arg in ("-i", "--input", "--video", "-v") and i + 1 < len(args):
++            video_path = args[i + 1]
++            i += 2
++        elif arg in ("-o", "--output") and i + 1 < len(args):
++            if args[i + 1] not in output_paths:
++                output_paths.append(args[i + 1])
++            i += 2
++        elif arg.startswith("--input=") or arg.startswith("--video="):
++            video_path = arg.split("=", 1)[1]
++            i += 1
++        elif arg.startswith("--output="):
++            out_p = arg.split("=", 1)[1]
++            if out_p not in output_paths:
++                output_paths.append(out_p)
++            i += 1
++        elif not arg.startswith("-"):
++            pos_args.append(arg)
++            i += 1
++        else:
++            i += 1
++
++    if len(pos_args) >= 1:
++        video_path = pos_args[0]
++    if len(pos_args) >= 2 and pos_args[1] not in output_paths:
++        output_paths.append(pos_args[1])
++
++    takeoff_frame, land_frame = analyze_video(video_path)
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    toml_str = toml.dumps(result)
++    for out_path in output_paths:
++        with open(out_path, "w") as f:
++            f.write(toml_str)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

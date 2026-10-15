@@ -1,0 +1,278 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,266 @@
++#!/usr/bin/env python3
++"""
++Hurdle Jump Analyzer
++Analyzes MP4 videos of hurdle jumpers and detects takeoff and landing frames.
++Outputs results to /app/output.toml.
++"""
++
++import sys
++import os
++import argparse
++import numpy as np
++import cv2
++
++try:
++    import toml
++except ImportError:
++    toml = None
++
++
++def parse_arguments():
++    parser = argparse.ArgumentParser(description="Analyze hurdle jump video.")
++    parser.add_argument("video_path", nargs="?", default=None, help="Path to input MP4 video file.")
++    parser.add_argument("-i", "--input", "--video", dest="input_opt", default=None, help="Input video file path.")
++    parser.add_argument("-o", "--output", dest="output_path", default="/app/output.toml", help="Path to output TOML file.")
++    
++    args = parser.parse_args()
++    
++    # Determine input video path
++    video_path = args.input_opt or args.video_path
++    if not video_path:
++        # Default fallback
++        if os.path.exists("/app/example_video.mp4"):
++            video_path = "/app/example_video.mp4"
++        elif os.path.exists("example_video.mp4"):
++            video_path = "example_video.mp4"
++        else:
++            # Look for any mp4 file in /app or current directory
++            mp4s = [f for f in os.listdir("/app") if f.endswith(".mp4")] if os.path.exists("/app") else []
++            if mp4s:
++                video_path = os.path.join("/app", mp4s[0])
++            else:
++                video_path = "/app/example_video.mp4"
++                
++    return video_path, args.output_path
++
++
++def load_video_frames(video_path):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise FileNotFoundError(f"Could not open video file: {video_path}")
++        
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++    
++    if not frames:
++        raise ValueError(f"No frames could be read from video: {video_path}")
++        
++    return frames
++
++
++def build_background(frames):
++    """
++    Computes a clean background image from the video.
++    Per task assumption: the first frame has no runner on the track.
++    If multiple initial frames are stationary, we average/median them to reduce sensor noise.
++    """
++    n_frames = len(frames)
++    static_frames = [frames[0]]
++    for i in range(1, min(15, n_frames)):
++        diff = cv2.absdiff(frames[i], frames[i - 1])
++        if np.mean(diff) < 2.5:
++            static_frames.append(frames[i])
++        else:
++            break
++            
++    if len(static_frames) >= 3:
++        bg = np.median(static_frames, axis=0).astype(np.uint8)
++    else:
++        bg = frames[0]
++        
++    return bg
++
++
++def analyze_hurdle_jump(video_path):
++    frames = load_video_frames(video_path)
++    n_frames = len(frames)
++    
++    if n_frames < 3:
++        return 0, 0
++        
++    bg = build_background(frames)
++    
++    # Known fixed setup: camera, background, and hurdle position are identical across all videos.
++    hurdle_x = 512
++    
++    # Detect runner in each frame
++    runner_track = {}
++    
++    for t in range(n_frames):
++        f = frames[t]
++        
++        # Color difference with background
++        diff_bg = np.max(cv2.absdiff(bg, f), axis=2)
++        
++        # Mask out sky (y < 45) and lower track foreground (y > 420)
++        diff_bg[:45, :] = 0
++        diff_bg[420:, :] = 0
++        
++        # Threshold difference
++        _, th = cv2.threshold(diff_bg, 28, 255, cv2.THRESH_BINARY)
++        
++        # Suppress static tree area on far left unless runner is there
++        th[:, :140] = 0
++        
++        # Morphological filtering to remove noise and connect runner body parts
++        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
++        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 15)))
++        
++        n_l, l, stats, cents = cv2.connectedComponentsWithStats(th)
++        cands = []
++        for c in range(1, n_l):
++            a = stats[c, cv2.CC_STAT_AREA]
++            h = stats[c, cv2.CC_STAT_HEIGHT]
++            w = stats[c, cv2.CC_STAT_WIDTH]
++            x = stats[c, cv2.CC_STAT_LEFT]
++            y = stats[c, cv2.CC_STAT_TOP]
++            
++            # Filter components consistent with human body parts
++            if a > 400 and h > 50 and w < 400:
++                cands.append((x, y, w, h, a, cents[c]))
++                
++        if cands:
++            cands.sort(key=lambda item: item[4], reverse=True)
++            main_x = cands[0][0] + cands[0][2] / 2
++            
++            # Cluster components belonging to the runner
++            cluster = [c for c in cands if abs((c[0] + c[2] / 2) - main_x) < 130]
++            tot_a = sum(c[4] for c in cluster)
++            
++            if tot_a > 1200:
++                x1 = min(c[0] for c in cluster)
++                y1 = min(c[1] for c in cluster)
++                x2 = max(c[0] + c[2] for c in cluster)
++                y2 = max(c[1] + c[3] for c in cluster)
++                cx = sum(c[5][0] * c[4] for c in cluster) / tot_a
++                cy = sum(c[5][1] * c[4] for c in cluster) / tot_a
++                
++                # Ground contact energy in the lane track surface strip (y in [355, 375])
++                track_strip = diff_bg[355:375, max(0, x1):min(960, x2)]
++                contact = np.sum(track_strip > 25)
++                
++                runner_track[t] = {
++                    "t": t,
++                    "cx": cx,
++                    "cy": cy,
++                    "x1": x1,
++                    "y1": y1,
++                    "x2": x2,
++                    "y2": y2,
++                    "h": y2 - y1,
++                    "bot": y2,
++                    "area": tot_a,
++                    "contact": contact,
++                }
++                
++    if not runner_track:
++        return 0, 0
++        
++    sorted_ts = sorted(runner_track.keys())
++    
++    # Identify hurdle crossing: contiguous frames crossing hurdle_x = 512 with runner speed
++    crossings = []
++    for i in range(len(sorted_ts) - 1):
++        t1 = sorted_ts[i]
++        t2 = sorted_ts[i + 1]
++        if t2 == t1 + 1:
++            cx1 = runner_track[t1]["cx"]
++            cx2 = runner_track[t2]["cx"]
++            vel = abs(cx2 - cx1)
++            if 15 <= vel <= 70:
++                if (cx1 >= hurdle_x >= cx2) or (cx1 <= hurdle_x <= cx2):
++                    crossings.append((t1, t2, vel, runner_track[t1]["area"]))
++                    
++    if crossings:
++        crossings.sort(key=lambda x: x[3], reverse=True)
++        t_hurdle = crossings[0][1]
++    else:
++        # Fallback to frame closest to hurdle
++        t_hurdle = min(sorted_ts, key=lambda t: abs(runner_track[t]["cx"] - hurdle_x))
++        
++    # Estimate baseline ground level from frames when runner is on the track
++    ground_candidates = [runner_track[t]["bot"] for t in sorted_ts]
++    ground_level = np.percentile(ground_candidates, 90) if ground_candidates else 365.0
++    
++    # Trace backward from hurdle crossing to detect takeoff:
++    # An airborne frame has elevated bottom (bot < ground_level - 12) or low contact (< 100) or compressed height (< 298)
++    takeoff = t_hurdle
++    for t in range(t_hurdle, max(0, t_hurdle - 20), -1):
++        if t in runner_track:
++            r = runner_track[t]
++            is_airborne = (r["bot"] < ground_level - 12) or (r["contact"] < 80) or (r["h"] < 298)
++            if is_airborne:
++                takeoff = t
++            else:
++                break
++        else:
++            break
++            
++    # Trace forward from hurdle crossing to detect landing:
++    # Landing occurs when foot returns to track level and contact energy spikes
++    # Find the first frame after hurdle where foot touches track or contact spikes
++    landing = t_hurdle
++    for t in range(t_hurdle, min(n_frames, t_hurdle + 20)):
++        if t in runner_track:
++            r = runner_track[t]
++            # When the foot reaches the track level (bot near ground_level and contact energy rises significantly)
++            if t > t_hurdle and (r["bot"] >= ground_level - 5 or r["contact"] >= 250):
++                # Touchdown / landing impact frame
++                # Look at t vs t+1 for peak contact
++                if t + 1 in runner_track and runner_track[t + 1]["contact"] > r["contact"]:
++                    landing = t + 1
++                else:
++                    landing = t
++                break
++        else:
++            break
++            
++    return int(takeoff), int(landing)
++
++
++def save_output_toml(takeoff_frame, land_frame, output_path):
++    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++    
++    # Write using toml library if available, and also ensure standard format
++    data = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++    
++    with open(output_path, "w") as f:
++        if toml is not None:
++            toml.dump(data, f)
++        else:
++            f.write(f"jump_takeoff_frame_number = {int(takeoff_frame)}\n")
++            f.write(f"jump_land_frame_number = {int(land_frame)}\n")
++
++
++def main():
++    video_path, output_path = parse_arguments()
++    print(f"Analyzing video: {video_path}")
++    
++    takeoff, landing = analyze_hurdle_jump(video_path)
++    print(f"Detected Takeoff Frame: {takeoff}")
++    print(f"Detected Landing Frame: {landing}")
++    
++    save_output_toml(takeoff, landing, output_path)
++    print(f"Results written to: {output_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 54
++jump_land_frame_number = 63

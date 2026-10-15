@@ -1,0 +1,84 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..6ce8895b0d 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -144,6 +144,9 @@ class ForwardManyToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         if not remote_field.multiple:
+             for rel_obj in queryset:
++                if remote_field.is_cached(rel_obj):
++                    # Don't override an object fetched by a nested prefetch.
++                    continue
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+                 remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+@@ -376,6 +379,9 @@ class ReverseOneToOneDescriptor:
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
++            if self.related.field.is_cached(rel_obj):
++                # Don't override an object fetched by a nested prefetch.
++                continue
+             instance = instances_dict[rel_obj_attr(rel_obj)]
+             self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+@@ -646,6 +652,9 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             # Since we just bypassed this class' get_queryset(), we must manage
+             # the reverse relation manually.
+             for rel_obj in queryset:
++                if self.field.is_cached(rel_obj):
++                    # Don't override an object fetched by a nested prefetch.
++                    continue
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+                 setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..5a094a5cd0 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -1614,3 +1614,45 @@ class ReadPrefetchedObjectsCacheTests(TestCase):
+         with self.assertNumQueries(4):
+             # AuthorWithAge -> Author -> FavoriteAuthors, Book
+             self.assertSequenceEqual(authors, [self.author1, self.author2])
++
++
++class NestedPrefetchTests(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        house = House.objects.create(name='Big house', address='123 Main St')
++        cls.room = Room.objects.create(name='Kitchen', house=house)
++
++    def test_nested_prefetch_is_not_overwritten_by_related_object(self):
++        """
++        The prefetched relationship is used rather than populating the reverse
++        relationship from the parent, when prefetching a set of child objects
++        related to a set of parent objects and the child queryset itself
++        specifies a prefetch back to the parent.
++        """
++        queryset = House.objects.only('name').prefetch_related(
++            Prefetch('rooms', queryset=Room.objects.prefetch_related(
++                Prefetch('house', queryset=House.objects.only('address')),
++            )),
++        )
++        with self.assertNumQueries(3):
++            house = queryset.first()
++
++        self.assertIs(Room.house.is_cached(self.room), True)
++        with self.assertNumQueries(0):
++            house.rooms.all()[0].house.address
++
++
++class NestedPrefetchOneToOneTests(TestCase):
++    def test_nested_prefetch_one_to_one(self):
++        book = Book.objects.create(title='Poems')
++        author = Author.objects.create(name='Jane', first_book=book)
++        Bio.objects.create(author=author)
++        queryset = Author.objects.only('name').prefetch_related(
++            Prefetch('bio', queryset=Bio.objects.prefetch_related(
++                Prefetch('author', queryset=Author.objects.only('name', 'first_book')),
++            )),
++        )
++        with self.assertNumQueries(3):
++            author = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(author.bio.author.first_book_id, book.pk)

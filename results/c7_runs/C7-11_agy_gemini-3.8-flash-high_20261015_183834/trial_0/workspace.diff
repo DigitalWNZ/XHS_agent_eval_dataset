@@ -1,0 +1,2021 @@
+diff --git a/s2/encode.go b/s2/encode.go
+index e396cb4..69c6118 100644
+--- a/s2/encode.go
++++ b/s2/encode.go
+@@ -17,8 +17,11 @@ package s2
+ import (
+ 	"bufio"
+ 	"encoding/binary"
++	"errors"
+ 	"io"
+ 	"math"
++
++	"github.com/golang/geo/r3"
+ )
+ 
+ const (
+@@ -120,6 +123,12 @@ func (e *encoder) writeFloat64(x float64) {
+ 	e.err = binary.Write(e.w, binary.LittleEndian, x)
+ }
+ 
++func (e *encoder) writePoint(p Point) {
++	e.writeFloat64(p.X)
++	e.writeFloat64(p.Y)
++	e.writeFloat64(p.Z)
++}
++
+ type byteReader interface {
+ 	io.Reader
+ 	io.ByteReader
+@@ -203,3 +212,37 @@ func (d *decoder) readUvarint() (x uint64) {
+ 	x, d.err = binary.ReadUvarint(d.r)
+ 	return
+ }
++
++func (d *decoder) readInt32() (x int32) {
++	if d.err != nil {
++		return
++	}
++	d.err = binary.Read(d.r, binary.LittleEndian, &x)
++	return
++}
++
++func (d *decoder) readInt64() (x int64) {
++	if d.err != nil {
++		return
++	}
++	d.err = binary.Read(d.r, binary.LittleEndian, &x)
++	return
++}
++
++func (d *decoder) readPoint() Point {
++	if d.err != nil {
++		return Point{}
++	}
++	x := d.readFloat64()
++	y := d.readFloat64()
++	z := d.readFloat64()
++	if d.err != nil {
++		return Point{}
++	}
++	if math.IsNaN(x) || math.IsNaN(y) || math.IsNaN(z) ||
++		math.IsInf(x, 0) || math.IsInf(y, 0) || math.IsInf(z, 0) {
++		d.err = errors.New("point coordinates must be finite numbers")
++		return Point{}
++	}
++	return Point{r3.Vector{X: x, Y: y, Z: z}}
++}
+diff --git a/s2/lax_loop.go b/s2/lax_loop.go
+index 451818d..bc496a7 100644
+--- a/s2/lax_loop.go
++++ b/s2/lax_loop.go
+@@ -14,6 +14,11 @@
+ 
+ package s2
+ 
++import (
++	"fmt"
++	"io"
++)
++
+ // Shape interface enforcement
+ var _ Shape = (*LaxLoop)(nil)
+ 
+@@ -81,9 +86,60 @@ func (l *LaxLoop) ChainEdge(i, j int) Edge {
+ func (l *LaxLoop) ChainPosition(e int) ChainPosition { return ChainPosition{0, e} }
+ func (l *LaxLoop) IsEmpty() bool                     { return defaultShapeIsEmpty(l) }
+ func (l *LaxLoop) IsFull() bool                      { return defaultShapeIsFull(l) }
+-func (l *LaxLoop) typeTag() typeTag                  { return typeTagNone }
++func (l *LaxLoop) typeTag() typeTag                  { return typeTagLaxLoop }
+ func (l *LaxLoop) privateInterface()                 {}
+ 
++// Encode encodes the LaxLoop.
++func (l *LaxLoop) Encode(w io.Writer) error {
++	e := &encoder{w: w}
++	l.encode(e)
++	return e.err
++}
++
++func (l *LaxLoop) encode(e *encoder) {
++	e.writeInt8(encodingVersion)
++	e.writeUint32(uint32(len(l.vertices)))
++	for _, pt := range l.vertices {
++		e.writePoint(pt)
++	}
++}
++
++// Decode decodes the LaxLoop.
++func (l *LaxLoop) Decode(r io.Reader) error {
++	d := &decoder{r: asByteReader(r)}
++	l.decode(d)
++	return d.err
++}
++
++func (l *LaxLoop) decode(d *decoder) {
++	version := d.readInt8()
++	if d.err != nil {
++		return
++	}
++	if version != encodingVersion {
++		d.err = fmt.Errorf("cannot decode LaxLoop version %d; my version: %d", version, encodingVersion)
++		return
++	}
++	nverts := d.readUint32()
++	if d.err != nil {
++		return
++	}
++	if nverts > maxEncodedVertices {
++		d.err = fmt.Errorf("too many vertices (%d; max is %d)", nverts, maxEncodedVertices)
++		return
++	}
++	verts := make([]Point, 0, min(int(nverts), 1024))
++	for range nverts {
++		pt := d.readPoint()
++		if d.err != nil {
++			return
++		}
++		verts = append(verts, pt)
++	}
++	l.numVertices = len(verts)
++	l.vertices = verts
++}
++
+ // TODO(roberts): Remaining to be ported from C++:
+ // LaxClosedPolyline
+ // VertexIDLaxLoop
+diff --git a/s2/lax_polygon.go b/s2/lax_polygon.go
+index ba9cf22..8ff73a8 100644
+--- a/s2/lax_polygon.go
++++ b/s2/lax_polygon.go
+@@ -14,6 +14,11 @@
+ 
+ package s2
+ 
++import (
++	"fmt"
++	"io"
++)
++
+ // Shape interface enforcement
+ var _ Shape = (*LaxPolygon)(nil)
+ 
+@@ -220,5 +225,85 @@ func (p *LaxPolygon) ChainPosition(e int) ChainPosition {
+ 	return ChainPosition{p.cumulativeVertices[nextLoop] - p.cumulativeVertices[1], e - p.cumulativeVertices[nextLoop-1]}
+ }
+ 
++// Encode encodes the LaxPolygon.
++func (p *LaxPolygon) Encode(w io.Writer) error {
++	e := &encoder{w: w}
++	p.encode(e)
++	return e.err
++}
++
++func (p *LaxPolygon) encode(e *encoder) {
++	e.writeInt8(encodingVersion)
++	e.writeUint32(uint32(p.numLoops))
++	for i := 0; i < p.numLoops; i++ {
++		e.writeUint32(uint32(p.numLoopVertices(i)))
++	}
++	totalVerts := p.numVertices()
++	for i := 0; i < totalVerts; i++ {
++		e.writePoint(p.vertices[i])
++	}
++}
++
++// Decode decodes the LaxPolygon.
++func (p *LaxPolygon) Decode(r io.Reader) error {
++	d := &decoder{r: asByteReader(r)}
++	p.decode(d)
++	return d.err
++}
++
++func (p *LaxPolygon) decode(d *decoder) {
++	version := d.readInt8()
++	if d.err != nil {
++		return
++	}
++	if version != encodingVersion {
++		d.err = fmt.Errorf("cannot decode LaxPolygon version %d; my version: %d", version, encodingVersion)
++		return
++	}
++	numLoops := d.readUint32()
++	if d.err != nil {
++		return
++	}
++	if numLoops > maxEncodedLoops {
++		d.err = fmt.Errorf("too many loops (%d; max is %d)", numLoops, maxEncodedLoops)
++		return
++	}
++
++	loopSizes := make([]int, 0, min(int(numLoops), 1024))
++	var totalVerts int
++	for range numLoops {
++		sz := d.readUint32()
++		if d.err != nil {
++			return
++		}
++		if sz > maxEncodedVertices {
++			d.err = fmt.Errorf("too many vertices in loop (%d; max is %d)", sz, maxEncodedVertices)
++			return
++		}
++		totalVerts += int(sz)
++		if totalVerts > maxEncodedVertices {
++			d.err = fmt.Errorf("too many total vertices (%d; max is %d)", totalVerts, maxEncodedVertices)
++			return
++		}
++		loopSizes = append(loopSizes, int(sz))
++	}
++
++	loops := make([][]Point, numLoops)
++	for i, sz := range loopSizes {
++		loop := make([]Point, 0, min(sz, 1024))
++		for range sz {
++			pt := d.readPoint()
++			if d.err != nil {
++				return
++			}
++			loop = append(loop, pt)
++		}
++		loops[i] = loop
++	}
++
++	lp := LaxPolygonFromPoints(loops)
++	*p = *lp
++}
++
+ // TODO(roberts): Remaining to port from C++:
+ // EncodedLaxPolygon
+diff --git a/s2/lax_polyline.go b/s2/lax_polyline.go
+index a0e0613..ce825d2 100644
+--- a/s2/lax_polyline.go
++++ b/s2/lax_polyline.go
+@@ -14,6 +14,11 @@
+ 
+ package s2
+ 
++import (
++	"fmt"
++	"io"
++)
++
+ const laxPolylineTypeTag = 4
+ 
+ // LaxPolyline represents a polyline. It is similar to Polyline except
+@@ -53,6 +58,55 @@ func (l *LaxPolyline) IsFull() bool                      { return defaultShapeIs
+ func (l *LaxPolyline) typeTag() typeTag                  { return typeTagLaxPolyline }
+ func (l *LaxPolyline) privateInterface()                 {}
+ 
++// Encode encodes the LaxPolyline.
++func (l *LaxPolyline) Encode(w io.Writer) error {
++	e := &encoder{w: w}
++	l.encode(e)
++	return e.err
++}
++
++func (l *LaxPolyline) encode(e *encoder) {
++	e.writeInt8(encodingVersion)
++	e.writeUint32(uint32(len(l.vertices)))
++	for _, pt := range l.vertices {
++		e.writePoint(pt)
++	}
++}
++
++// Decode decodes the LaxPolyline.
++func (l *LaxPolyline) Decode(r io.Reader) error {
++	d := &decoder{r: asByteReader(r)}
++	l.decode(d)
++	return d.err
++}
++
++func (l *LaxPolyline) decode(d *decoder) {
++	version := d.readInt8()
++	if d.err != nil {
++		return
++	}
++	if version != encodingVersion {
++		d.err = fmt.Errorf("cannot decode LaxPolyline version %d; my version: %d", version, encodingVersion)
++		return
++	}
++	nverts := d.readUint32()
++	if d.err != nil {
++		return
++	}
++	if nverts > maxEncodedVertices {
++		d.err = fmt.Errorf("too many vertices (%d; max is %d)", nverts, maxEncodedVertices)
++		return
++	}
++	verts := make([]Point, 0, min(int(nverts), 1024))
++	for range nverts {
++		pt := d.readPoint()
++		if d.err != nil {
++			return
++		}
++		verts = append(verts, pt)
++	}
++	l.vertices = verts
++}
++
+ // TODO(roberts):
+-// Add Encode/Decode support
+ // Add EncodedLaxPolyline type
+diff --git a/s2/loop.go b/s2/loop.go
+index c4b1e9d..f094824 100644
+--- a/s2/loop.go
++++ b/s2/loop.go
+@@ -518,7 +518,7 @@ func (l *Loop) ChainPosition(edgeID int) ChainPosition {
+ // Dimension returns the dimension of the geometry represented by this Loop.
+ func (l *Loop) Dimension() int { return 2 }
+ 
+-func (l *Loop) typeTag() typeTag { return typeTagNone }
++func (l *Loop) typeTag() typeTag { return typeTagLoop }
+ 
+ func (l *Loop) privateInterface() {}
+ 
+@@ -1302,16 +1302,21 @@ func (l *Loop) decode(d *decoder) {
+ 		}
+ 		return
+ 	}
+-	l.vertices = make([]Point, nvertices)
+-	for i := range l.vertices {
+-		l.vertices[i].X = d.readFloat64()
+-		l.vertices[i].Y = d.readFloat64()
+-		l.vertices[i].Z = d.readFloat64()
++	l.vertices = make([]Point, 0, min(int(nvertices), 1024))
++	for range nvertices {
++		pt := d.readPoint()
++		if d.err != nil {
++			return
++		}
++		l.vertices = append(l.vertices, pt)
+ 	}
+ 	l.index = NewShapeIndex()
+ 	l.originInside = d.readBool()
+ 	l.depth = int(d.readUint32())
+ 	l.bound.decode(d)
++	if d.err != nil {
++		return
++	}
+ 	l.subregionBound = ExpandForSubregions(l.bound)
+ 
+ 	l.index.Add(l)
+diff --git a/s2/point_vector.go b/s2/point_vector.go
+index f8e6f65..ab56b1f 100644
+--- a/s2/point_vector.go
++++ b/s2/point_vector.go
+@@ -14,6 +14,11 @@
+ 
+ package s2
+ 
++import (
++	"fmt"
++	"io"
++)
++
+ // Shape interface enforcement
+ var (
+ 	_ Shape = (*PointVector)(nil)
+@@ -40,3 +45,53 @@ func (p *PointVector) IsEmpty() bool                     { return defaultShapeIs
+ func (p *PointVector) IsFull() bool                      { return defaultShapeIsFull(p) }
+ func (p *PointVector) typeTag() typeTag                  { return typeTagPointVector }
+ func (p *PointVector) privateInterface()                 {}
++
++// Encode encodes the PointVector.
++func (p *PointVector) Encode(w io.Writer) error {
++	e := &encoder{w: w}
++	p.encode(e)
++	return e.err
++}
++
++func (p *PointVector) encode(e *encoder) {
++	e.writeInt8(encodingVersion)
++	e.writeUint32(uint32(len(*p)))
++	for _, pt := range *p {
++		e.writePoint(pt)
++	}
++}
++
++// Decode decodes the PointVector.
++func (p *PointVector) Decode(r io.Reader) error {
++	d := &decoder{r: asByteReader(r)}
++	p.decode(d)
++	return d.err
++}
++
++func (p *PointVector) decode(d *decoder) {
++	version := d.readInt8()
++	if d.err != nil {
++		return
++	}
++	if version != encodingVersion {
++		d.err = fmt.Errorf("cannot decode PointVector version %d; my version: %d", version, encodingVersion)
++		return
++	}
++	npoints := d.readUint32()
++	if d.err != nil {
++		return
++	}
++	if npoints > maxEncodedVertices {
++		d.err = fmt.Errorf("too many points (%d; max is %d)", npoints, maxEncodedVertices)
++		return
++	}
++	pts := make(PointVector, 0, min(int(npoints), 1024))
++	for range npoints {
++		pt := d.readPoint()
++		if d.err != nil {
++			return
++		}
++		pts = append(pts, pt)
++	}
++	*p = pts
++}
+diff --git a/s2/polygon.go b/s2/polygon.go
+index c14ccdf..b2cdb4e 100644
+--- a/s2/polygon.go
++++ b/s2/polygon.go
+@@ -1165,11 +1165,15 @@ func (p *Polygon) decode(d *decoder) {
+ 		d.err = fmt.Errorf("too many loops (%d; max is %d)", nloops, maxEncodedLoops)
+ 		return
+ 	}
+-	p.loops = make([]*Loop, nloops)
+-	for i := range p.loops {
+-		p.loops[i] = new(Loop)
+-		p.loops[i].decode(d)
+-		p.numVertices += len(p.loops[i].vertices)
++	p.loops = make([]*Loop, 0, min(int(nloops), 1024))
++	for range nloops {
++		loop := new(Loop)
++		loop.decode(d)
++		if d.err != nil {
++			return
++		}
++		p.loops = append(p.loops, loop)
++		p.numVertices += len(loop.vertices)
+ 	}
+ 
+ 	p.bound.decode(d)
+@@ -1190,13 +1194,21 @@ func (p *Polygon) decodeCompressed(d *decoder) {
+ 	// Polygons with no loops are explicitly allowed here: a newly created
+ 	// polygon has zero loops and such polygons encode and decode properly.
+ 	nloops := int(d.readUvarint())
+-	if nloops > maxEncodedLoops {
++	if d.err != nil {
++		return
++	}
++	if nloops > maxEncodedLoops || nloops < 0 {
+ 		d.err = fmt.Errorf("too many loops (%d; max is %d)", nloops, maxEncodedLoops)
++		return
+ 	}
+-	p.loops = make([]*Loop, nloops)
+-	for i := range p.loops {
+-		p.loops[i] = new(Loop)
+-		p.loops[i].decodeCompressed(d, snapLevel)
++	p.loops = make([]*Loop, 0, min(nloops, 1024))
++	for range nloops {
++		loop := new(Loop)
++		loop.decodeCompressed(d, snapLevel)
++		if d.err != nil {
++			return
++		}
++		p.loops = append(p.loops, loop)
+ 	}
+ 	p.initLoopProperties()
+ }
+diff --git a/s2/polyline.go b/s2/polyline.go
+index 6185a16..9c4fe21 100644
+--- a/s2/polyline.go
++++ b/s2/polyline.go
+@@ -371,12 +371,12 @@ func (p Polyline) encode(e *encoder) {
+ 
+ // Decode decodes the polyline.
+ func (p *Polyline) Decode(r io.Reader) error {
+-	d := decoder{r: asByteReader(r)}
++	d := &decoder{r: asByteReader(r)}
+ 	p.decode(d)
+ 	return d.err
+ }
+ 
+-func (p *Polyline) decode(d decoder) {
++func (p *Polyline) decode(d *decoder) {
+ 	version := d.readInt8()
+ 	if d.err != nil {
+ 		return
+@@ -393,12 +393,15 @@ func (p *Polyline) decode(d decoder) {
+ 		d.err = fmt.Errorf("too many vertices (%d; max is %d)", nvertices, maxEncodedVertices)
+ 		return
+ 	}
+-	*p = make([]Point, nvertices)
+-	for i := range *p {
+-		(*p)[i].X = d.readFloat64()
+-		(*p)[i].Y = d.readFloat64()
+-		(*p)[i].Z = d.readFloat64()
++	pts := make([]Point, 0, min(int(nvertices), 1024))
++	for range nvertices {
++		pt := d.readPoint()
++		if d.err != nil {
++			return
++		}
++		pts = append(pts, pt)
+ 	}
++	*p = pts
+ }
+ 
+ // Project returns a point on the polyline that is closest to the given point,
+diff --git a/s2/shape.go b/s2/shape.go
+index 765cadf..c1fcfc7 100644
+--- a/s2/shape.go
++++ b/s2/shape.go
+@@ -149,6 +149,8 @@ const (
+ 	typeTagPointVector typeTag = 3
+ 	typeTagLaxPolyline typeTag = 4
+ 	typeTagLaxPolygon  typeTag = 5
++	typeTagLoop        typeTag = 6
++	typeTagLaxLoop     typeTag = 7
+ 
+ 	// The minimum allowable tag for future user-defined Shape types.
+ 	typeTagMinUser typeTag = 8192
+diff --git a/s2/shapeindex.go b/s2/shapeindex.go
+index 60f7257..3a4bc49 100644
+--- a/s2/shapeindex.go
++++ b/s2/shapeindex.go
+@@ -15,6 +15,9 @@
+ package s2
+ 
+ import (
++	"errors"
++	"fmt"
++	"io"
+ 	"math"
+ 	"slices"
+ 	"sort"
+@@ -846,7 +849,7 @@ func (s *ShapeIndex) applyUpdatesInternal() {
+ 		s.removeShapeInternal(p, allEdges, t)
+ 	}
+ 
+-	for id := s.pendingAdditionsPos; id < int32(len(s.shapes)); id++ {
++	for id := s.pendingAdditionsPos; id < s.nextID; id++ {
+ 		s.addShapeInternal(id, allEdges, t)
+ 	}
+ 
+@@ -855,7 +858,7 @@ func (s *ShapeIndex) applyUpdatesInternal() {
+ 	}
+ 
+ 	s.pendingRemovals = s.pendingRemovals[:0]
+-	s.pendingAdditionsPos = int32(len(s.shapes))
++	s.pendingAdditionsPos = s.nextID
+ 	// It is the caller's responsibility to update the index status.
+ }
+ 
+@@ -1540,3 +1543,361 @@ func maxLevelForEdge(edge Edge) int {
+ func (s *ShapeIndex) removeShapeInternal(removed *removedShape, allEdges [][]faceEdge, t *tracker) {
+ 	// TODO(roberts): finish the implementation of this.
+ }
++
++const (
++	shapeIndexEncodingVersion = int8(1)
++	maxEncodedShapes          = 10000000
++	maxEncodedCells           = 10000000
++	maxEncodedClippedShapes   = 10000000
++	maxEncodedEdgesPerShape   = 10000000
++)
++
++// Encode encodes the ShapeIndex to the given Writer.
++func (s *ShapeIndex) Encode(w io.Writer) error {
++	if w == nil {
++		return errors.New("cannot encode to nil io.Writer")
++	}
++
++	s.maybeApplyUpdates()
++
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++
++	e := &encoder{w: w}
++	s.encode(e)
++	return e.err
++}
++
++func (s *ShapeIndex) encode(e *encoder) {
++	e.writeInt8(shapeIndexEncodingVersion)
++	e.writeInt32(int32(s.maxEdgesPerCell))
++	e.writeInt32(s.nextID)
++	e.writeInt32(s.pendingAdditionsPos)
++
++	// Shapes:
++	e.writeUint32(uint32(len(s.shapes)))
++	// Write shapes in sorted order by shapeID for determinism
++	shapeIDs := make([]int32, 0, len(s.shapes))
++	for id := range s.shapes {
++		shapeIDs = append(shapeIDs, id)
++	}
++	slices.Sort(shapeIDs)
++
++	for _, id := range shapeIDs {
++		shape := s.shapes[id]
++		if shape == nil {
++			e.err = fmt.Errorf("cannot encode nil shape with ID %d", id)
++			return
++		}
++		tag := shape.typeTag()
++		if tag == typeTagNone {
++			e.err = fmt.Errorf("cannot encode shape %d: unsupported shape type %T", id, shape)
++			return
++		}
++		e.writeInt32(id)
++		e.writeUint32(uint32(tag))
++		encodeShape(e, shape)
++		if e.err != nil {
++			return
++		}
++	}
++
++	// Cells:
++	e.writeUint32(uint32(len(s.cells)))
++	for _, cellID := range s.cells {
++		cell := s.cellMap[cellID]
++		e.writeUint64(uint64(cellID))
++		if cell == nil {
++			e.writeUint32(0)
++			continue
++		}
++		e.writeUint32(uint32(len(cell.shapes)))
++		for _, cs := range cell.shapes {
++			e.writeInt32(cs.shapeID)
++			e.writeBool(cs.containsCenter)
++			e.writeUint32(uint32(len(cs.edges)))
++			for _, edgeID := range cs.edges {
++				e.writeInt32(int32(edgeID))
++			}
++		}
++		if e.err != nil {
++			return
++		}
++	}
++}
++
++func encodeShape(e *encoder, shape Shape) {
++	switch s := shape.(type) {
++	case *Polygon:
++		s.encode(e)
++	case *Polyline:
++		s.encode(e)
++	case *PointVector:
++		s.encode(e)
++	case *LaxPolyline:
++		s.encode(e)
++	case *LaxPolygon:
++		s.encode(e)
++	case *Loop:
++		s.encode(e)
++	case *LaxLoop:
++		s.encode(e)
++	default:
++		e.err = fmt.Errorf("unsupported shape type: %T", shape)
++	}
++}
++
++func decodeShape(d *decoder, tag typeTag) (Shape, error) {
++	switch tag {
++	case typeTagPolygon:
++		p := new(Polygon)
++		version := int8(d.readUint8())
++		if d.err != nil {
++			return nil, d.err
++		}
++		switch version {
++		case encodingVersion:
++			p.decode(d)
++		case encodingCompressedVersion:
++			p.decodeCompressed(d)
++		default:
++			return nil, fmt.Errorf("unsupported Polygon encoding version: %d", version)
++		}
++		if d.err != nil {
++			return nil, d.err
++		}
++		return p, nil
++	case typeTagPolyline:
++		p := new(Polyline)
++		p.decode(d)
++		if d.err != nil {
++			return nil, d.err
++		}
++		return p, nil
++	case typeTagPointVector:
++		p := new(PointVector)
++		p.decode(d)
++		if d.err != nil {
++			return nil, d.err
++		}
++		return p, nil
++	case typeTagLaxPolyline:
++		p := new(LaxPolyline)
++		p.decode(d)
++		if d.err != nil {
++			return nil, d.err
++		}
++		return p, nil
++	case typeTagLaxPolygon:
++		p := new(LaxPolygon)
++		p.decode(d)
++		if d.err != nil {
++			return nil, d.err
++		}
++		return p, nil
++	case typeTagLoop:
++		l := new(Loop)
++		l.decode(d)
++		if d.err != nil {
++			return nil, d.err
++		}
++		return l, nil
++	case typeTagLaxLoop:
++		l := new(LaxLoop)
++		l.decode(d)
++		if d.err != nil {
++			return nil, d.err
++		}
++		return l, nil
++	default:
++		return nil, fmt.Errorf("unknown shape type tag: %d", tag)
++	}
++}
++
++// Decode decodes the ShapeIndex from the given Reader.
++func (s *ShapeIndex) Decode(r io.Reader) (err error) {
++	if r == nil {
++		return errors.New("cannot decode from nil io.Reader")
++	}
++
++	defer func() {
++		if rec := recover(); rec != nil {
++			err = fmt.Errorf("decode error: %v", rec)
++		}
++	}()
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	d := &decoder{r: asByteReader(r)}
++
++	version := d.readInt8()
++	if d.err != nil {
++		return d.err
++	}
++	if version != shapeIndexEncodingVersion {
++		return fmt.Errorf("unsupported ShapeIndex encoding version: %d", version)
++	}
++
++	maxEdgesPerCell := int(d.readInt32())
++	if d.err != nil {
++		return d.err
++	}
++	if maxEdgesPerCell <= 0 {
++		return fmt.Errorf("invalid maxEdgesPerCell: %d", maxEdgesPerCell)
++	}
++
++	nextID := d.readInt32()
++	if d.err != nil {
++		return d.err
++	}
++	if nextID < 0 {
++		return fmt.Errorf("invalid nextID: %d", nextID)
++	}
++
++	pendingAdditionsPos := d.readInt32()
++	if d.err != nil {
++		return d.err
++	}
++	if pendingAdditionsPos < 0 {
++		return fmt.Errorf("invalid pendingAdditionsPos: %d", pendingAdditionsPos)
++	}
++
++	numShapes := d.readUint32()
++	if d.err != nil {
++		return d.err
++	}
++	if numShapes > maxEncodedShapes {
++		return fmt.Errorf("too many shapes (%d; max is %d)", numShapes, maxEncodedShapes)
++	}
++	if int32(numShapes) > nextID {
++		return fmt.Errorf("numShapes (%d) exceeds nextID (%d)", numShapes, nextID)
++	}
++
++	shapes := make(map[int32]Shape, min(int(numShapes), 1024))
++	for range numShapes {
++		shapeID := d.readInt32()
++		if d.err != nil {
++			return d.err
++		}
++		if shapeID < 0 || shapeID >= nextID {
++			return fmt.Errorf("invalid shapeID %d (nextID is %d)", shapeID, nextID)
++		}
++		if _, exists := shapes[shapeID]; exists {
++			return fmt.Errorf("duplicate shapeID: %d", shapeID)
++		}
++		tag := typeTag(d.readUint32())
++		if d.err != nil {
++			return d.err
++		}
++		shape, err := decodeShape(d, tag)
++		if err != nil {
++			return err
++		}
++		if d.err != nil {
++			return d.err
++		}
++		shapes[shapeID] = shape
++	}
++
++	numCells := d.readUint32()
++	if d.err != nil {
++		return d.err
++	}
++	if numCells > maxEncodedCells {
++		return fmt.Errorf("too many cells (%d; max is %d)", numCells, maxEncodedCells)
++	}
++
++	cells := make([]CellID, 0, min(int(numCells), 1024))
++	cellMap := make(map[CellID]*ShapeIndexCell, min(int(numCells), 1024))
++
++	var prevCellID CellID
++	for i := range numCells {
++		cellID := CellID(d.readUint64())
++		if d.err != nil {
++			return d.err
++		}
++		if !cellID.IsValid() {
++			return fmt.Errorf("invalid CellID: %v", cellID)
++		}
++		if i > 0 && cellID <= prevCellID {
++			return fmt.Errorf("cells not in strictly increasing order: %v <= %v", cellID, prevCellID)
++		}
++		prevCellID = cellID
++
++		numCShapes := d.readUint32()
++		if d.err != nil {
++			return d.err
++		}
++		if numCShapes > maxEncodedClippedShapes {
++			return fmt.Errorf("too many clipped shapes (%d; max is %d)", numCShapes, maxEncodedClippedShapes)
++		}
++		cell := &ShapeIndexCell{
++			shapes: make([]*clippedShape, 0, min(int(numCShapes), 64)),
++		}
++		var prevShapeID int32 = -1
++		for j := range numCShapes {
++			cShapeID := d.readInt32()
++			if d.err != nil {
++				return d.err
++			}
++			shape, ok := shapes[cShapeID]
++			if !ok {
++				return fmt.Errorf("cell references unknown shapeID: %d", cShapeID)
++			}
++			if j > 0 && cShapeID <= prevShapeID {
++				return fmt.Errorf("clipped shapes not in strictly increasing order by shapeID: %d <= %d", cShapeID, prevShapeID)
++			}
++			prevShapeID = cShapeID
++
++			containsCenter := d.readBool()
++			numEdges := d.readUint32()
++			if d.err != nil {
++				return d.err
++			}
++			if numEdges > maxEncodedEdgesPerShape {
++				return fmt.Errorf("too many edges in clipped shape (%d; max is %d)", numEdges, maxEncodedEdgesPerShape)
++			}
++			if int(numEdges) > shape.NumEdges() {
++				return fmt.Errorf("numEdges in clipped shape (%d) exceeds shape.NumEdges() (%d)", numEdges, shape.NumEdges())
++			}
++			edges := make([]int, 0, min(int(numEdges), 64))
++			var prevEdgeID int = -1
++			for k := range numEdges {
++				edgeID := int(d.readInt32())
++				if d.err != nil {
++					return d.err
++				}
++				if edgeID < 0 || edgeID >= shape.NumEdges() {
++					return fmt.Errorf("invalid edgeID %d for shape %d (shape has %d edges)", edgeID, cShapeID, shape.NumEdges())
++				}
++				if k > 0 && edgeID <= prevEdgeID {
++					return fmt.Errorf("edges in clipped shape not in strictly increasing order: %d <= %d", edgeID, prevEdgeID)
++				}
++				prevEdgeID = edgeID
++				edges = append(edges, edgeID)
++			}
++			cell.shapes = append(cell.shapes, &clippedShape{
++				shapeID:        cShapeID,
++				containsCenter: containsCenter,
++				edges:          edges,
++			})
++		}
++		cells = append(cells, cellID)
++		cellMap[cellID] = cell
++	}
++
++	if d.err != nil {
++		return d.err
++	}
++
++	s.shapes = shapes
++	s.maxEdgesPerCell = maxEdgesPerCell
++	s.nextID = nextID
++	s.pendingAdditionsPos = pendingAdditionsPos
++	s.cells = cells
++	s.cellMap = cellMap
++	s.pendingRemovals = nil
++	atomic.StoreInt32(&s.status, fresh)
++	return nil
++}
+diff --git a/s2/shapeindex_encode_test.go b/s2/shapeindex_encode_test.go
+new file mode 100644
+index 0000000..2c25d8b
+--- /dev/null
++++ b/s2/shapeindex_encode_test.go
+@@ -0,0 +1,1086 @@
++// Copyright 2024 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package s2
++
++import (
++	"bytes"
++	"encoding/binary"
++	"math"
++	"math/rand"
++	"reflect"
++	"testing"
++)
++
++// Helper to compare two shapes for equality.
++func compareShapes(t *testing.T, id int32, s1, s2 Shape) {
++	t.Helper()
++	if s1 == nil || s2 == nil {
++		if s1 != s2 {
++			t.Errorf("shape %d: nil mismatch: %v vs %v", id, s1, s2)
++		}
++		return
++	}
++	if reflect.TypeOf(s1) != reflect.TypeOf(s2) {
++		t.Errorf("shape %d: type mismatch: got %T, want %T", id, s2, s1)
++		return
++	}
++	if s1.typeTag() != s2.typeTag() {
++		t.Errorf("shape %d: typeTag mismatch: got %v, want %v", id, s2.typeTag(), s1.typeTag())
++	}
++	if s1.NumEdges() != s2.NumEdges() {
++		t.Errorf("shape %d: NumEdges mismatch: got %d, want %d", id, s2.NumEdges(), s1.NumEdges())
++	}
++	if s1.NumChains() != s2.NumChains() {
++		t.Errorf("shape %d: NumChains mismatch: got %d, want %d", id, s2.NumChains(), s1.NumChains())
++	}
++	if s1.Dimension() != s2.Dimension() {
++		t.Errorf("shape %d: Dimension mismatch: got %d, want %d", id, s2.Dimension(), s1.Dimension())
++	}
++	if s1.IsEmpty() != s2.IsEmpty() {
++		t.Errorf("shape %d: IsEmpty mismatch: got %v, want %v", id, s2.IsEmpty(), s1.IsEmpty())
++	}
++	if s1.IsFull() != s2.IsFull() {
++		t.Errorf("shape %d: IsFull mismatch: got %v, want %v", id, s2.IsFull(), s1.IsFull())
++	}
++
++	for i := 0; i < s1.NumEdges(); i++ {
++		e1 := s1.Edge(i)
++		e2 := s2.Edge(i)
++		if e1.V0 != e2.V0 || e1.V1 != e2.V1 {
++			t.Errorf("shape %d: Edge(%d) mismatch: got %v, want %v", id, i, e2, e1)
++		}
++	}
++
++	for i := 0; i < s1.NumChains(); i++ {
++		c1 := s1.Chain(i)
++		c2 := s2.Chain(i)
++		if c1 != c2 {
++			t.Errorf("shape %d: Chain(%d) mismatch: got %v, want %v", id, i, c2, c1)
++		}
++	}
++}
++
++// Helper to compare spatial cells of two ShapeIndexes.
++func compareSpatialCells(t *testing.T, orig, dec *ShapeIndex) {
++	t.Helper()
++	if len(orig.cells) != len(dec.cells) {
++		t.Fatalf("cells length mismatch: got %d, want %d", len(dec.cells), len(orig.cells))
++	}
++	for i, cellID := range orig.cells {
++		if dec.cells[i] != cellID {
++			t.Fatalf("cellID[%d] mismatch: got %v, want %v", i, dec.cells[i], cellID)
++		}
++		origCell := orig.cellMap[cellID]
++		decCell := dec.cellMap[cellID]
++		if len(origCell.shapes) != len(decCell.shapes) {
++			t.Fatalf("cell %v clipped shapes count mismatch: got %d, want %d", cellID, len(decCell.shapes), len(origCell.shapes))
++		}
++		for j, csOrig := range origCell.shapes {
++			csDec := decCell.shapes[j]
++			if csDec.shapeID != csOrig.shapeID {
++				t.Errorf("cell %v shape[%d] ID mismatch: got %d, want %d", cellID, j, csDec.shapeID, csOrig.shapeID)
++			}
++			if csDec.containsCenter != csOrig.containsCenter {
++				t.Errorf("cell %v shape[%d] containsCenter mismatch: got %v, want %v", cellID, j, csDec.containsCenter, csOrig.containsCenter)
++			}
++			if !reflect.DeepEqual(csDec.edges, csOrig.edges) {
++				t.Errorf("cell %v shape[%d] edges mismatch: got %v, want %v", cellID, j, csDec.edges, csOrig.edges)
++			}
++		}
++	}
++}
++
++func TestShapeIndexEncodeDecodeEmpty(t *testing.T) {
++	idx := NewShapeIndex()
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++	if buf.Len() == 0 {
++		t.Errorf("encoded byte stream must be non-empty for empty index, got 0 bytes")
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	if dec.Len() != 0 {
++		t.Errorf("decoded index Len() = %d, want 0", dec.Len())
++	}
++	if dec.NumEdges() != 0 {
++		t.Errorf("decoded index NumEdges() = %d, want 0", dec.NumEdges())
++	}
++	if !dec.IsFresh() {
++		t.Errorf("decoded index should be fresh without calling Build")
++	}
++
++	it := dec.Iterator()
++	if !it.Done() {
++		t.Errorf("iterator on empty index should be Done")
++	}
++}
++
++func TestShapeIndexAllBuiltInShapeTypes(t *testing.T) {
++	idx := NewShapeIndex()
++
++	// 1. Polygon
++	poly := makePolygon("0:0, 0:2, 2:2, 2:0", true)
++	idPoly := idx.Add(poly)
++
++	// 2. Polyline
++	pline := makePolyline("0:0, 1:1, 2:2, 3:3")
++	idPline := idx.Add(pline)
++
++	// 3. PointVector
++	pv := PointVector{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0), PointFromCoords(0, 0, 1)}
++	idPv := idx.Add(&pv)
++
++	// 4. LaxPolyline
++	laxPline := LaxPolylineFromPoints([]Point{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0)})
++	idLaxPline := idx.Add(laxPline)
++
++	// 5. LaxPolygon
++	laxPoly := LaxPolygonFromPoints([][]Point{
++		{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0), PointFromCoords(0, 0, 1)},
++	})
++	idLaxPoly := idx.Add(laxPoly)
++
++	// 6. Loop
++	loop := makeLoop("0:0, 0:3, 3:3, 3:0")
++	idLoop := idx.Add(loop)
++
++	// 7. LaxLoop
++	laxLoop := LaxLoopFromPoints([]Point{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0), PointFromCoords(0, 0, 1)})
++	idLaxLoop := idx.Add(laxLoop)
++
++	idx.Build()
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	if !dec.IsFresh() {
++		t.Errorf("decoded index should be fresh without Build")
++	}
++	if dec.Len() != 7 {
++		t.Errorf("dec.Len() = %d, want 7", dec.Len())
++	}
++
++	expectedIDs := []int32{idPoly, idPline, idPv, idLaxPline, idLaxPoly, idLoop, idLaxLoop}
++	for _, id := range expectedIDs {
++		sOrig := idx.Shape(id)
++		sDec := dec.Shape(id)
++		if sDec == nil {
++			t.Fatalf("decoded shape %d is nil", id)
++		}
++		compareShapes(t, id, sOrig, sDec)
++	}
++
++	compareSpatialCells(t, idx, dec)
++
++	// Verify query works without Build
++	containsQuery := NewContainsPointQuery(dec, VertexModelSemiOpen)
++	ptInside := PointFromLatLng(LatLngFromDegrees(1, 1))
++	if !containsQuery.Contains(ptInside) {
++		t.Errorf("query on decoded index failed to find containment for ptInside")
++	}
++}
++
++func TestShapeIndexShapeIDsSurvive(t *testing.T) {
++	idx := NewShapeIndex()
++	s0 := makePolyline("0:0, 1:1")
++	s1 := makePolyline("1:1, 2:2")
++	s2 := makePolyline("2:2, 3:3")
++
++	id0 := idx.Add(s0)
++	id1 := idx.Add(s1)
++	id2 := idx.Add(s2)
++
++	if id0 != 0 || id1 != 1 || id2 != 2 {
++		t.Fatalf("unexpected initial IDs: %d, %d, %d", id0, id1, id2)
++	}
++
++	// Remove shape 1
++	idx.Remove(s1)
++	idx.Build()
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	if dec.Shape(1) != nil {
++		t.Errorf("shape 1 should be nil after removal and decoding")
++	}
++	if dec.Shape(0) == nil || dec.Shape(2) == nil {
++		t.Fatalf("shape 0 or 2 is nil in decoded index")
++	}
++	compareShapes(t, 0, idx.Shape(0), dec.Shape(0))
++	compareShapes(t, 2, idx.Shape(2), dec.Shape(2))
++
++	// Verify cell references point to 0 and 2
++	for it := dec.Iterator(); !it.Done(); it.Next() {
++		cell := it.IndexCell()
++		for _, cs := range cell.shapes {
++			if cs.shapeID != 0 && cs.shapeID != 2 {
++				t.Errorf("unexpected cell reference to shapeID %d", cs.shapeID)
++			}
++		}
++	}
++
++	// Adding a new shape should get ID 3 (nextID was preserved)
++	s3 := makePolyline("4:4, 5:5")
++	id3 := dec.Add(s3)
++	if id3 != 3 {
++		t.Errorf("new shape got ID %d, want 3", id3)
++	}
++}
++
++func TestShapeIndexEncodeWithoutExplicitBuild(t *testing.T) {
++	idx := NewShapeIndex()
++	poly := makePolygon("0:0, 0:4, 4:4, 4:0", true)
++	pline := makePolyline("1:1, 2:2, 3:3")
++	idx.Add(poly)
++	idx.Add(pline)
++
++	// Note: Build() is NOT explicitly called!
++	if idx.IsFresh() {
++		t.Fatalf("index should not be fresh before build/encode")
++	}
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	// Decoded index must be fresh and have full spatial cells without Build
++	if !dec.IsFresh() {
++		t.Errorf("decoded index should be fresh without Build")
++	}
++	if len(dec.cells) == 0 {
++		t.Errorf("decoded index should have non-empty spatial cells")
++	}
++
++	// Queries must work immediately
++	pt := PointFromLatLng(LatLngFromDegrees(2, 2))
++	it := dec.Iterator()
++	if !it.LocatePoint(pt) {
++		t.Errorf("LocatePoint(%v) failed on decoded index without Build", pt)
++	}
++	cpq := NewContainsPointQuery(dec, VertexModelSemiOpen)
++	if !cpq.Contains(pt) {
++		t.Errorf("ContainsPointQuery failed on decoded index without Build")
++	}
++}
++
++func TestShapeIndexZeroEdgeShapes(t *testing.T) {
++	idx := NewShapeIndex()
++
++	// Empty PointVector (0 edges)
++	pvEmpty := PointVector{}
++	idPv := idx.Add(&pvEmpty)
++
++	// Empty LaxPolyline (0 edges)
++	laxPlineEmpty := LaxPolylineFromPoints(nil)
++	idLaxPline := idx.Add(laxPlineEmpty)
++
++	// Single point LaxPolyline (0 edges)
++	laxPline1 := LaxPolylineFromPoints([]Point{PointFromCoords(1, 0, 0)})
++	idLaxPline1 := idx.Add(laxPline1)
++
++	// Empty Polyline (0 edges)
++	plineEmpty := Polyline(nil)
++	idPline := idx.Add(&plineEmpty)
++
++	// Single point Polyline (0 edges)
++	pline1 := Polyline([]Point{PointFromCoords(1, 0, 0)})
++	idPline1 := idx.Add(&pline1)
++
++	// Empty Polygon (0 edges)
++	polyEmpty := &Polygon{}
++	idPoly := idx.Add(polyEmpty)
++
++	// Full Polygon (0 edges, full)
++	polyFull := PolygonFromLoops([]*Loop{FullLoop()})
++	idPolyFull := idx.Add(polyFull)
++
++	// Empty LaxPolygon (0 edges)
++	laxPolyEmpty := LaxPolygonFromPoints(nil)
++	idLaxPoly := idx.Add(laxPolyEmpty)
++
++	// Full LaxPolygon (0 edges, full)
++	laxPolyFull := LaxPolygonFromPoints([][]Point{{}})
++	idLaxPolyFull := idx.Add(laxPolyFull)
++
++	// Empty Loop (0 edges)
++	loopEmpty := EmptyLoop()
++	idLoopEmpty := idx.Add(loopEmpty)
++
++	// Full Loop (0 edges, full)
++	loopFull := FullLoop()
++	idLoopFull := idx.Add(loopFull)
++
++	// Empty LaxLoop (0 edges)
++	laxLoopEmpty := LaxLoopFromPoints(nil)
++	idLaxLoopEmpty := idx.Add(laxLoopEmpty)
++
++	idx.Build()
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	allZeroIDs := []int32{
++		idPv, idLaxPline, idLaxPline1, idPline, idPline1,
++		idPoly, idPolyFull, idLaxPoly, idLaxPolyFull,
++		idLoopEmpty, idLoopFull, idLaxLoopEmpty,
++	}
++
++	for _, id := range allZeroIDs {
++		sOrig := idx.Shape(id)
++		sDec := dec.Shape(id)
++		if sDec == nil {
++			t.Fatalf("decoded shape %d is nil", id)
++		}
++		if sDec.NumEdges() != 0 {
++			t.Errorf("shape %d NumEdges = %d, want 0", id, sDec.NumEdges())
++		}
++		compareShapes(t, id, sOrig, sDec)
++	}
++
++	compareSpatialCells(t, idx, dec)
++}
++
++func TestShapeIndexMixedChainCounts(t *testing.T) {
++	idx := NewShapeIndex()
++
++	p1 := PointFromCoords(1, 0, 0)
++	p2 := PointFromCoords(0, 1, 0)
++	p3 := PointFromCoords(0, 0, 1)
++	p4 := PointFromCoords(-1, 0, 0)
++	p5 := PointFromCoords(0, -1, 0)
++
++	// LaxPolygon with mixed chains:
++	// chain 0: 4 vertices (4 edges)
++	// chain 1: 0 vertices (0 edges - full degeneracy)
++	// chain 2: 1 vertex (1 degenerate edge)
++	// chain 3: 2 vertices (2 edges)
++	// chain 4: 3 vertices (3 edges)
++	mixedLoops := [][]Point{
++		{p1, p2, p3, p4},
++		{},
++		{p5},
++		{p1, p2},
++		{p3, p4, p5},
++	}
++	laxPolyMixed := LaxPolygonFromPoints(mixedLoops)
++	idLaxPoly := idx.Add(laxPolyMixed)
++
++	// Polygon with 2 loops
++	poly2 := PolygonFromLoops([]*Loop{
++		makeLoop("0:0, 0:4, 4:4, 4:0"),
++		makeLoop("1:1, 1:2, 2:2, 2:1"),
++	})
++	idPoly2 := idx.Add(poly2)
++
++	// PointVector with 5 points (5 chains)
++	pv5 := PointVector{p1, p2, p3, p4, p5}
++	idPv5 := idx.Add(&pv5)
++
++	// Polyline (1 chain)
++	pline := makePolyline("0:0, 1:1, 2:2")
++	idPline := idx.Add(pline)
++
++	idx.Build()
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	for _, id := range []int32{idLaxPoly, idPoly2, idPv5, idPline} {
++		compareShapes(t, id, idx.Shape(id), dec.Shape(id))
++	}
++
++	// Verify chain lengths for the mixed LaxPolygon
++	decLax := dec.Shape(idLaxPoly)
++	if decLax.NumChains() != 5 {
++		t.Fatalf("mixed LaxPolygon NumChains = %d, want 5", decLax.NumChains())
++	}
++	expectedChainLens := []int{4, 0, 1, 2, 3}
++	for i, wantLen := range expectedChainLens {
++		c := decLax.Chain(i)
++		if c.Length != wantLen {
++			t.Errorf("chain %d length = %d, want %d", i, c.Length, wantLen)
++		}
++	}
++
++	compareSpatialCells(t, idx, dec)
++}
++
++func TestShapeIndexDecodeMalformedInput(t *testing.T) {
++	// Build a valid encoding first
++	idx := NewShapeIndex()
++	idx.Add(makePolygon("0:0, 0:2, 2:2, 2:0", true))
++	idx.Add(makePolyline("0:0, 1:1, 2:2"))
++	pv := PointVector{PointFromCoords(1, 0, 0)}
++	idx.Add(&pv)
++	idx.Build()
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++	validBytes := buf.Bytes()
++
++	t.Run("NilReader", func(t *testing.T) {
++		dec := NewShapeIndex()
++		if err := dec.Decode(nil); err == nil {
++			t.Errorf("expected error for nil Reader, got nil")
++		}
++	})
++
++	t.Run("TruncatedData", func(t *testing.T) {
++		// Truncate at every single byte prefix
++		for i := 0; i < len(validBytes); i++ {
++			dec := NewShapeIndex()
++			err := dec.Decode(bytes.NewReader(validBytes[:i]))
++			if err == nil {
++				t.Fatalf("expected error for truncated data at byte %d of %d, got nil", i, len(validBytes))
++			}
++		}
++	})
++
++	t.Run("InvalidVersion", func(t *testing.T) {
++		corrupt := append([]byte(nil), validBytes...)
++		corrupt[0] = 99 // invalid version
++		dec := NewShapeIndex()
++		if err := dec.Decode(bytes.NewReader(corrupt)); err == nil {
++			t.Errorf("expected error for invalid version, got nil")
++		}
++	})
++
++	t.Run("CorruptedBytes", func(t *testing.T) {
++		// Random byte flips
++		rng := rand.New(rand.NewSource(42))
++		for iter := 0; iter < 100; iter++ {
++			corrupt := append([]byte(nil), validBytes...)
++			// flip a few random bytes
++			for flips := 0; flips < 5; flips++ {
++				pos := rng.Intn(len(corrupt))
++				corrupt[pos] = byte(rng.Intn(256))
++			}
++			dec := NewShapeIndex()
++			// Must return error or succeed, but NEVER panic
++			func() {
++				defer func() {
++					if r := recover(); r != nil {
++						t.Fatalf("Decode panicked on corrupted bytes: %v", r)
++					}
++				}()
++				_ = dec.Decode(bytes.NewReader(corrupt))
++			}()
++		}
++	})
++
++	t.Run("OversizedShapesCount", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, uint32(math.MaxUint32)) // oversized numShapes
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for math.MaxUint32 shapes, got nil")
++		}
++	})
++
++	t.Run("OversizedCellsCount", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0))            // 0 shapes
++		binary.Write(&b, binary.LittleEndian, uint32(math.MaxUint32)) // oversized numCells
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for math.MaxUint32 cells, got nil")
++		}
++	})
++
++	t.Run("UnknownShapeTypeTag", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 shape
++		binary.Write(&b, binary.LittleEndian, int32(0))  // shapeID 0
++		binary.Write(&b, binary.LittleEndian, uint32(9999)) // unknown tag
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for unknown shape type tag, got nil")
++		}
++	})
++
++	t.Run("InvalidCellID", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0)) // 0 shapes
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 cell
++		binary.Write(&b, binary.LittleEndian, uint64(0)) // cellID 0 (invalid)
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for invalid cell ID, got nil")
++		}
++	})
++
++	t.Run("CellsOutOfOrder", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0)) // 0 shapes
++		binary.Write(&b, binary.LittleEndian, uint32(2)) // 2 cells
++		c1 := CellIDFromFace(1)
++		c2 := CellIDFromFace(0)                          // decreasing!
++		binary.Write(&b, binary.LittleEndian, uint64(c1))
++		binary.Write(&b, binary.LittleEndian, uint32(0)) // 0 clipped shapes
++		binary.Write(&b, binary.LittleEndian, uint64(c2))
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for cells out of order, got nil")
++		}
++	})
++
++	t.Run("CellReferencesNonExistentShape", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0)) // 0 shapes
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 cell
++		c1 := CellIDFromFace(0)
++		binary.Write(&b, binary.LittleEndian, uint64(c1))
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 clipped shape
++		binary.Write(&b, binary.LittleEndian, int32(99)) // shapeID 99 (does not exist)
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for cell referencing non-existent shape, got nil")
++		}
++	})
++
++	t.Run("NaNFloatPoint", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 shape
++		binary.Write(&b, binary.LittleEndian, int32(0))  // shapeID 0
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1) // PointVector version
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 point
++		binary.Write(&b, binary.LittleEndian, math.NaN())
++		binary.Write(&b, binary.LittleEndian, float64(0))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for NaN coordinate, got nil")
++		}
++	})
++
++	t.Run("InfFloatPoint", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, math.Inf(1))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for Inf coordinate, got nil")
++		}
++	})
++
++	t.Run("EdgeIDOutOfBounds", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1) // version
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 shape
++		binary.Write(&b, binary.LittleEndian, int32(0))  // shapeID 0
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1)                                  // PointVector version
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 point -> 1 edge (edgeID 0)
++		binary.Write(&b, binary.LittleEndian, float64(1))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 cell
++		c1 := CellIDFromFace(0)
++		binary.Write(&b, binary.LittleEndian, uint64(c1))
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 clipped shape
++		binary.Write(&b, binary.LittleEndian, int32(0))  // shapeID 0
++		binary.Write(&b, binary.LittleEndian, int8(0))   // containsCenter false
++		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 edge
++		binary.Write(&b, binary.LittleEndian, int32(5))  // edgeID 5 (out of bounds, shape has only 1 edge!)
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for edgeID out of bounds, got nil")
++		}
++	})
++
++	t.Run("NegativeEdgeID", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, float64(1))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++		binary.Write(&b, binary.LittleEndian, float64(0))
++
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		c1 := CellIDFromFace(0)
++		binary.Write(&b, binary.LittleEndian, uint64(c1))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int8(0))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(-1)) // negative edgeID
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for negative edgeID, got nil")
++		}
++	})
++
++	t.Run("EdgeIDsNotIncreasing", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, uint32(3)) // 3 edges (0, 1, 2)
++		for range 3 {
++			binary.Write(&b, binary.LittleEndian, float64(1))
++			binary.Write(&b, binary.LittleEndian, float64(0))
++			binary.Write(&b, binary.LittleEndian, float64(0))
++		}
++
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		c1 := CellIDFromFace(0)
++		binary.Write(&b, binary.LittleEndian, uint64(c1))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int8(0))
++		binary.Write(&b, binary.LittleEndian, uint32(2))
++		binary.Write(&b, binary.LittleEndian, int32(2)) // 2 then 1 (decreasing!)
++		binary.Write(&b, binary.LittleEndian, int32(1))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for non-increasing edgeIDs, got nil")
++		}
++	})
++
++	t.Run("NegativeMaxEdgesPerCell", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, int32(-5)) // negative maxEdgesPerCell
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for negative maxEdgesPerCell, got nil")
++		}
++	})
++
++	t.Run("NegativeNextID", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(-1)) // negative nextID
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for negative nextID, got nil")
++		}
++	})
++
++	t.Run("ShapeIDExceedsNextID", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, int32(1))
++		binary.Write(&b, binary.LittleEndian, uint32(1))
++		binary.Write(&b, binary.LittleEndian, int32(5)) // shapeID 5 >= nextID 1
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for shapeID >= nextID, got nil")
++		}
++	})
++
++	t.Run("DuplicateShapeID", func(t *testing.T) {
++		var b bytes.Buffer
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, int32(10))
++		binary.Write(&b, binary.LittleEndian, int32(5))
++		binary.Write(&b, binary.LittleEndian, int32(5))
++		binary.Write(&b, binary.LittleEndian, uint32(2)) // 2 shapes
++		// Shape 1: id 0
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++		// Shape 2: id 0 (duplicate!)
++		binary.Write(&b, binary.LittleEndian, int32(0))
++		binary.Write(&b, binary.LittleEndian, uint32(typeTagPointVector))
++		b.WriteByte(1)
++		binary.Write(&b, binary.LittleEndian, uint32(0))
++
++		dec := NewShapeIndex()
++		if err := dec.Decode(&b); err == nil {
++			t.Errorf("expected error for duplicate shapeID, got nil")
++		}
++	})
++
++	t.Run("EncodeNilWriter", func(t *testing.T) {
++		idx := NewShapeIndex()
++		if err := idx.Encode(nil); err == nil {
++			t.Errorf("expected error for Encode(nil), got nil")
++		}
++	})
++}
++
++func TestIndividualShapesEncodeDecode(t *testing.T) {
++	t.Run("PointVector", func(t *testing.T) {
++		// Empty
++		pv0 := &PointVector{}
++		var buf0 bytes.Buffer
++		if err := pv0.Encode(&buf0); err != nil {
++			t.Fatalf("pv0.Encode failed: %v", err)
++		}
++		var dec0 PointVector
++		if err := dec0.Decode(&buf0); err != nil {
++			t.Fatalf("dec0.Decode failed: %v", err)
++		}
++		if len(dec0) != 0 {
++			t.Errorf("len(dec0) = %d, want 0", len(dec0))
++		}
++
++		// Non-empty
++		pv1 := &PointVector{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0)}
++		var buf1 bytes.Buffer
++		if err := pv1.Encode(&buf1); err != nil {
++			t.Fatalf("pv1.Encode failed: %v", err)
++		}
++		var dec1 PointVector
++		if err := dec1.Decode(&buf1); err != nil {
++			t.Fatalf("dec1.Decode failed: %v", err)
++		}
++		if len(dec1) != 2 || dec1[0] != (*pv1)[0] || dec1[1] != (*pv1)[1] {
++			t.Errorf("PointVector mismatch: got %v, want %v", dec1, *pv1)
++		}
++
++		// Malformed: oversized
++		var bufBad bytes.Buffer
++		bufBad.WriteByte(1)
++		binary.Write(&bufBad, binary.LittleEndian, uint32(math.MaxUint32))
++		var decBad PointVector
++		if err := decBad.Decode(&bufBad); err == nil {
++			t.Errorf("expected error for oversized PointVector, got nil")
++		}
++	})
++
++	t.Run("LaxPolyline", func(t *testing.T) {
++		// Empty
++		lp0 := LaxPolylineFromPoints(nil)
++		var buf0 bytes.Buffer
++		if err := lp0.Encode(&buf0); err != nil {
++			t.Fatalf("lp0.Encode failed: %v", err)
++		}
++		var dec0 LaxPolyline
++		if err := dec0.Decode(&buf0); err != nil {
++			t.Fatalf("dec0.Decode failed: %v", err)
++		}
++		if dec0.NumEdges() != 0 {
++			t.Errorf("dec0.NumEdges() = %d, want 0", dec0.NumEdges())
++		}
++
++		// Non-empty
++		pts := []Point{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0), PointFromCoords(0, 0, 1)}
++		lp1 := LaxPolylineFromPoints(pts)
++		var buf1 bytes.Buffer
++		if err := lp1.Encode(&buf1); err != nil {
++			t.Fatalf("lp1.Encode failed: %v", err)
++		}
++		var dec1 LaxPolyline
++		if err := dec1.Decode(&buf1); err != nil {
++			t.Fatalf("dec1.Decode failed: %v", err)
++		}
++		if dec1.NumEdges() != lp1.NumEdges() {
++			t.Errorf("LaxPolyline NumEdges mismatch: got %d, want %d", dec1.NumEdges(), lp1.NumEdges())
++		}
++
++		// Malformed: oversized
++		var bufBad bytes.Buffer
++		bufBad.WriteByte(1)
++		binary.Write(&bufBad, binary.LittleEndian, uint32(math.MaxUint32))
++		var decBad LaxPolyline
++		if err := decBad.Decode(&bufBad); err == nil {
++			t.Errorf("expected error for oversized LaxPolyline, got nil")
++		}
++	})
++
++	t.Run("LaxPolygon", func(t *testing.T) {
++		// Empty
++		lp0 := LaxPolygonFromPoints(nil)
++		var buf0 bytes.Buffer
++		if err := lp0.Encode(&buf0); err != nil {
++			t.Fatalf("lp0.Encode failed: %v", err)
++		}
++		var dec0 LaxPolygon
++		if err := dec0.Decode(&buf0); err != nil {
++			t.Fatalf("dec0.Decode failed: %v", err)
++		}
++		if !dec0.IsEmpty() {
++			t.Errorf("dec0 should be empty")
++		}
++
++		// Full
++		lpFull := LaxPolygonFromPoints([][]Point{{}})
++		var bufFull bytes.Buffer
++		if err := lpFull.Encode(&bufFull); err != nil {
++			t.Fatalf("lpFull.Encode failed: %v", err)
++		}
++		var decFull LaxPolygon
++		if err := decFull.Decode(&bufFull); err != nil {
++			t.Fatalf("decFull.Decode failed: %v", err)
++		}
++		if !decFull.IsFull() {
++			t.Errorf("decFull should be full")
++		}
++
++		// Mixed loops
++		p1 := PointFromCoords(1, 0, 0)
++		p2 := PointFromCoords(0, 1, 0)
++		p3 := PointFromCoords(0, 0, 1)
++		mixedLoops := [][]Point{
++			{p1, p2, p3},
++			{},
++			{p1},
++			{p2, p3},
++		}
++		lpMixed := LaxPolygonFromPoints(mixedLoops)
++		var bufMixed bytes.Buffer
++		if err := lpMixed.Encode(&bufMixed); err != nil {
++			t.Fatalf("lpMixed.Encode failed: %v", err)
++		}
++		var decMixed LaxPolygon
++		if err := decMixed.Decode(&bufMixed); err != nil {
++			t.Fatalf("decMixed.Decode failed: %v", err)
++		}
++		if decMixed.NumChains() != 4 {
++			t.Errorf("decMixed.NumChains() = %d, want 4", decMixed.NumChains())
++		}
++		if decMixed.NumEdges() != lpMixed.NumEdges() {
++			t.Errorf("decMixed.NumEdges() = %d, want %d", decMixed.NumEdges(), lpMixed.NumEdges())
++		}
++
++		// Malformed: oversized loops
++		var bufBad bytes.Buffer
++		bufBad.WriteByte(1)
++		binary.Write(&bufBad, binary.LittleEndian, uint32(math.MaxUint32))
++		var decBad LaxPolygon
++		if err := decBad.Decode(&bufBad); err == nil {
++			t.Errorf("expected error for oversized LaxPolygon loops, got nil")
++		}
++	})
++
++	t.Run("LaxLoop", func(t *testing.T) {
++		// Empty
++		ll0 := LaxLoopFromPoints(nil)
++		var buf0 bytes.Buffer
++		if err := ll0.Encode(&buf0); err != nil {
++			t.Fatalf("ll0.Encode failed: %v", err)
++		}
++		var dec0 LaxLoop
++		if err := dec0.Decode(&buf0); err != nil {
++			t.Fatalf("dec0.Decode failed: %v", err)
++		}
++		if !dec0.IsEmpty() {
++			t.Errorf("dec0 should be empty")
++		}
++
++		// Non-empty
++		pts := []Point{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0), PointFromCoords(0, 0, 1)}
++		ll1 := LaxLoopFromPoints(pts)
++		var buf1 bytes.Buffer
++		if err := ll1.Encode(&buf1); err != nil {
++			t.Fatalf("ll1.Encode failed: %v", err)
++		}
++		var dec1 LaxLoop
++		if err := dec1.Decode(&buf1); err != nil {
++			t.Fatalf("dec1.Decode failed: %v", err)
++		}
++		if dec1.NumEdges() != 3 {
++			t.Errorf("dec1.NumEdges() = %d, want 3", dec1.NumEdges())
++		}
++
++		// Malformed: oversized
++		var bufBad bytes.Buffer
++		bufBad.WriteByte(1)
++		binary.Write(&bufBad, binary.LittleEndian, uint32(math.MaxUint32))
++		var decBad LaxLoop
++		if err := decBad.Decode(&bufBad); err == nil {
++			t.Errorf("expected error for oversized LaxLoop, got nil")
++		}
++	})
++}
++
++func TestShapeIndexQueriesWorkWithoutBuild(t *testing.T) {
++	idx := NewShapeIndex()
++	poly := makePolygon("0:0, 0:4, 4:4, 4:0", true)
++	pline := makePolyline("1:1, 3:3")
++	idx.Add(poly)
++	idx.Add(pline)
++	idx.Build()
++
++	var buf bytes.Buffer
++	if err := idx.Encode(&buf); err != nil {
++		t.Fatalf("Encode failed: %v", err)
++	}
++
++	dec := NewShapeIndex()
++	if err := dec.Decode(&buf); err != nil {
++		t.Fatalf("Decode failed: %v", err)
++	}
++
++	// 1. LocatePoint
++	ptInside := PointFromLatLng(LatLngFromDegrees(2, 2))
++	it := dec.Iterator()
++	if !it.LocatePoint(ptInside) {
++		t.Errorf("LocatePoint(ptInside) returned false")
++	}
++
++	// 2. LocateCellID
++	cellTarget := cellIDFromPoint(ptInside)
++	rel := it.LocateCellID(cellTarget)
++	if rel == Disjoint {
++		t.Errorf("LocateCellID returned Disjoint, expected Indexed or Subdivided")
++	}
++
++	// 3. ContainsPointQuery
++	cpq := NewContainsPointQuery(dec, VertexModelSemiOpen)
++	if !cpq.Contains(ptInside) {
++		t.Errorf("ContainsPointQuery returned false for interior point")
++	}
++	ptOutside := PointFromLatLng(LatLngFromDegrees(10, 10))
++	if cpq.Contains(ptOutside) {
++		t.Errorf("ContainsPointQuery returned true for exterior point")
++	}
++
++	// 4. CrossingEdgeQuery
++	ceq := NewCrossingEdgeQuery(dec)
++	crossEdgeP0 := PointFromLatLng(LatLngFromDegrees(2, -1))
++	crossEdgeP1 := PointFromLatLng(LatLngFromDegrees(2, 1))
++	edges := ceq.Crossings(crossEdgeP0, crossEdgeP1, dec.Shape(0), CrossingTypeAll)
++	if len(edges) == 0 {
++		t.Errorf("CrossingEdgeQuery found 0 crossings, expected at least 1")
++	}
++
++	// 5. ShapeIndexRegion
++	region := dec.Region()
++	capBound := region.CapBound()
++	if capBound.IsEmpty() {
++		t.Errorf("ShapeIndexRegion.CapBound() is empty")
++	}
++	if !capBound.ContainsPoint(ptInside) {
++		t.Errorf("CapBound does not contain ptInside")
++	}
++}
++

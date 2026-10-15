@@ -1,0 +1,188 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""
++Jump Analyzer for Hurdle Jumpers in MP4 Videos.
++Detects jump takeoff and landing frame numbers and outputs to /app/output.toml.
++"""
++
++import sys
++import os
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_video(video_path: str):
++    """
++    Analyzes an MP4 video of an athlete jumping over a hurdle.
++    Returns (jump_takeoff_frame_number, jump_land_frame_number).
++    """
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise FileNotFoundError(f"Cannot open video file: {video_path}")
++
++    ret, bg_frame = cap.read()
++    if not ret:
++        raise ValueError("Cannot read video first frame")
++
++    bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)
++    frame_h, frame_w = bg_gray.shape
++
++    # Vertical Region of Interest for track and athlete motion
++    track_y1 = int(frame_h * 0.05)
++    track_y2 = int(frame_h * 0.85)
++
++    frames_list = []
++    cys_list = []
++    cxs_list = []
++    foot_ys_list = []
++
++    frame_idx = 1 # frame 0 was background frame
++    runner_bbox = None
++
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++
++        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++        diff = cv2.absdiff(bg_gray, gray)
++
++        mask = np.zeros_like(diff)
++        mask[track_y1:track_y2, :] = diff[track_y1:track_y2, :]
++
++        _, thresh = cv2.threshold(mask, 25, 255, cv2.THRESH_BINARY)
++        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
++        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
++        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
++
++        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++
++        valid_cnts = []
++        for c in cnts:
++            x, y, w, h = cv2.boundingRect(c)
++            area = cv2.contourArea(c)
++            if h > 35 or area > 250:
++                valid_cnts.append((c, area, x, y, w, h))
++
++        if valid_cnts:
++            if runner_bbox is None:
++                # Athlete entry candidate near borders
++                entry_cands = [
++                    item for item in valid_cnts
++                    if item[2] > frame_w * 0.6 or (item[2] + item[4]) > frame_w * 0.6 or item[2] < frame_w * 0.3
++                ]
++                if entry_cands:
++                    best = max(entry_cands, key=lambda item: item[1])
++                    runner_bbox = (best[2], best[3], best[4], best[5])
++            else:
++                prev_cx = runner_bbox[0] + runner_bbox[2] / 2
++                prev_cy = runner_bbox[1] + runner_bbox[3] / 2
++
++                # Closest contour matching runner's expected trajectory
++                best = min(
++                    valid_cnts,
++                    key=lambda item: ((item[2] + item[4] / 2 - prev_cx) ** 2 + (item[3] + item[5] / 2 - prev_cy) ** 2) ** 0.5
++                )
++                dist = ((best[2] + best[4] / 2 - prev_cx) ** 2 + (best[3] + best[5] / 2 - prev_cy) ** 2) ** 0.5
++                if dist < frame_w * 0.2:
++                    cx = best[2] + best[4] / 2
++                    nearby = [item[0] for item in valid_cnts if abs((item[2] + item[4] / 2) - cx) < frame_w * 0.15]
++                    all_pts = np.vstack(nearby)
++                    rx, ry, rw, rh = cv2.boundingRect(all_pts)
++                    if rh > 80 or ry + rh > track_y2 * 0.7:
++                        runner_bbox = (rx, ry, rw, rh)
++
++            if runner_bbox is not None:
++                rx, ry, rw, rh = runner_bbox
++                if rx > 10 and (rx + rw) < (frame_w - 10) and rh > 100:
++                    cx = rx + rw / 2
++                    cy = ry + rh / 2
++                    foot_y = ry + rh
++                    frames_list.append(frame_idx)
++                    cys_list.append(cy)
++                    cxs_list.append(cx)
++                    foot_ys_list.append(foot_y)
++
++        frame_idx += 1
++
++    cap.release()
++
++    if len(frames_list) < 5:
++        raise ValueError("Tracking failed: insufficient frame data extracted.")
++
++    frames = np.array(frames_list)
++    cys = np.array(cys_list)
++    cxs = np.array(cxs_list)
++    foot_ys = np.array(foot_ys_list)
++
++    # Baseline foot y-level during running
++    ground_foot = np.percentile(foot_ys, 90)
++    elevation = ground_foot - foot_ys
++
++    # Restrict jump peak search to central hurdle zone (25% to 75% of image width)
++    hurdle_zone = (cxs >= frame_w * 0.25) & (cxs <= frame_w * 0.75)
++    valid_elevation = elevation * hurdle_zone
++
++    if np.max(valid_elevation) <= 0:
++        apex_idx = np.argmax(elevation)
++    else:
++        apex_idx = np.argmax(valid_elevation)
++
++    # Traversal from jump apex to find takeoff and landing local minima
++    left_idx = apex_idx
++    while left_idx > 1 and elevation[left_idx - 1] < elevation[left_idx] and elevation[left_idx] > 10.0:
++        left_idx -= 1
++
++    right_idx = apex_idx
++    while right_idx < len(frames) - 2 and elevation[right_idx + 1] < elevation[right_idx] and elevation[right_idx] > 20.0:
++        right_idx += 1
++
++    takeoff_frame = int(frames[left_idx])
++    land_frame = int(frames[right_idx])
++
++    return takeoff_frame, land_frame
++
++
++def main():
++    video_path = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    output_path = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++
++    if not os.path.exists(video_path):
++        # Fallback if relative path provided
++        if os.path.exists(os.path.join("/app", video_path)):
++            video_path = os.path.join("/app", video_path)
++
++    takeoff_frame, land_frame = analyze_video(video_path)
++
++    result = {
++        "jump_takeoff_frame_number": takeoff_frame,
++        "jump_land_frame_number": land_frame,
++    }
++
++    # Always ensure /app/output.toml is written
++    with open("/app/output.toml", "w") as f:
++        toml.dump(result, f)
++
++    if output_path != "/app/output.toml":
++        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++        with open(output_path, "w") as f:
++            toml.dump(result, f)
++
++    print(f"Analysis complete. Results written to {output_path}:")
++    print(toml.dumps(result))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

@@ -1,0 +1,92 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..2777ce8f49 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -193,13 +193,12 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+             else:
+                 rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
+-                    lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
+-                )
++            *rhs_key_transforms, final_key = rhs_key_transforms
++            rhs_json_path = "%s%s" % (
++                compile_json_path(rhs_key_transforms, include_root=False),
++                ".%s" % json.dumps(str(final_key)),
+             )
++            rhs_params.append("%s%s" % (lhs_json_path, rhs_json_path))
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
+@@ -387,25 +386,24 @@ class KeyTransformTextLookupMixin:
+ class KeyTransformIsNull(lookups.IsNull):
+     # key__isnull=False is the same as has_key='key'
+     def as_oracle(self, compiler, connection):
+-        sql, params = HasKey(
+-            self.lhs.lhs,
+-            self.lhs.key_name,
+-        ).as_oracle(compiler, connection)
++        lhs, params, key_transforms = self.lhs.preprocess_lhs(compiler, connection)
++        json_path = compile_json_path(key_transforms)
+         if not self.rhs:
+-            return sql, params
++            return "JSON_EXISTS(%s, '%s')" % (lhs, json_path), tuple(params)
+         # Column doesn't have a key or IS NULL.
+-        lhs, lhs_params, _ = self.lhs.preprocess_lhs(compiler, connection)
+-        return "(NOT %s OR %s IS NULL)" % (sql, lhs), tuple(params) + tuple(lhs_params)
++        return "(NOT JSON_EXISTS(%s, '%s') OR %s IS NULL)" % (
++            lhs,
++            json_path,
++            lhs,
++        ), tuple(params) * 2
+ 
+     def as_sqlite(self, compiler, connection):
++        lhs, params, key_transforms = self.lhs.preprocess_lhs(compiler, connection)
++        json_path = compile_json_path(key_transforms)
+         template = "JSON_TYPE(%s, %%s) IS NULL"
+         if not self.rhs:
+             template = "JSON_TYPE(%s, %%s) IS NOT NULL"
+-        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-        )
++        return template % lhs, tuple(params) + (json_path,)
+ 
+ 
+ class KeyTransformIn(lookups.In):
+diff --git a/tests/model_fields/test_jsonfield.py b/tests/model_fields/test_jsonfield.py
+index dfd00f4745..387698bd14 100644
+--- a/tests/model_fields/test_jsonfield.py
++++ b/tests/model_fields/test_jsonfield.py
+@@ -564,6 +564,27 @@ class TestQuerying(TestCase):
+                     [obj],
+                 )
+ 
++    def test_has_key_number(self):
++        obj = NullableJSONModel.objects.create(
++            value={"1111": "a", "2222": "b", "3333": "c", "1": "d"}
++        )
++        tests = [
++            Q(value__has_key="1111"),
++            Q(value__has_key=1111),
++            Q(value__has_key="1"),
++            Q(value__has_key=1),
++            Q(value__has_keys=["1111", "2222"]),
++            Q(value__has_keys=[1111, 2222]),
++            Q(value__has_any_keys=["1111", "4444"]),
++            Q(value__has_any_keys=[1111, 4444]),
++        ]
++        for condition in tests:
++            with self.subTest(condition=condition):
++                self.assertSequenceEqual(
++                    NullableJSONModel.objects.filter(condition),
++                    [obj],
++                )
++
+     def test_has_keys(self):
+         self.assertSequenceEqual(
+             NullableJSONModel.objects.filter(value__has_keys=["a", "c", "h"]),

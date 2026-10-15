@@ -1,0 +1,109 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..8290265e96 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -145,7 +145,8 @@ class ForwardManyToOneDescriptor:
+         if not remote_field.multiple:
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                remote_field.set_cached_value(rel_obj, instance)
++                if not remote_field.is_cached(rel_obj):
++                    remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+ 
+     def get_object(self, instance):
+@@ -377,7 +378,8 @@ class ReverseOneToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
+             instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
++            if not self.related.field.is_cached(rel_obj):
++                self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -647,7 +649,8 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             # the reverse relation manually.
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
++                if not self.field.is_cached(rel_obj):
++                    setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..60f1479790 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -872,6 +872,70 @@ class CustomPrefetchTests(TestCase):
+             ))
+             self.assertEqual(add_q_mock.call_count, 1)
+ 
++    def test_only_related_queryset(self):
++        house = House.objects.create(name='Villa', address='123 Main St')
++        room = Room.objects.create(name='Living Room', house=house)
++        house.main_room = room
++        house.save()
++
++        # Reverse OneToOneField
++        queryset = House.objects.filter(id=house.id).only('name', 'main_room').prefetch_related(
++            Prefetch(
++                'main_room',
++                queryset=Room.objects.prefetch_related(
++                    Prefetch('main_room_of', queryset=House.objects.only('address', 'main_room'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            h = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(h.main_room.main_room_of.address, '123 Main St')
++
++        # Forward OneToOneField
++        queryset = Room.objects.filter(id=room.id).only('name').prefetch_related(
++            Prefetch(
++                'main_room_of',
++                queryset=House.objects.prefetch_related(
++                    Prefetch('main_room', queryset=Room.objects.only('name'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            r = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(r.main_room_of.main_room.name, 'Living Room')
++
++        # Reverse ForeignKey
++        book = BookWithYear.objects.create(title='Poems', published_year=2010)
++        review = BookReview.objects.create(book=book, notes='Great')
++        queryset = BookWithYear.objects.filter(id=book.id).only('title').prefetch_related(
++            Prefetch(
++                'bookreview_set',
++                queryset=BookReview.objects.prefetch_related(
++                    Prefetch('book', queryset=BookWithYear.objects.only('published_year'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            b = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(b.bookreview_set.all()[0].book.published_year, 2010)
++
++        # Forward ForeignKey
++        queryset = BookReview.objects.filter(id=review.id).only('notes', 'book').prefetch_related(
++            Prefetch(
++                'book',
++                queryset=BookWithYear.objects.prefetch_related(
++                    Prefetch('bookreview_set', queryset=BookReview.objects.only('notes', 'book'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            rev = queryset.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(rev.book.bookreview_set.all()[0].notes, 'Great')
++
+ 
+ class DefaultManagerTests(TestCase):
+ 

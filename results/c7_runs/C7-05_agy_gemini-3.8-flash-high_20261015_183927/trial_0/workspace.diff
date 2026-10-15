@@ -1,0 +1,209 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..71ac8382a0 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -193,13 +193,10 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+             else:
+                 rhs_key_transforms = [key]
+-            rhs_params.append(
+-                "%s%s"
+-                % (
+-                    lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
+-                )
+-            )
++            *rhs_key_transforms, final_key = rhs_key_transforms
++            rhs_json_path = compile_json_path(rhs_key_transforms, include_root=False)
++            rhs_json_path += ".%s" % json.dumps(str(final_key))
++            rhs_params.append("%s%s" % (lhs_json_path, rhs_json_path))
+         # Add condition for each key.
+         if self.logical_operator:
+             sql = "(%s)" % self.logical_operator.join([sql] * len(rhs_params))
+@@ -237,6 +234,11 @@ class HasKey(HasKeyLookup):
+     postgres_operator = "?"
+     prepare_rhs = False
+ 
++    def get_prep_lookup(self):
++        if hasattr(self.rhs, "resolve_expression"):
++            return self.rhs
++        return str(self.rhs)
++
+ 
+ class HasKeys(HasKeyLookup):
+     lookup_name = "has_keys"
+@@ -244,7 +246,10 @@ class HasKeys(HasKeyLookup):
+     logical_operator = " AND "
+ 
+     def get_prep_lookup(self):
+-        return [str(item) for item in self.rhs]
++        return [
++            item if hasattr(item, "resolve_expression") else str(item)
++            for item in self.rhs
++        ]
+ 
+ 
+ class HasAnyKeys(HasKeys):
+@@ -387,25 +392,25 @@ class KeyTransformTextLookupMixin:
+ class KeyTransformIsNull(lookups.IsNull):
+     # key__isnull=False is the same as has_key='key'
+     def as_oracle(self, compiler, connection):
+-        sql, params = HasKey(
+-            self.lhs.lhs,
+-            self.lhs.key_name,
+-        ).as_oracle(compiler, connection)
++        lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++            compiler, connection
++        )
++        json_path = compile_json_path(lhs_key_transforms)
++        sql = "JSON_EXISTS(%s, '%s')" % (lhs, json_path)
+         if not self.rhs:
+-            return sql, params
++            return sql, tuple(lhs_params)
+         # Column doesn't have a key or IS NULL.
+-        lhs, lhs_params, _ = self.lhs.preprocess_lhs(compiler, connection)
+-        return "(NOT %s OR %s IS NULL)" % (sql, lhs), tuple(params) + tuple(lhs_params)
++        return "(NOT %s OR %s IS NULL)" % (sql, lhs), tuple(lhs_params) * 2
+ 
+     def as_sqlite(self, compiler, connection):
+         template = "JSON_TYPE(%s, %%s) IS NULL"
+         if not self.rhs:
+             template = "JSON_TYPE(%s, %%s) IS NOT NULL"
+-        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
+-            compiler,
+-            connection,
+-            template=template,
++        lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++            compiler, connection
+         )
++        json_path = compile_json_path(lhs_key_transforms)
++        return template % lhs, tuple(lhs_params) + (json_path,)
+ 
+ 
+ class KeyTransformIn(lookups.In):
+@@ -466,13 +471,16 @@ class KeyTransformExact(JSONExact):
+         rhs, rhs_params = super().process_rhs(compiler, connection)
+         if rhs_params == ["null"]:
+             # Field has key and it's NULL.
+-            has_key_expr = HasKey(self.lhs.lhs, self.lhs.key_name)
+-            has_key_sql, has_key_params = has_key_expr.as_oracle(compiler, connection)
++            lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(
++                compiler, connection
++            )
++            json_path = compile_json_path(lhs_key_transforms)
++            has_key_sql = "JSON_EXISTS(%s, '%s')" % (lhs, json_path)
+             is_null_expr = self.lhs.get_lookup("isnull")(self.lhs, True)
+             is_null_sql, is_null_params = is_null_expr.as_sql(compiler, connection)
+             return (
+                 "%s AND %s" % (has_key_sql, is_null_sql),
+-                tuple(has_key_params) + tuple(is_null_params),
++                tuple(lhs_params) + tuple(is_null_params),
+             )
+         return super().as_sql(compiler, connection)
+ 
+diff --git a/test_scratch.py b/test_scratch.py
+new file mode 100644
+index 0000000000..e015be47b8
+--- /dev/null
++++ b/test_scratch.py
+@@ -0,0 +1,100 @@
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        DATABASES={
++            "default": {
++                "ENGINE": "django.db.backends.sqlite3",
++                "NAME": ":memory:",
++            }
++        },
++        INSTALLED_APPS=[
++            "django.contrib.contenttypes",
++            "django.contrib.auth",
++            "tests.model_fields",
++        ],
++        DEFAULT_AUTO_FIELD="django.db.models.AutoField",
++    )
++import django
++django.setup()
++
++from django.db import connection
++from django.db.models import F, Q
++from django.db.models.fields.json import HasKey, HasKeys, HasAnyKeys, KeyTransform
++from django.db.models.sql import Query
++from tests.model_fields.models import NullableJSONModel
++
++query = Query(NullableJSONModel)
++compiler = query.get_compiler(connection=connection)
++
++# Test HasKey on SQLite
++lookup = HasKey(NullableJSONModel._meta.get_field("value"), "1111")
++sql, params = lookup.as_sqlite(compiler, connection)
++print("SQLite has_key sql:", sql, params)
++assert "JSON_TYPE" in sql
++assert params[-1] == '$."1111"'
++
++# Test HasKeys on SQLite
++lookup = HasKeys(NullableJSONModel._meta.get_field("value"), ["1111", "2222"])
++sql, params = lookup.as_sqlite(compiler, connection)
++print("SQLite has_keys sql:", sql, params)
++assert " AND " in sql
++assert params[-2:] == ('$."1111"', '$."2222"')
++
++# Test HasAnyKeys on SQLite
++lookup = HasAnyKeys(NullableJSONModel._meta.get_field("value"), ["1111", "2222"])
++sql, params = lookup.as_sqlite(compiler, connection)
++print("SQLite has_any_keys sql:", sql, params)
++assert " OR " in sql
++assert params[-2:] == ('$."1111"', '$."2222"')
++
++# Test HasKey on MySQL
++class MySQLConnection:
++    vendor = "mysql"
++    mysql_is_mariadb = False
++lookup = HasKey(NullableJSONModel._meta.get_field("value"), "1111")
++sql, params = lookup.as_mysql(compiler, MySQLConnection())
++print("MySQL has_key sql:", sql, params)
++assert "JSON_CONTAINS_PATH" in sql
++assert params[-1] == '$."1111"'
++
++# Test HasKeys on MySQL
++lookup = HasKeys(NullableJSONModel._meta.get_field("value"), ["1111", "2222"])
++sql, params = lookup.as_mysql(compiler, MySQLConnection())
++print("MySQL has_keys sql:", sql, params)
++assert "JSON_CONTAINS_PATH" in sql and " AND " in sql
++assert params[-2:] == ('$."1111"', '$."2222"')
++
++# Test HasAnyKeys on MySQL
++lookup = HasAnyKeys(NullableJSONModel._meta.get_field("value"), ["1111", "2222"])
++sql, params = lookup.as_mysql(compiler, MySQLConnection())
++print("MySQL has_any_keys sql:", sql, params)
++assert "JSON_CONTAINS_PATH" in sql and " OR " in sql
++assert params[-2:] == ('$."1111"', '$."2222"')
++
++# Test HasKey on Oracle
++class OracleConnection:
++    vendor = "oracle"
++lookup = HasKey(NullableJSONModel._meta.get_field("value"), "1111")
++sql, params = lookup.as_oracle(compiler, OracleConnection())
++print("Oracle has_key sql:", sql, params)
++assert "JSON_EXISTS" in sql
++assert '$."1111"' in sql
++assert params == []
++
++# Test HasKeys on Oracle
++lookup = HasKeys(NullableJSONModel._meta.get_field("value"), ["1111", "2222"])
++sql, params = lookup.as_oracle(compiler, OracleConnection())
++print("Oracle has_keys sql:", sql, params)
++assert "JSON_EXISTS" in sql and " AND " in sql
++assert '$."1111"' in sql and '$."2222"' in sql
++assert params == []
++
++# Test HasAnyKeys on Oracle
++lookup = HasAnyKeys(NullableJSONModel._meta.get_field("value"), ["1111", "2222"])
++sql, params = lookup.as_oracle(compiler, OracleConnection())
++print("Oracle has_any_keys sql:", sql, params)
++assert "JSON_EXISTS" in sql and " OR " in sql
++assert '$."1111"' in sql and '$."2222"' in sql
++assert params == []
++
++print("ALL BACKEND SQL CHECKS PASSED!")

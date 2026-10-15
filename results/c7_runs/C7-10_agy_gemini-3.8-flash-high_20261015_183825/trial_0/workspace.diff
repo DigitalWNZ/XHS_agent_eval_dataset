@@ -1,0 +1,1596 @@
+diff --git a/config/job.go b/config/job.go
+index 5cbeec1..c6ce8ab 100644
+--- a/config/job.go
++++ b/config/job.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
++	"github.com/liweiyi88/onedump/encryption"
+ 	"github.com/liweiyi88/onedump/notifier/slack"
+ 	"github.com/liweiyi88/onedump/storage/dropbox"
+ 	"github.com/liweiyi88/onedump/storage/gdrive"
+@@ -39,7 +40,7 @@ func (dump *Dump) Validate() error {
+ 	}
+ 
+ 	for _, job := range dump.Jobs {
+-		err := job.validate()
++		err := job.Validate()
+ 		if err != nil {
+ 			errs = errors.Join(errs, err)
+ 		}
+@@ -49,16 +50,17 @@ func (dump *Dump) Validate() error {
+ }
+ 
+ type Job struct {
+-	Name         string   `yaml:"name"`
+-	DBDriver     string   `yaml:"dbdriver"`
+-	DBDriverPath string   `yaml:"driverpath"`
+-	DBDsn        string   `yaml:"dbdsn"`
+-	Gzip         bool     `yaml:"gzip"`
+-	Unique       bool     `yaml:"unique"`
+-	SshHost      string   `yaml:"sshhost"`
+-	SshUser      string   `yaml:"sshuser"`
+-	SshKey       string   `yaml:"sshkey"`
+-	DumpOptions  []string `yaml:"options"`
++	Name         string            `yaml:"name"`
++	DBDriver     string            `yaml:"dbdriver"`
++	DBDriverPath string            `yaml:"driverpath"`
++	DBDsn        string            `yaml:"dbdsn"`
++	Gzip         bool              `yaml:"gzip"`
++	Unique       bool              `yaml:"unique"`
++	SshHost      string            `yaml:"sshhost"`
++	SshUser      string            `yaml:"sshuser"`
++	SshKey       string            `yaml:"sshkey"`
++	DumpOptions  []string          `yaml:"options"`
++	Encryption   encryption.Config `yaml:"encryption"`
+ 	Storage      struct {
+ 		Local   []*local.Local     `yaml:"local"`
+ 		S3      []*s3.S3           `yaml:"s3"`
+@@ -100,6 +102,12 @@ func WithSshKey(sshKey string) Option {
+ 	}
+ }
+ 
++func WithEncryption(encryption encryption.Config) Option {
++	return func(job *Job) {
++		job.Encryption = encryption
++	}
++}
++
+ func NewJob(name, driver, dbDsn string, opts ...Option) *Job {
+ 	job := &Job{
+ 		Name:     name,
+@@ -114,7 +122,11 @@ func NewJob(name, driver, dbDsn string, opts ...Option) *Job {
+ 	return job
+ }
+ 
+-func (job Job) validate() error {
++func (job *Job) Validate() error {
++	if job == nil {
++		return errors.New("job is nil")
++	}
++
+ 	if strings.TrimSpace(job.Name) == "" {
+ 		return ErrMissingJobName
+ 	}
+@@ -127,9 +139,24 @@ func (job Job) validate() error {
+ 		return ErrMissingDBDriver
+ 	}
+ 
++	if err := job.Encryption.Validate(); err != nil {
++		return err
++	}
++
+ 	return nil
+ }
+ 
++func (job *Job) validate() error {
++	return job.Validate()
++}
++
++func (job *Job) Encrypted() bool {
++	if job == nil {
++		return false
++	}
++	return job.Encryption.Enabled
++}
++
+ func (job *Job) ViaSsh() bool {
+ 	if strings.TrimSpace(job.SshHost) != "" && strings.TrimSpace(job.SshUser) != "" && strings.TrimSpace(job.SshKey) != "" {
+ 		return true
+diff --git a/config/job_test.go b/config/job_test.go
+index 5bfa793..995be34 100644
+--- a/config/job_test.go
++++ b/config/job_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/liweiyi88/onedump/encryption"
+ 	"github.com/liweiyi88/onedump/jobresult"
+ 	"github.com/stretchr/testify/assert"
+ )
+@@ -103,3 +104,40 @@ func TestViaSsh(t *testing.T) {
+ 
+ 	assert.True(job.ViaSsh())
+ }
++
++func TestJobEncryption(t *testing.T) {
++	assert := assert.New(t)
++
++	// Disabled encryption
++	job := NewJob("job", "mysql", testDBDsn)
++	assert.False(job.Encrypted())
++	assert.NoError(job.Validate())
++
++	// Enabled valid encryption
++	jobWithEnc := NewJob(
++		"job",
++		"mysql",
++		testDBDsn,
++		WithEncryption(encryption.Config{
++			Enabled:   true,
++			KeySource: "literal",
++			Key:       "c29tZS1rZXk=",
++		}),
++	)
++	assert.True(jobWithEnc.Encrypted())
++	assert.NoError(jobWithEnc.Validate())
++
++	// Enabled invalid encryption (missing required field)
++	jobWithBadEnc := NewJob(
++		"job",
++		"mysql",
++		testDBDsn,
++		WithEncryption(encryption.Config{
++			Enabled:   true,
++			KeySource: "literal",
++			Key:       "",
++		}),
++	)
++	assert.True(jobWithBadEnc.Encrypted())
++	assert.Error(jobWithBadEnc.Validate())
++}
+diff --git a/encryption/config.go b/encryption/config.go
+new file mode 100644
+index 0000000..5a7dd0b
+--- /dev/null
++++ b/encryption/config.go
+@@ -0,0 +1,175 @@
++package encryption
++
++import (
++	"crypto/pbkdf2"
++	"crypto/sha256"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++
++	"gopkg.in/yaml.v3"
++)
++
++type Config struct {
++	Enabled    bool   `yaml:"enabled"`
++	KeySource  string `yaml:"keysource"`
++	KeyEnvVar  string `yaml:"keyenvvar"`
++	KeyFile    string `yaml:"keyfile"`
++	Key        string `yaml:"key"`
++	Passphrase string `yaml:"passphrase"`
++	Salt       string `yaml:"salt"`
++}
++
++func (c *Config) UnmarshalYAML(value *yaml.Node) error {
++	type rawConfig Config
++	var raw struct {
++		rawConfig    `yaml:",inline"`
++		KeySourceAlt string `yaml:"key_source"`
++		KeyEnvVarAlt string `yaml:"key_env_var"`
++		KeyFileAlt   string `yaml:"key_file"`
++	}
++	if err := value.Decode(&raw); err != nil {
++		return err
++	}
++	*c = Config(raw.rawConfig)
++	if c.KeySource == "" && raw.KeySourceAlt != "" {
++		c.KeySource = raw.KeySourceAlt
++	}
++	if c.KeyEnvVar == "" && raw.KeyEnvVarAlt != "" {
++		c.KeyEnvVar = raw.KeyEnvVarAlt
++	}
++	if c.KeyFile == "" && raw.KeyFileAlt != "" {
++		c.KeyFile = raw.KeyFileAlt
++	}
++	return nil
++}
++
++// Validate checks if the encryption configuration is valid.
++// Disabled configs are always valid.
++// When enabled, it rejects empty/unsupported key sources, requires source-specific fields,
++// and rejects fields belonging to other sources (error contains "mutually exclusive").
++func (c Config) Validate() error {
++	if !c.Enabled {
++		return nil
++	}
++
++	source := strings.ToLower(strings.TrimSpace(c.KeySource))
++	if source == "" {
++		return errors.New("encryption: key source is required")
++	}
++
++	switch source {
++	case "env":
++		if strings.TrimSpace(c.KeyEnvVar) == "" {
++			return errors.New("encryption: keyenvvar is required for env key source")
++		}
++		if strings.TrimSpace(c.KeyFile) != "" || strings.TrimSpace(c.Key) != "" || strings.TrimSpace(c.Passphrase) != "" || strings.TrimSpace(c.Salt) != "" {
++			return errors.New("encryption: fields are mutually exclusive")
++		}
++		return nil
++
++	case "file":
++		if strings.TrimSpace(c.KeyFile) == "" {
++			return errors.New("encryption: keyfile is required for file key source")
++		}
++		if strings.TrimSpace(c.KeyEnvVar) != "" || strings.TrimSpace(c.Key) != "" || strings.TrimSpace(c.Passphrase) != "" || strings.TrimSpace(c.Salt) != "" {
++			return errors.New("encryption: fields are mutually exclusive")
++		}
++		return nil
++
++	case "literal":
++		if strings.TrimSpace(c.Key) == "" {
++			return errors.New("encryption: key is required for literal key source")
++		}
++		if strings.TrimSpace(c.KeyEnvVar) != "" || strings.TrimSpace(c.KeyFile) != "" || strings.TrimSpace(c.Passphrase) != "" || strings.TrimSpace(c.Salt) != "" {
++			return errors.New("encryption: fields are mutually exclusive")
++		}
++		return nil
++
++	case "derive":
++		if strings.TrimSpace(c.Passphrase) == "" {
++			return errors.New("encryption: passphrase is required for derive key source")
++		}
++		if strings.TrimSpace(c.Salt) == "" {
++			return errors.New("encryption: salt is required for derive key source")
++		}
++		if strings.TrimSpace(c.KeyEnvVar) != "" || strings.TrimSpace(c.KeyFile) != "" || strings.TrimSpace(c.Key) != "" {
++			return errors.New("encryption: fields are mutually exclusive")
++		}
++		return nil
++
++	default:
++		return fmt.Errorf("encryption: unsupported key source: %s", c.KeySource)
++	}
++}
++
++// LoadKey loads and returns a 32-byte encryption key based on the provided configuration.
++func LoadKey(cfg Config) ([]byte, error) {
++	valCfg := cfg
++	valCfg.Enabled = true
++	if err := valCfg.Validate(); err != nil {
++		return nil, err
++	}
++
++	decodeBase64 := func(raw string) ([]byte, error) {
++		trimmed := strings.TrimSpace(raw)
++		b, err := base64.StdEncoding.DecodeString(trimmed)
++		if err != nil {
++			b, err = base64.RawStdEncoding.DecodeString(trimmed)
++			if err != nil {
++				return nil, fmt.Errorf("encryption: failed to decode base64 key: %w", err)
++			}
++		}
++		if len(b) != 32 {
++			return nil, fmt.Errorf("%w: key must be 32 bytes, got %d", ErrInvalidKey, len(b))
++		}
++		return b, nil
++	}
++
++	source := strings.ToLower(strings.TrimSpace(cfg.KeySource))
++	switch source {
++	case "env":
++		val, ok := os.LookupEnv(cfg.KeyEnvVar)
++		if !ok {
++			return nil, fmt.Errorf("encryption: key environment variable %q is not set", cfg.KeyEnvVar)
++		}
++		return decodeBase64(val)
++
++	case "file":
++		data, err := os.ReadFile(cfg.KeyFile)
++		if err != nil {
++			return nil, fmt.Errorf("encryption: failed to read key file %q: %w", cfg.KeyFile, err)
++		}
++		return decodeBase64(string(data))
++
++	case "literal":
++		return decodeBase64(cfg.Key)
++
++	case "derive":
++		if cfg.Passphrase == "" {
++			return nil, errors.New("encryption: empty passphrase rejected")
++		}
++		saltTrimmed := strings.TrimSpace(cfg.Salt)
++		saltBytes, err := base64.StdEncoding.DecodeString(saltTrimmed)
++		if err != nil {
++			saltBytes, err = base64.RawStdEncoding.DecodeString(saltTrimmed)
++			if err != nil {
++				return nil, fmt.Errorf("encryption: invalid base64 salt: %w", err)
++			}
++		}
++		if len(saltBytes) < 16 {
++			return nil, fmt.Errorf("encryption: salt must be at least 16 bytes, got %d", len(saltBytes))
++		}
++
++		key, err := pbkdf2.Key(sha256.New, cfg.Passphrase, saltBytes, 100000, 32)
++		if err != nil {
++			return nil, fmt.Errorf("encryption: failed to derive key: %w", err)
++		}
++		return key, nil
++
++	default:
++		return nil, fmt.Errorf("encryption: unsupported key source: %s", cfg.KeySource)
++	}
++}
+diff --git a/encryption/config_test.go b/encryption/config_test.go
+new file mode 100644
+index 0000000..60bcb36
+--- /dev/null
++++ b/encryption/config_test.go
+@@ -0,0 +1,265 @@
++package encryption
++
++import (
++	"crypto/rand"
++	"encoding/base64"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestConfigValidateDisabled(t *testing.T) {
++	// Disabled configs must always be valid
++	cfgs := []Config{
++		{Enabled: false},
++		{Enabled: false, KeySource: ""},
++		{Enabled: false, KeySource: "invalid"},
++		{Enabled: false, KeySource: "env", KeyFile: "file.txt", Key: "key"},
++	}
++	for _, cfg := range cfgs {
++		assert.NoError(t, cfg.Validate())
++	}
++}
++
++func TestConfigValidateKeySource(t *testing.T) {
++	// Enabled with empty source rejected
++	cfg := Config{Enabled: true, KeySource: ""}
++	assert.Error(t, cfg.Validate())
++
++	// Enabled with unsupported source rejected
++	cfg = Config{Enabled: true, KeySource: "unsupported"}
++	assert.Error(t, cfg.Validate())
++}
++
++func TestConfigValidateCaseInsensitive(t *testing.T) {
++	sources := []struct {
++		cfg Config
++	}{
++		{Config{Enabled: true, KeySource: "ENV", KeyEnvVar: "MY_KEY"}},
++		{Config{Enabled: true, KeySource: "eNv", KeyEnvVar: "MY_KEY"}},
++		{Config{Enabled: true, KeySource: "FILE", KeyFile: "key.txt"}},
++		{Config{Enabled: true, KeySource: "LITERAL", Key: "a2V5"}},
++		{Config{Enabled: true, KeySource: "DERIVE", Passphrase: "secret", Salt: "c2FsdHNhbHRzYWx0MTY="}},
++	}
++	for _, s := range sources {
++		assert.NoError(t, s.cfg.Validate(), "source %s should be valid", s.cfg.KeySource)
++	}
++}
++
++func TestConfigValidateEnvSource(t *testing.T) {
++	// Valid
++	cfg := Config{Enabled: true, KeySource: "env", KeyEnvVar: "MY_KEY"}
++	assert.NoError(t, cfg.Validate())
++
++	// Missing KeyEnvVar
++	cfg = Config{Enabled: true, KeySource: "env"}
++	assert.Error(t, cfg.Validate())
++
++	// Mutually exclusive fields
++	conflicts := []Config{
++		{Enabled: true, KeySource: "env", KeyEnvVar: "MY_KEY", KeyFile: "key.txt"},
++		{Enabled: true, KeySource: "env", KeyEnvVar: "MY_KEY", Key: "literal"},
++		{Enabled: true, KeySource: "env", KeyEnvVar: "MY_KEY", Passphrase: "pass"},
++		{Enabled: true, KeySource: "env", KeyEnvVar: "MY_KEY", Salt: "salt"},
++	}
++	for _, c := range conflicts {
++		err := c.Validate()
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "mutually exclusive")
++	}
++}
++
++func TestConfigValidateFileSource(t *testing.T) {
++	// Valid
++	cfg := Config{Enabled: true, KeySource: "file", KeyFile: "/tmp/key.txt"}
++	assert.NoError(t, cfg.Validate())
++
++	// Missing KeyFile
++	cfg = Config{Enabled: true, KeySource: "file"}
++	assert.Error(t, cfg.Validate())
++
++	// Mutually exclusive fields
++	conflicts := []Config{
++		{Enabled: true, KeySource: "file", KeyFile: "key.txt", KeyEnvVar: "MY_KEY"},
++		{Enabled: true, KeySource: "file", KeyFile: "key.txt", Key: "literal"},
++		{Enabled: true, KeySource: "file", KeyFile: "key.txt", Passphrase: "pass"},
++		{Enabled: true, KeySource: "file", KeyFile: "key.txt", Salt: "salt"},
++	}
++	for _, c := range conflicts {
++		err := c.Validate()
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "mutually exclusive")
++	}
++}
++
++func TestConfigValidateLiteralSource(t *testing.T) {
++	// Valid
++	cfg := Config{Enabled: true, KeySource: "literal", Key: "some-key"}
++	assert.NoError(t, cfg.Validate())
++
++	// Missing Key
++	cfg = Config{Enabled: true, KeySource: "literal"}
++	assert.Error(t, cfg.Validate())
++
++	// Mutually exclusive fields
++	conflicts := []Config{
++		{Enabled: true, KeySource: "literal", Key: "k", KeyEnvVar: "MY_KEY"},
++		{Enabled: true, KeySource: "literal", Key: "k", KeyFile: "key.txt"},
++		{Enabled: true, KeySource: "literal", Key: "k", Passphrase: "pass"},
++		{Enabled: true, KeySource: "literal", Key: "k", Salt: "salt"},
++	}
++	for _, c := range conflicts {
++		err := c.Validate()
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "mutually exclusive")
++	}
++}
++
++func TestConfigValidateDeriveSource(t *testing.T) {
++	// Valid
++	cfg := Config{Enabled: true, KeySource: "derive", Passphrase: "pass", Salt: "c2FsdHNhbHRzYWx0MTY="}
++	assert.NoError(t, cfg.Validate())
++
++	// Missing Passphrase
++	cfg = Config{Enabled: true, KeySource: "derive", Salt: "c2FsdHNhbHRzYWx0MTY="}
++	assert.Error(t, cfg.Validate())
++
++	// Missing Salt
++	cfg = Config{Enabled: true, KeySource: "derive", Passphrase: "pass"}
++	assert.Error(t, cfg.Validate())
++
++	// Mutually exclusive fields
++	conflicts := []Config{
++		{Enabled: true, KeySource: "derive", Passphrase: "p", Salt: "s", KeyEnvVar: "MY_KEY"},
++		{Enabled: true, KeySource: "derive", Passphrase: "p", Salt: "s", KeyFile: "key.txt"},
++		{Enabled: true, KeySource: "derive", Passphrase: "p", Salt: "s", Key: "literal"},
++	}
++	for _, c := range conflicts {
++		err := c.Validate()
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "mutually exclusive")
++	}
++}
++
++func TestLoadKeyEnv(t *testing.T) {
++	rawKey := make([]byte, 32)
++	_, _ = rand.Read(rawKey)
++	b64Key := base64.StdEncoding.EncodeToString(rawKey)
++
++	envVar := "ONEDUMP_TEST_ENCRYPTION_KEY"
++	t.Setenv(envVar, b64Key)
++
++	cfg := Config{Enabled: true, KeySource: "env", KeyEnvVar: envVar}
++	loaded, err := LoadKey(cfg)
++	require.NoError(t, err)
++	assert.Equal(t, rawKey, loaded)
++
++	// Unset env var returns error containing "encryption" or "key"
++	unsetCfg := Config{Enabled: true, KeySource: "env", KeyEnvVar: "NON_EXISTENT_VAR_12345"}
++	_, err = LoadKey(unsetCfg)
++	require.Error(t, err)
++	errMsg := strings.ToLower(err.Error())
++	assert.True(t, strings.Contains(errMsg, "encryption") || strings.Contains(errMsg, "key"))
++}
++
++func TestLoadKeyFile(t *testing.T) {
++	rawKey := make([]byte, 32)
++	_, _ = rand.Read(rawKey)
++	b64Key := base64.StdEncoding.EncodeToString(rawKey)
++
++	dir := t.TempDir()
++	keyFilePath := filepath.Join(dir, "key.txt")
++	// Include whitespace and newlines to test trimming
++	err := os.WriteFile(keyFilePath, []byte("  \n"+b64Key+"  \n\n"), 0600)
++	require.NoError(t, err)
++
++	cfg := Config{Enabled: true, KeySource: "file", KeyFile: keyFilePath}
++	loaded, err := LoadKey(cfg)
++	require.NoError(t, err)
++	assert.Equal(t, rawKey, loaded)
++
++	// File not found
++	cfgBad := Config{Enabled: true, KeySource: "file", KeyFile: filepath.Join(dir, "missing.txt")}
++	_, err = LoadKey(cfgBad)
++	require.Error(t, err)
++}
++
++func TestLoadKeyLiteral(t *testing.T) {
++	rawKey := make([]byte, 32)
++	_, _ = rand.Read(rawKey)
++	b64Key := base64.StdEncoding.EncodeToString(rawKey)
++
++	cfg := Config{Enabled: true, KeySource: "literal", Key: b64Key}
++	loaded, err := LoadKey(cfg)
++	require.NoError(t, err)
++	assert.Equal(t, rawKey, loaded)
++
++	// Invalid base64
++	cfgBad := Config{Enabled: true, KeySource: "literal", Key: "not-base64!!!"}
++	_, err = LoadKey(cfgBad)
++	require.Error(t, err)
++
++	// Wrong key size (16 bytes)
++	shortKey := make([]byte, 16)
++	b64Short := base64.StdEncoding.EncodeToString(shortKey)
++	cfgShort := Config{Enabled: true, KeySource: "literal", Key: b64Short}
++	_, err = LoadKey(cfgShort)
++	require.Error(t, err)
++	assert.True(t, errors.Is(err, ErrInvalidKey))
++}
++
++func TestLoadKeyDerive(t *testing.T) {
++	rawSalt := make([]byte, 16)
++	_, _ = rand.Read(rawSalt)
++	b64Salt := base64.StdEncoding.EncodeToString(rawSalt)
++
++	cfg := Config{
++		Enabled:    true,
++		KeySource:  "derive",
++		Passphrase: "my-secure-passphrase",
++		Salt:       b64Salt,
++	}
++
++	key1, err := LoadKey(cfg)
++	require.NoError(t, err)
++	assert.Len(t, key1, 32)
++
++	// Deterministic: second run must yield identical key
++	key2, err := LoadKey(cfg)
++	require.NoError(t, err)
++	assert.Equal(t, key1, key2)
++
++	// Different passphrase produces different key
++	cfgDiffPass := cfg
++	cfgDiffPass.Passphrase = "different-passphrase"
++	keyDiffPass, err := LoadKey(cfgDiffPass)
++	require.NoError(t, err)
++	assert.NotEqual(t, key1, keyDiffPass)
++
++	// Different salt produces different key
++	rawSalt2 := make([]byte, 16)
++	_, _ = rand.Read(rawSalt2)
++	cfgDiffSalt := cfg
++	cfgDiffSalt.Salt = base64.StdEncoding.EncodeToString(rawSalt2)
++	keyDiffSalt, err := LoadKey(cfgDiffSalt)
++	require.NoError(t, err)
++	assert.NotEqual(t, key1, keyDiffSalt)
++
++	// Salt < 16 bytes rejected
++	shortSalt := make([]byte, 15)
++	cfgShortSalt := cfg
++	cfgShortSalt.Salt = base64.StdEncoding.EncodeToString(shortSalt)
++	_, err = LoadKey(cfgShortSalt)
++	require.Error(t, err)
++
++	// Empty passphrase rejected
++	cfgEmptyPass := cfg
++	cfgEmptyPass.Passphrase = ""
++	_, err = LoadKey(cfgEmptyPass)
++	require.Error(t, err)
++}
+diff --git a/encryption/encryption.go b/encryption/encryption.go
+new file mode 100644
+index 0000000..f03904a
+--- /dev/null
++++ b/encryption/encryption.go
+@@ -0,0 +1,346 @@
++package encryption
++
++import (
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/hmac"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"hash"
++	"io"
++)
++
++const (
++	MagicByte1    byte = 0x4F
++	MagicByte2    byte = 0x44
++	StreamVersion byte = 0x01
++
++	ChunkSize = 64 * 1024 // 64KB plaintext chunk size
++	NonceSize = 12
++)
++
++var (
++	ErrInvalidKey = errors.New("encryption: invalid key size")
++)
++
++type Encryptor struct {
++	key  []byte
++	aead cipher.AEAD
++}
++
++// NewEncryptor creates a new Encryptor using the provided 32-byte key.
++// It rejects non-32-byte keys, returning an error wrapping ErrInvalidKey.
++func NewEncryptor(key []byte) (*Encryptor, error) {
++	if len(key) != 32 {
++		return nil, fmt.Errorf("%w: key must be 32 bytes, got %d", ErrInvalidKey, len(key))
++	}
++
++	block, err := aes.NewCipher(key)
++	if err != nil {
++		return nil, fmt.Errorf("encryption: failed to create AES cipher: %w", err)
++	}
++
++	gcm, err := cipher.NewGCM(block)
++	if err != nil {
++		return nil, fmt.Errorf("encryption: failed to create GCM cipher: %w", err)
++	}
++
++	keyCopy := make([]byte, len(key))
++	copy(keyCopy, key)
++
++	return &Encryptor{
++		key:  keyCopy,
++		aead: gcm,
++	}, nil
++}
++
++// EncryptWriter returns an io.WriteCloser that encrypts data written to it using AES-256-GCM streaming.
++func (e *Encryptor) EncryptWriter(w io.Writer) io.WriteCloser {
++	return &encryptWriter{
++		w:    w,
++		key:  e.key,
++		aead: e.aead,
++		hmac: hmac.New(sha256.New, e.key),
++		buf:  make([]byte, 0, ChunkSize),
++	}
++}
++
++type encryptWriter struct {
++	w             io.Writer
++	key           []byte
++	aead          cipher.AEAD
++	hmac          hash.Hash
++	buf           []byte
++	headerWritten bool
++	closed        bool
++}
++
++func (ew *encryptWriter) writeHeader() error {
++	if ew.headerWritten {
++		return nil
++	}
++	header := [3]byte{MagicByte1, MagicByte2, StreamVersion}
++	if _, err := ew.w.Write(header[:]); err != nil {
++		return err
++	}
++	ew.headerWritten = true
++	return nil
++}
++
++func (ew *encryptWriter) flushChunk() error {
++	if len(ew.buf) == 0 {
++		return nil
++	}
++
++	nonce := make([]byte, NonceSize)
++	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
++		return fmt.Errorf("encryption: failed to generate nonce: %w", err)
++	}
++
++	ciphertext := ew.aead.Seal(nil, nonce, ew.buf, nil)
++	chunkLen := uint32(len(nonce) + len(ciphertext))
++
++	var lenBuf [4]byte
++	binary.BigEndian.PutUint32(lenBuf[:], chunkLen)
++
++	if _, err := ew.w.Write(lenBuf[:]); err != nil {
++		return err
++	}
++	ew.hmac.Write(lenBuf[:])
++
++	if _, err := ew.w.Write(nonce); err != nil {
++		return err
++	}
++	ew.hmac.Write(nonce)
++
++	if _, err := ew.w.Write(ciphertext); err != nil {
++		return err
++	}
++	ew.hmac.Write(ciphertext)
++
++	ew.buf = ew.buf[:0]
++	return nil
++}
++
++func (ew *encryptWriter) Write(p []byte) (int, error) {
++	if ew.closed {
++		return 0, errors.New("encryption: write to closed writer")
++	}
++
++	if !ew.headerWritten {
++		if err := ew.writeHeader(); err != nil {
++			return 0, err
++		}
++	}
++
++	total := len(p)
++	for len(p) > 0 {
++		available := ChunkSize - len(ew.buf)
++		if available > len(p) {
++			available = len(p)
++		}
++		ew.buf = append(ew.buf, p[:available]...)
++		p = p[available:]
++
++		if len(ew.buf) == ChunkSize {
++			if err := ew.flushChunk(); err != nil {
++				return 0, err
++			}
++		}
++	}
++
++	return total, nil
++}
++
++func (ew *encryptWriter) Close() error {
++	if ew.closed {
++		return nil
++	}
++	ew.closed = true
++
++	if !ew.headerWritten {
++		if err := ew.writeHeader(); err != nil {
++			return err
++		}
++	}
++
++	if len(ew.buf) > 0 {
++		if err := ew.flushChunk(); err != nil {
++			return err
++		}
++	}
++
++	// Zero sentinel (4 zero bytes) ends chunks
++	var sentinel [4]byte
++	if _, err := ew.w.Write(sentinel[:]); err != nil {
++		return err
++	}
++
++	// 32-byte HMAC-SHA256 computed over all bytes between header and sentinel
++	mac := ew.hmac.Sum(nil)
++	if _, err := ew.w.Write(mac); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++// DecryptReader creates an io.Reader that decrypts an encrypted stream.
++// It initializes lazily; stream header and payload validation errors occur in Read.
++func DecryptReader(r io.Reader, key []byte) (io.Reader, error) {
++	if len(key) != 32 {
++		return nil, fmt.Errorf("%w: key must be 32 bytes, got %d", ErrInvalidKey, len(key))
++	}
++
++	block, err := aes.NewCipher(key)
++	if err != nil {
++		return nil, fmt.Errorf("encryption: failed to create AES cipher: %w", err)
++	}
++
++	gcm, err := cipher.NewGCM(block)
++	if err != nil {
++		return nil, fmt.Errorf("encryption: failed to create GCM cipher: %w", err)
++	}
++
++	keyCopy := make([]byte, len(key))
++	copy(keyCopy, key)
++
++	return &decryptReader{
++		r:    r,
++		key:  keyCopy,
++		aead: gcm,
++	}, nil
++}
++
++type decryptReader struct {
++	r           io.Reader
++	key         []byte
++	aead        cipher.AEAD
++	hmac        hash.Hash
++	initialized bool
++	buf         []byte
++	bufOff      int
++	eof         bool
++	err         error
++}
++
++func (dr *decryptReader) Read(p []byte) (int, error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++
++	if dr.err != nil {
++		return 0, dr.err
++	}
++
++	if !dr.initialized {
++		var header [3]byte
++		if _, err := io.ReadFull(dr.r, header[:]); err != nil {
++			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++				dr.err = fmt.Errorf("truncated data: %w", err)
++			} else {
++				dr.err = fmt.Errorf("failed to read header: %w", err)
++			}
++			return 0, dr.err
++		}
++
++		if header[0] != MagicByte1 || header[1] != MagicByte2 {
++			dr.err = fmt.Errorf("invalid header: expected magic 0x%02X 0x%02X, got 0x%02X 0x%02X", MagicByte1, MagicByte2, header[0], header[1])
++			return 0, dr.err
++		}
++
++		if header[2] != StreamVersion {
++			dr.err = fmt.Errorf("unsupported version: 0x%02X", header[2])
++			return 0, dr.err
++		}
++
++		dr.hmac = hmac.New(sha256.New, dr.key)
++		dr.initialized = true
++	}
++
++	if dr.bufOff < len(dr.buf) {
++		n := copy(p, dr.buf[dr.bufOff:])
++		dr.bufOff += n
++		return n, nil
++	}
++
++	if dr.eof {
++		return 0, io.EOF
++	}
++
++	for {
++		var lenBuf [4]byte
++		if _, err := io.ReadFull(dr.r, lenBuf[:]); err != nil {
++			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++				dr.err = fmt.Errorf("truncated data: %w", err)
++			} else {
++				dr.err = fmt.Errorf("failed to read chunk length: %w", err)
++			}
++			return 0, dr.err
++		}
++
++		chunkLen := binary.BigEndian.Uint32(lenBuf[:])
++		if chunkLen == 0 {
++			// Zero sentinel reached
++			var receivedMac [32]byte
++			if _, err := io.ReadFull(dr.r, receivedMac[:]); err != nil {
++				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++					dr.err = fmt.Errorf("truncated data: %w", err)
++				} else {
++					dr.err = fmt.Errorf("failed to read HMAC: %w", err)
++				}
++				return 0, dr.err
++			}
++
++			expectedMac := dr.hmac.Sum(nil)
++			if !hmac.Equal(receivedMac[:], expectedMac) {
++				dr.err = errors.New("integrity check failed: HMAC mismatch")
++				return 0, dr.err
++			}
++
++			dr.eof = true
++			return 0, io.EOF
++		}
++
++		// Each chunk has at least 12-byte nonce + 16-byte tag = 28 bytes
++		if chunkLen < 28 {
++			dr.err = fmt.Errorf("invalid chunk length: %d (minimum 28 bytes)", chunkLen)
++			return 0, dr.err
++		}
++
++		dr.hmac.Write(lenBuf[:])
++
++		chunkData := make([]byte, chunkLen)
++		if _, err := io.ReadFull(dr.r, chunkData); err != nil {
++			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++				dr.err = fmt.Errorf("truncated data: %w", err)
++			} else {
++				dr.err = fmt.Errorf("failed to read chunk data: %w", err)
++			}
++			return 0, dr.err
++		}
++
++		dr.hmac.Write(chunkData)
++
++		nonce := chunkData[:NonceSize]
++		ciphertextAndTag := chunkData[NonceSize:]
++
++		plaintext, err := dr.aead.Open(nil, nonce, ciphertextAndTag, nil)
++		if err != nil {
++			dr.err = fmt.Errorf("failed to decrypt chunk: %w", err)
++			return 0, dr.err
++		}
++
++		dr.buf = plaintext
++		dr.bufOff = 0
++
++		if len(plaintext) > 0 {
++			n := copy(p, dr.buf[dr.bufOff:])
++			dr.bufOff += n
++			return n, nil
++		}
++	}
++}
+diff --git a/encryption/encryption_test.go b/encryption/encryption_test.go
+new file mode 100644
+index 0000000..9ef9ce3
+--- /dev/null
++++ b/encryption/encryption_test.go
+@@ -0,0 +1,282 @@
++package encryption
++
++import (
++	"bytes"
++	"crypto/rand"
++	"encoding/binary"
++	"errors"
++	"io"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestNewEncryptor(t *testing.T) {
++	// Rejects non-32-byte keys
++	for _, keyLen := range []int{0, 16, 24, 31, 33, 64} {
++		key := make([]byte, keyLen)
++		enc, err := NewEncryptor(key)
++		assert.Nil(t, enc)
++		require.Error(t, err)
++		assert.True(t, errors.Is(err, ErrInvalidKey), "error must wrap ErrInvalidKey")
++	}
++
++	// Accepts 32-byte key
++	validKey := make([]byte, 32)
++	_, err := rand.Read(validKey)
++	require.NoError(t, err)
++
++	enc, err := NewEncryptor(validKey)
++	require.NoError(t, err)
++	assert.NotNil(t, enc)
++}
++
++func TestEncryptWriterHeaderAndStructure(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, err := NewEncryptor(key)
++	require.NoError(t, err)
++
++	var buf bytes.Buffer
++	w := enc.EncryptWriter(&buf)
++
++	plaintext := []byte("Hello, World!")
++	n, err := w.Write(plaintext)
++	require.NoError(t, err)
++	assert.Equal(t, len(plaintext), n)
++
++	// Close is idempotent
++	err = w.Close()
++	require.NoError(t, err)
++	err = w.Close()
++	require.NoError(t, err)
++
++	data := buf.Bytes()
++	// Header: 3 bytes: 0x4F, 0x44, 0x01
++	require.GreaterOrEqual(t, len(data), 3+4+12+len(plaintext)+16+4+32)
++	assert.Equal(t, byte(0x4F), data[0])
++	assert.Equal(t, byte(0x44), data[1])
++	assert.Equal(t, byte(0x01), data[2])
++
++	// First chunk length prefix (4 bytes)
++	chunkLen := binary.BigEndian.Uint32(data[3:7])
++	assert.Equal(t, uint32(12+len(plaintext)+16), chunkLen)
++
++	// After chunk, zero sentinel (4 zero bytes)
++	chunkEnd := 3 + 4 + int(chunkLen)
++	sentinel := binary.BigEndian.Uint32(data[chunkEnd : chunkEnd+4])
++	assert.Equal(t, uint32(0), sentinel)
++
++	// Followed by 32-byte HMAC
++	hmacBytes := data[chunkEnd+4:]
++	assert.Len(t, hmacBytes, 32)
++}
++
++func TestTwoEncryptionsDifferAndNonceUnique(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, err := NewEncryptor(key)
++	require.NoError(t, err)
++
++	plaintext := []byte("Same plaintext content for both runs")
++
++	var buf1, buf2 bytes.Buffer
++	w1 := enc.EncryptWriter(&buf1)
++	_, _ = w1.Write(plaintext)
++	_ = w1.Close()
++
++	w2 := enc.EncryptWriter(&buf2)
++	_, _ = w2.Write(plaintext)
++	_ = w2.Close()
++
++	// Two encryptions of same plaintext must differ
++	assert.NotEqual(t, buf1.Bytes(), buf2.Bytes())
++
++	// Nonces in chunk must differ
++	nonce1 := buf1.Bytes()[7:19]
++	nonce2 := buf2.Bytes()[7:19]
++	assert.NotEqual(t, nonce1, nonce2)
++}
++
++func TestMultiChunkUniqueNonces(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, err := NewEncryptor(key)
++	require.NoError(t, err)
++
++	// Create data larger than 64KB to produce multiple chunks
++	plaintext := make([]byte, 140*1024)
++	_, _ = rand.Read(plaintext)
++
++	var buf bytes.Buffer
++	w := enc.EncryptWriter(&buf)
++	_, err = w.Write(plaintext)
++	require.NoError(t, err)
++	err = w.Close()
++	require.NoError(t, err)
++
++	data := buf.Bytes()
++	// Parse nonces
++	var nonces [][]byte
++	offset := 3 // skip header
++	for {
++		chunkLen := binary.BigEndian.Uint32(data[offset : offset+4])
++		offset += 4
++		if chunkLen == 0 {
++			break
++		}
++		nonce := data[offset : offset+12]
++		nonces = append(nonces, nonce)
++		offset += int(chunkLen)
++	}
++
++	require.GreaterOrEqual(t, len(nonces), 3)
++	// Verify each chunk has a unique nonce
++	for i := 0; i < len(nonces); i++ {
++		for j := i + 1; j < len(nonces); j++ {
++			assert.NotEqual(t, nonces[i], nonces[j], "nonces across chunks must differ")
++		}
++	}
++}
++
++func TestRoundTrip(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, err := NewEncryptor(key)
++	require.NoError(t, err)
++
++	testSizes := []int{0, 1, 100, 64 * 1024, 64*1024 + 1, 150 * 1024}
++
++	for _, size := range testSizes {
++		plaintext := make([]byte, size)
++		if size > 0 {
++			_, _ = rand.Read(plaintext)
++		}
++
++		var buf bytes.Buffer
++		w := enc.EncryptWriter(&buf)
++		_, err = w.Write(plaintext)
++		require.NoError(t, err)
++		require.NoError(t, w.Close())
++
++		dr, err := DecryptReader(&buf, key)
++		require.NoError(t, err)
++
++		decrypted, err := io.ReadAll(dr)
++		require.NoError(t, err)
++		assert.Equal(t, plaintext, decrypted, "round trip size %d failed", size)
++	}
++}
++
++func TestDecryptReaderLazyInit(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++
++	// Passing an empty or invalid reader should succeed in DecryptReader constructor
++	badReader := bytes.NewReader([]byte{0x00, 0x00, 0x00})
++	dr, err := DecryptReader(badReader, key)
++	require.NoError(t, err, "DecryptReader must be lazy and not error at creation")
++
++	// Error happens in Read
++	var out [10]byte
++	_, err = dr.Read(out[:])
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid header")
++}
++
++func TestDecryptReaderInvalidHeaderMagic(t *testing.T) {
++	key := make([]byte, 32)
++	badHeaderStream := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x00, 0x00}
++	dr, err := DecryptReader(bytes.NewReader(badHeaderStream), key)
++	require.NoError(t, err)
++
++	_, err = io.ReadAll(dr)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid header")
++}
++
++func TestDecryptReaderUnsupportedVersion(t *testing.T) {
++	key := make([]byte, 32)
++	badVersionStream := []byte{0x4F, 0x44, 0x02, 0x00, 0x00, 0x00, 0x00}
++	dr, err := DecryptReader(bytes.NewReader(badVersionStream), key)
++	require.NoError(t, err)
++
++	_, err = io.ReadAll(dr)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "unsupported version")
++}
++
++func TestDecryptReaderHMACIntegrityFailure(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, _ := NewEncryptor(key)
++
++	var buf bytes.Buffer
++	w := enc.EncryptWriter(&buf)
++	_, _ = w.Write([]byte("integrity check test"))
++	_ = w.Close()
++
++	corruptedData := buf.Bytes()
++	// Tamper with the last byte (part of HMAC)
++	corruptedData[len(corruptedData)-1] ^= 0xFF
++
++	dr, err := DecryptReader(bytes.NewReader(corruptedData), key)
++	require.NoError(t, err)
++
++	_, err = io.ReadAll(dr)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "integrity")
++}
++
++func TestDecryptReaderWrongKey(t *testing.T) {
++	key1 := make([]byte, 32)
++	key2 := make([]byte, 32)
++	_, _ = rand.Read(key1)
++	_, _ = rand.Read(key2)
++
++	enc, _ := NewEncryptor(key1)
++	var buf bytes.Buffer
++	w := enc.EncryptWriter(&buf)
++	_, _ = w.Write([]byte("sensitive payload"))
++	_ = w.Close()
++
++	dr, err := DecryptReader(&buf, key2)
++	require.NoError(t, err)
++
++	_, err = io.ReadAll(dr)
++	require.Error(t, err, "wrong key must fail")
++}
++
++func TestDecryptReaderTruncatedData(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, _ := NewEncryptor(key)
++
++	var buf bytes.Buffer
++	w := enc.EncryptWriter(&buf)
++	_, _ = w.Write([]byte("truncate me please"))
++	_ = w.Close()
++
++	full := buf.Bytes()
++	// Test truncating at various cut points
++	cutPoints := []int{1, 2, 3, 5, 15, len(full) - 10, len(full) - 1}
++	for _, cut := range cutPoints {
++		dr, err := DecryptReader(bytes.NewReader(full[:cut]), key)
++		require.NoError(t, err)
++
++		_, err = io.ReadAll(dr)
++		require.Error(t, err, "truncated data at length %d must error", cut)
++	}
++}
++
++func TestDecryptReaderKeyValidation(t *testing.T) {
++	// Rejects invalid key sizes
++	for _, badLen := range []int{0, 16, 31, 33} {
++		badKey := make([]byte, badLen)
++		_, err := DecryptReader(strings.NewReader(""), badKey)
++		require.Error(t, err)
++		assert.True(t, errors.Is(err, ErrInvalidKey))
++	}
++}
+diff --git a/fileutil/filenutil.go b/fileutil/filenutil.go
+index c69e3e7..541cc0a 100644
+--- a/fileutil/filenutil.go
++++ b/fileutil/filenutil.go
+@@ -27,21 +27,30 @@ func ensureUniqueness(path string, unique bool) string {
+ }
+ 
+ // Ensure a file has proper file extension.
+-func EnsureFileSuffix(filename string, shouldGzip bool) string {
+-	if !shouldGzip {
+-		return filename
++func EnsureFileSuffix(filename string, shouldGzip, shouldEncrypt bool) string {
++	f := filename
++	if shouldGzip {
++		if strings.HasSuffix(f, ".enc") {
++			base := strings.TrimSuffix(f, ".enc")
++			if !strings.HasSuffix(base, ".gz") {
++				f = base + ".gz.enc"
++			}
++		} else if !strings.HasSuffix(f, ".gz") {
++			f = f + ".gz"
++		}
+ 	}
+ 
+-	fileExt := filepath.Ext(filename)
+-	if fileExt == ".gz" {
+-		return filename
++	if shouldEncrypt {
++		if !strings.HasSuffix(f, ".enc") {
++			f = f + ".enc"
++		}
+ 	}
+ 
+-	return filename + ".gz"
++	return f
+ }
+ 
+-func EnsureFileName(path string, shouldGzip, unique bool) string {
+-	p := EnsureFileSuffix(path, shouldGzip)
++func EnsureFileName(path string, shouldGzip, shouldEncrypt, unique bool) string {
++	p := EnsureFileSuffix(path, shouldGzip, shouldEncrypt)
+ 	return ensureUniqueness(p, unique)
+ }
+ 
+diff --git a/fileutil/fileutil_test.go b/fileutil/fileutil_test.go
+index fcab76f..241ab58 100644
+--- a/fileutil/fileutil_test.go
++++ b/fileutil/fileutil_test.go
+@@ -12,20 +12,36 @@ import (
+ )
+ 
+ func TestEnsureFileName(t *testing.T) {
+-	p := EnsureFileName("/Users/jack/Desktop/hello.sql", true, false)
++	p := EnsureFileName("/Users/jack/Desktop/hello.sql", true, false, false)
+ 	assert.Equal(t, "/Users/jack/Desktop/hello.sql.gz", p)
++
++	p = EnsureFileName("/Users/jack/Desktop/hello.sql", true, true, false)
++	assert.Equal(t, "/Users/jack/Desktop/hello.sql.gz.enc", p)
++
++	p = EnsureFileName("/Users/jack/Desktop/hello.sql", false, true, false)
++	assert.Equal(t, "/Users/jack/Desktop/hello.sql.enc", p)
+ }
+ 
+ func TestEnsureFileSuffix(t *testing.T) {
+ 	assert := assert.New(t)
+-	f := EnsureFileSuffix("test.sql", true)
++	f := EnsureFileSuffix("test.sql", true, false)
+ 	assert.Equal("test.sql.gz", f)
+ 
+-	f = EnsureFileSuffix("test.sql.gz", true)
++	f = EnsureFileSuffix("test.sql.gz", true, false)
+ 	assert.Equal("test.sql.gz", f)
+ 
+-	f = EnsureFileSuffix("test.sql", false)
++	f = EnsureFileSuffix("test.sql", false, false)
+ 	assert.Equal("test.sql", f)
++
++	f = EnsureFileSuffix("test.sql", true, true)
++	assert.Equal("test.sql.gz.enc", f)
++
++	// Idempotency
++	assert.Equal("test.sql.gz.enc", EnsureFileSuffix("test.sql.gz.enc", true, true))
++	assert.Equal("test.sql.gz.enc", EnsureFileSuffix("test.sql.gz", true, true))
++	assert.Equal("test.sql.gz.enc", EnsureFileSuffix("test.sql.enc", true, true))
++	assert.Equal("test.sql.enc", EnsureFileSuffix("test.sql", false, true))
++	assert.Equal("test.sql.enc", EnsureFileSuffix("test.sql.enc", false, true))
+ }
+ 
+ func TestEnsureUniqueness(t *testing.T) {
+diff --git a/handler/jobhandler.go b/handler/jobhandler.go
+index 89bc2c1..bbec664 100644
+--- a/handler/jobhandler.go
++++ b/handler/jobhandler.go
+@@ -12,6 +12,7 @@ import (
+ 
+ 	"github.com/liweiyi88/onedump/config"
+ 	"github.com/liweiyi88/onedump/dumper"
++	"github.com/liweiyi88/onedump/encryption"
+ 	"github.com/liweiyi88/onedump/fileutil"
+ 	"github.com/liweiyi88/onedump/jobresult"
+ 	"github.com/liweiyi88/onedump/storage"
+@@ -29,7 +30,7 @@ func NewJobHandler(job *config.Job) *JobHandler {
+ }
+ 
+ // Pipe readers, writer and closers for fanout the same writer.
+-func storageReadWriteCloser(count int, compress bool) ([]io.Reader, io.Writer, io.Closer) {
++func storageReadWriteCloser(count int, compress bool, encryptor *encryption.Encryptor) ([]io.Reader, io.Writer, io.Closer) {
+ 	var prs []io.Reader
+ 	var pws []io.Writer
+ 	var pcs []io.Closer
+@@ -38,14 +39,26 @@ func storageReadWriteCloser(count int, compress bool) ([]io.Reader, io.Writer, i
+ 
+ 		prs = append(prs, pr)
+ 
++		var target io.Writer = pw
++		var intermediateClosers []io.Closer
++
++		if encryptor != nil {
++			ew := encryptor.EncryptWriter(pw)
++			target = ew
++			intermediateClosers = append(intermediateClosers, ew)
++		}
++
+ 		if compress {
+-			gw := gzip.NewWriter(pw)
++			gw := gzip.NewWriter(target)
+ 			pws = append(pws, gw)
+ 			pcs = append(pcs, gw)
+ 		} else {
+-			pws = append(pws, pw)
++			pws = append(pws, target)
+ 		}
+ 
++		// EncryptWriter must close after gzip.Writer but before PipeWriter
++		pcs = append(pcs, intermediateClosers...)
++
+ 		// This following append method must not be moved before pcs = append(pcs, gw) if compress is in use as the closer won't be able to close properly.
+ 		// Thus, we put this line here and do not move it to other place.
+ 		pcs = append(pcs, pw)
+@@ -57,6 +70,20 @@ func storageReadWriteCloser(count int, compress bool) ([]io.Reader, io.Writer, i
+ // Save database dump to different storages.
+ func (handler *JobHandler) save() error {
+ 	job := handler.Job
++
++	var encryptor *encryption.Encryptor
++	if job.Encrypted() {
++		key, err := encryption.LoadKey(job.Encryption)
++		if err != nil {
++			return fmt.Errorf("encryption error: %w", err)
++		}
++		enc, err := encryption.NewEncryptor(key)
++		if err != nil {
++			return fmt.Errorf("encryption error: %w", err)
++		}
++		encryptor = enc
++	}
++
+ 	storages := handler.getStorages()
+ 
+ 	numberOfStorages := len(storages)
+@@ -71,7 +98,7 @@ func (handler *JobHandler) save() error {
+ 
+ 	if numberOfStorages > 0 {
+ 		// Use pipe to pass content from the database dump to different writer.
+-		readers, writer, closer := storageReadWriteCloser(numberOfStorages, job.Gzip)
++		readers, writer, closer := storageReadWriteCloser(numberOfStorages, job.Gzip, encryptor)
+ 
+ 		var dumpWg sync.WaitGroup
+ 		dumpWg.Add(1)
+@@ -100,7 +127,7 @@ func (handler *JobHandler) save() error {
+ 				defer readWg.Done()
+ 
+ 				pathGenerator := func(filename string) string {
+-					return fileutil.EnsureFileName(filename, job.Gzip, job.Unique)
++					return fileutil.EnsureFileName(filename, job.Gzip, job.Encrypted(), job.Unique)
+ 				}
+ 
+ 				e := storage.Save(readers[i], pathGenerator)
+@@ -188,3 +215,8 @@ func (handler *JobHandler) Do() *jobresult.JobResult {
+ 
+ 	return result
+ }
++
++// Save executes the save operation.
++func (handler *JobHandler) Save() error {
++	return handler.save()
++}
+diff --git a/handler/jobhandler_test.go b/handler/jobhandler_test.go
+index afc7fce..6ac28ae 100644
+--- a/handler/jobhandler_test.go
++++ b/handler/jobhandler_test.go
+@@ -1,15 +1,20 @@
+ package handler
+ 
+ import (
++	"compress/gzip"
++	"crypto/rand"
+ 	"errors"
++	"io"
+ 	"net"
+ 	"os"
++	"strings"
+ 	"testing"
+ 
+ 	"golang.org/x/crypto/ssh"
+ 
+ 	"github.com/liweiyi88/onedump/config"
+ 	"github.com/liweiyi88/onedump/dumper"
++	"github.com/liweiyi88/onedump/encryption"
+ 	"github.com/liweiyi88/onedump/fileutil"
+ 	"github.com/liweiyi88/onedump/storage/dropbox"
+ 	"github.com/liweiyi88/onedump/storage/gdrive"
+@@ -17,6 +22,7 @@ import (
+ 	"github.com/liweiyi88/onedump/storage/s3"
+ 	"github.com/liweiyi88/onedump/testutils"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ var testDBDsn = "root@tcp(127.0.0.1:3306)/dump_test"
+@@ -153,11 +159,14 @@ func TestGetStorages(t *testing.T) {
+ }
+ 
+ func TestEnsureFileSuffix(t *testing.T) {
+-	gzip := fileutil.EnsureFileSuffix("test.sql", true)
++	gzip := fileutil.EnsureFileSuffix("test.sql", true, false)
+ 	assert.Equal(t, "test.sql.gz", gzip)
+ 
+-	sql := fileutil.EnsureFileSuffix("test.sql.gz", true)
++	sql := fileutil.EnsureFileSuffix("test.sql.gz", true, false)
+ 	assert.Equal(t, "test.sql.gz", sql)
++
++	enc := fileutil.EnsureFileSuffix("test.sql", true, true)
++	assert.Equal(t, "test.sql.gz.enc", enc)
+ }
+ 
+ func TestGetDumper(t *testing.T) {
+@@ -187,3 +196,101 @@ func TestGetDumper(t *testing.T) {
+ 		t.Errorf("expect ssh dumper, but got type: %T", r)
+ 	}
+ }
++
++func TestPipelineRoundTripWithGzipAndEncryption(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, err := encryption.NewEncryptor(key)
++	require.NoError(t, err)
++
++	originalData := []byte("SELECT * FROM users WHERE active = 1; -- some long database dump content that will be compressed and encrypted...")
++
++	readers, writer, closer := storageReadWriteCloser(1, true, enc)
++
++	go func() {
++		_, writeErr := writer.Write(originalData)
++		assert.NoError(t, writeErr)
++		closeErr := closer.Close()
++		assert.NoError(t, closeErr)
++	}()
++
++	// The full pipeline output must round-trip through DecryptReader then gzip.NewReader back to the original data.
++	dr, err := encryption.DecryptReader(readers[0], key)
++	require.NoError(t, err)
++
++	gr, err := gzip.NewReader(dr)
++	require.NoError(t, err)
++
++	result, err := io.ReadAll(gr)
++	require.NoError(t, err)
++	require.NoError(t, gr.Close())
++
++	assert.Equal(t, originalData, result)
++}
++
++func TestPipelineRoundTripEncryptionOnly(t *testing.T) {
++	key := make([]byte, 32)
++	_, _ = rand.Read(key)
++	enc, err := encryption.NewEncryptor(key)
++	require.NoError(t, err)
++
++	originalData := []byte("Uncompressed database dump payload")
++
++	readers, writer, closer := storageReadWriteCloser(1, false, enc)
++
++	go func() {
++		_, writeErr := writer.Write(originalData)
++		assert.NoError(t, writeErr)
++		closeErr := closer.Close()
++		assert.NoError(t, closeErr)
++	}()
++
++	dr, err := encryption.DecryptReader(readers[0], key)
++	require.NoError(t, err)
++
++	result, err := io.ReadAll(dr)
++	require.NoError(t, err)
++	assert.Equal(t, originalData, result)
++}
++
++func TestMissingKeyEnvVarErrorWithAndWithoutStorages(t *testing.T) {
++	// With 0 storages:
++	jobNoStorage := config.NewJob("no-storage", "mysql", testDBDsn, config.WithEncryption(encryption.Config{
++		Enabled:   true,
++		KeySource: "env",
++		KeyEnvVar: "NON_EXISTENT_VAR_ABCXYZ",
++	}))
++	hNoStorage := NewJobHandler(jobNoStorage)
++	resNoStorage := hNoStorage.Do()
++	require.Error(t, resNoStorage.Error)
++	errMsgNoStorage := strings.ToLower(resNoStorage.Error.Error())
++	assert.True(t, strings.Contains(errMsgNoStorage, "encryption") || strings.Contains(errMsgNoStorage, "key"),
++		"error without storages must contain 'encryption' or 'key', got: %s", resNoStorage.Error.Error())
++
++	errSaveNoStorage := hNoStorage.Save()
++	require.Error(t, errSaveNoStorage)
++	errMsgSaveNoStorage := strings.ToLower(errSaveNoStorage.Error())
++	assert.True(t, strings.Contains(errMsgSaveNoStorage, "encryption") || strings.Contains(errMsgSaveNoStorage, "key"),
++		"Save() error without storages must contain 'encryption' or 'key', got: %s", errSaveNoStorage.Error())
++
++	// With storages configured:
++	jobWithStorage := config.NewJob("with-storage", "mysql", testDBDsn, config.WithEncryption(encryption.Config{
++		Enabled:   true,
++		KeySource: "env",
++		KeyEnvVar: "NON_EXISTENT_VAR_ABCXYZ",
++	}))
++	jobWithStorage.Storage.Local = append(jobWithStorage.Storage.Local, &local.Local{Path: "/tmp/some-dump.sql"})
++	hWithStorage := NewJobHandler(jobWithStorage)
++	resWithStorage := hWithStorage.Do()
++	require.Error(t, resWithStorage.Error)
++	errMsgWithStorage := strings.ToLower(resWithStorage.Error.Error())
++	assert.True(t, strings.Contains(errMsgWithStorage, "encryption") || strings.Contains(errMsgWithStorage, "key"),
++		"error with storages must contain 'encryption' or 'key', got: %s", resWithStorage.Error.Error())
++
++	errSaveWithStorage := hWithStorage.Save()
++	require.Error(t, errSaveWithStorage)
++	errMsgSaveWithStorage := strings.ToLower(errSaveWithStorage.Error())
++	assert.True(t, strings.Contains(errMsgSaveWithStorage, "encryption") || strings.Contains(errMsgSaveWithStorage, "key"),
++		"Save() error with storages must contain 'encryption' or 'key', got: %s", errSaveWithStorage.Error())
++}
++
+diff --git a/storage/storage.go b/storage/storage.go
+index 404277b..939d09d 100644
+--- a/storage/storage.go
++++ b/storage/storage.go
+@@ -14,6 +14,6 @@ type Storage interface {
+ 
+ func PathGenerator(gzip bool, unique bool) PathGeneratorFunc {
+ 	return func(filename string) string {
+-		return fileutil.EnsureFileName(filename, gzip, unique)
++		return fileutil.EnsureFileName(filename, gzip, false, unique)
+ 	}
+ }

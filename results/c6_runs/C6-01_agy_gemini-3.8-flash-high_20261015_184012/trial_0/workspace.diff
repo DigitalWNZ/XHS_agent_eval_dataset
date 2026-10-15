@@ -1,0 +1,357 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,352 @@
++#!/usr/bin/env python3
++"""
++/app/filter.py - HTML JavaScript Filter for XSS Prevention
++
++Removes all JavaScript from HTML files in-place to prevent XSS attacks while
++preserving legitimate HTML structure, formatting, tables, headers, and
++non-dangerous attributes.
++"""
++
++import sys
++import os
++import re
++import html
++import base64
++import urllib.parse
++
++
++def is_dangerous_url(val):
++    """
++    Check if a URL value uses javascript:, vbscript:, livescript:,
++    or is a dangerous data: URL (e.g. text/html, javascript, or containing scripts).
++    """
++    if not val:
++        return False
++
++    # Strip surrounding quotes if present
++    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")) or (val.startswith('`') and val.endswith('`')):
++        val = val[1:-1]
++
++    # Decode HTML entities
++    decoded = html.unescape(val)
++
++    # Clean whitespace, quotes, and ASCII control characters
++    cleaned = re.sub(r'[\s\x00-\x1f\x7f-\x9f\'"`\\]+', '', decoded).lower()
++    unquoted = urllib.parse.unquote(cleaned)
++
++    for check in (cleaned, unquoted):
++        if check.startswith(('javascript:', 'vbscript:', 'livescript:')):
++            return True
++        if 'url=javascript:' in check or 'url=vbscript:' in check or 'url=livescript:' in check:
++            return True
++
++    # Check data: URLs
++    if cleaned.startswith('data:'):
++        after_data = cleaned[5:]
++        # Allow safe image/audio/video/font types
++        if any(after_data.startswith(safe) for safe in (
++            'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
++            'image/x-icon', 'image/bmp', 'audio/', 'video/', 'font/'
++        )):
++            return False
++        # Block text/html, scripts, etc.
++        if any(after_data.startswith(bad) for bad in (
++            'text/html', 'text/javascript', 'application/javascript',
++            'application/x-javascript', 'application/ecmascript'
++        )):
++            return True
++        if '<script' in cleaned or 'javascript:' in cleaned or 'onerror' in cleaned or 'onload' in cleaned:
++            return True
++        # Check base64 decoded data
++        if ';base64,' in cleaned:
++            try:
++                b64_part = cleaned.split(';base64,', 1)[1]
++                decoded_b64 = base64.b64decode(b64_part, validate=False).decode('utf-8', errors='ignore').lower()
++                if '<script' in decoded_b64 or 'javascript:' in decoded_b64 or 'onerror' in decoded_b64 or 'onload' in decoded_b64:
++                    return True
++            except Exception:
++                pass
++        # Any other data URL containing HTML tags or scripts
++        if '<' in decoded or 'javascript:' in cleaned:
++            return True
++
++    return False
++
++
++def filter_style_content(style_str):
++    """
++    Remove JavaScript execution vectors from CSS style content
++    (e.g., javascript:, expression(), behavior:).
++    Preserves legitimate CSS styling.
++    """
++    cleaned = re.sub(r'javascript\s*:\s*', '', style_str, flags=re.IGNORECASE)
++    cleaned = re.sub(r'expression\s*\([^)]*\)', '', cleaned, flags=re.IGNORECASE)
++    cleaned = re.sub(r'behavior\s*:\s*[^;}\"]+', '', cleaned, flags=re.IGNORECASE)
++    return cleaned
++
++
++def filter_attributes(attrs_str):
++    """
++    Filter dangerous attributes from an HTML tag's attribute string.
++    Removes:
++    - Event handlers (onclick, onload, onerror, on*, etc.)
++    - URLs containing javascript: / vbscript: / dangerous data: schemes
++    - Dangerous style attributes
++    Sanitizes:
++    - srcdoc attributes containing HTML
++    Preserves all non-dangerous attributes and formatting.
++    """
++    ATTR_REGEX = re.compile(
++        r'(?P<sep>[\s/]+)(?P<name>[^\s"\'`=>/]+)'
++        r'(?:\s*=\s*(?P<val>"[^"]*"|\'[^\']*\'|`[^`]*`|[^\s>]+))?',
++        re.DOTALL
++    )
++
++    def replace_attr(m):
++        sep = m.group('sep')
++        name = m.group('name')
++        val = m.group('val')
++        name_lower = name.lower()
++
++        # Event handlers: on...
++        if name_lower.startswith('on'):
++            return ''
++
++        # URLs with javascript / dangerous schemes
++        if val and is_dangerous_url(val):
++            return ''
++
++        # Style attributes
++        if name_lower == 'style' and val:
++            quote = ''
++            raw_val = val
++            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")) or (val.startswith('`') and val.endswith('`')):
++                quote = val[0]
++                raw_val = val[1:-1]
++            cleaned_val = filter_style_content(raw_val)
++            if cleaned_val != raw_val:
++                return f'{sep}{name}={quote}{cleaned_val}{quote}'
++
++        # srcdoc attribute
++        if name_lower == 'srcdoc' and val:
++            quote = '"'
++            raw_val = val
++            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")) or (val.startswith('`') and val.endswith('`')):
++                quote = val[0]
++                raw_val = val[1:-1]
++            unescaped = html.unescape(raw_val)
++            filtered_unescaped = filter_html(unescaped)
++            escaped_val = html.escape(filtered_unescaped, quote=(quote == '"'))
++            return f'{sep}{name}={quote}{escaped_val}{quote}'
++
++        return m.group(0)
++
++    return ATTR_REGEX.sub(replace_attr, attrs_str)
++
++
++def find_tag_end(text, start):
++    """
++    Find the ending > of an HTML tag starting at `start`, respecting quotes.
++    If another '<' is encountered outside quotes, stop before the new tag.
++    """
++    i = start + 1
++    n = len(text)
++    in_quote = None
++    while i < n:
++        c = text[i]
++        if in_quote:
++            if c == in_quote:
++                in_quote = None
++        else:
++            if c in ('"', "'", '`'):
++                in_quote = c
++            elif c == '<':
++                return i
++            elif c == '>':
++                return i + 1
++        i += 1
++    return n
++
++
++def _filter_html_single_pass(text):
++    """
++    Perform a single pass of token-based HTML sanitization.
++    """
++    result = []
++    i = 0
++    n = len(text)
++
++    while i < n:
++        # 1. HTML Comment: <!-- ... -->
++        if text.startswith('<!--', i):
++            end_comment = text.find('-->', i + 4)
++            if end_comment == -1:
++                comment_content = text[i:]
++                i = n
++            else:
++                comment_content = text[i:end_comment + 3]
++                i = end_comment + 3
++            # In comment, sanitize any <script or </script tags to avoid evasion
++            sanitized_comment = re.sub(r'</?script\b[^>]*>', '', comment_content, flags=re.IGNORECASE)
++            result.append(sanitized_comment)
++            continue
++
++        # 2. CDATA: <![CDATA[ ... ]]>
++        if text.startswith('<![CDATA[', i):
++            end_cdata = text.find(']]>', i + 9)
++            if end_cdata == -1:
++                result.append(text[i:])
++                i = n
++            else:
++                result.append(text[i:end_cdata + 3])
++                i = end_cdata + 3
++            continue
++
++        # 3. DOCTYPE or declaration: <!...>
++        if text.startswith('<!', i):
++            tag_end = find_tag_end(text, i)
++            result.append(text[i:tag_end])
++            i = tag_end
++            continue
++
++        # 4. Processing instruction: <? ... ?>
++        if text.startswith('<?', i):
++            end_pi = text.find('?>', i + 2)
++            if end_pi == -1:
++                result.append(text[i:])
++                i = n
++            else:
++                result.append(text[i:end_pi + 2])
++                i = end_pi + 2
++            continue
++
++        # 5. Script tag: <script ...> ... </script> or self-closing
++        if text[i:i+7].lower() == '<script' and (i + 7 == n or text[i+7] in ' \t\r\n/>'):
++            open_tag_end = find_tag_end(text, i)
++            open_tag = text[i:open_tag_end]
++            # Check if self-closing
++            if open_tag.rstrip().endswith('/>'):
++                i = open_tag_end
++                continue
++            # Find closing </script>
++            close_match = re.search(r'</script\s*>', text[open_tag_end:], re.IGNORECASE)
++            if close_match:
++                script_end = open_tag_end + close_match.end()
++                i = script_end
++            else:
++                # Unclosed script tag: eats rest of document
++                i = n
++            continue
++
++        # 6. Stray closing script tag: </script ...>
++        if text[i:i+8].lower() == '</script' and (i + 8 == n or text[i+8] in ' \t\r\n>'):
++            tag_end = find_tag_end(text, i)
++            i = tag_end
++            continue
++
++        # 7. Style tag: <style ...> ... </style>
++        if text[i:i+6].lower() == '<style' and (i + 6 == n or text[i+6] in ' \t\r\n/>'):
++            open_tag_end = find_tag_end(text, i)
++            open_tag = text[i:open_tag_end]
++            if open_tag.rstrip().endswith('/>'):
++                result.append(open_tag)
++                i = open_tag_end
++                continue
++            close_match = re.search(r'</style\s*>', text[open_tag_end:], re.IGNORECASE)
++            if close_match:
++                content = text[open_tag_end:open_tag_end + close_match.start()]
++                close_tag = close_match.group(0)
++                cleaned_content = filter_style_content(content)
++                result.append(open_tag + cleaned_content + close_tag)
++                i = open_tag_end + close_match.end()
++            else:
++                content = text[open_tag_end:]
++                cleaned_content = filter_style_content(content)
++                result.append(open_tag + cleaned_content)
++                i = n
++            continue
++
++        # 8. Closing HTML tag: </tag ...>
++        if text.startswith('</', i):
++            tag_end = find_tag_end(text, i)
++            tag_text = text[i:tag_end]
++            m_tag = re.match(r'^</(?P<tag>[a-zA-Z][a-zA-Z0-9_\-:]*)', tag_text)
++            if m_tag:
++                tag = m_tag.group('tag')
++                rest = tag_text[m_tag.end():]
++                if rest.endswith('>'):
++                    attrs = rest[:-1]
++                    end = '>'
++                else:
++                    attrs = rest
++                    end = ''
++                filtered_attrs = filter_attributes(attrs)
++                result.append(f"</{tag}{filtered_attrs}{end}")
++            else:
++                result.append(tag_text)
++            i = tag_end
++            continue
++
++        # 9. Opening HTML tag: <tag ...>
++        if text[i] == '<' and i + 1 < n and (text[i+1].isalpha()):
++            tag_end = find_tag_end(text, i)
++            tag_text = text[i:tag_end]
++            m_tag = re.match(r'^<(?P<tag>[a-zA-Z][a-zA-Z0-9_\-:]*)', tag_text)
++            if m_tag:
++                tag = m_tag.group('tag')
++                rest = tag_text[m_tag.end():]
++                if rest.endswith('/>'):
++                    attrs = rest[:-2]
++                    end = '/>'
++                elif rest.endswith('>'):
++                    attrs = rest[:-1]
++                    end = '>'
++                else:
++                    attrs = rest
++                    end = ''
++                filtered_attrs = filter_attributes(attrs)
++                result.append(f"<{tag}{filtered_attrs}{end}")
++            else:
++                result.append(tag_text)
++            i = tag_end
++            continue
++
++        # 10. Normal character outside tags
++        result.append(text[i])
++        i += 1
++
++    return ''.join(result)
++
++
++def filter_html(text):
++    """
++    Iteratively filter HTML until stable, ensuring nested attack vectors are removed.
++    """
++    prev = None
++    while text != prev:
++        prev = text
++        text = _filter_html_single_pass(text)
++    return text
++
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: python3 filter.py <html_file>", file=sys.stderr)
++        sys.exit(1)
++
++    file_path = sys.argv[1]
++    if not os.path.exists(file_path):
++        print(f"Error: File not found: {file_path}", file=sys.stderr)
++        sys.exit(1)
++
++    with open(file_path, 'r', encoding='utf-8', errors='surrogateescape') as f:
++        content = f.read()
++
++    filtered = filter_html(content)
++
++    with open(file_path, 'w', encoding='utf-8', errors='surrogateescape') as f:
++        f.write(filtered)
++
++
++if __name__ == '__main__':
++    main()
