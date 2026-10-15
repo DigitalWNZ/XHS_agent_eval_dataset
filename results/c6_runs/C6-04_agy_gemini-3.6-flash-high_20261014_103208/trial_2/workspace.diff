@@ -1,0 +1,156 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++import sys
++import os
++import cv2
++import numpy as np
++import toml
++
++def analyze_video(video_path):
++    if not os.path.exists(video_path):
++        raise FileNotFoundError(f"Input video file not found: {video_path}")
++        
++    cap = cv2.VideoCapture(video_path)
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++    
++    num_frames = len(frames)
++    if num_frames == 0:
++        raise ValueError("Video contains no frames")
++        
++    # Build clean background model using median of sampled frames
++    sample_indices = np.linspace(0, num_frames - 1, min(50, num_frames), dtype=int)
++    sampled_frames = [frames[i] for i in sample_indices]
++    bg = np.median(sampled_frames, axis=0).astype(np.uint8)
++    
++    h_img, w_img = bg.shape[:2]
++    
++    # Process frame by frame to extract motion blobs
++    per_frame_blobs = []
++    for t in range(num_frames):
++        diff = cv2.absdiff(frames[t], bg)
++        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
++        
++        # Exclude sky (y < h_img * 0.1) and bottom edge (y > h_img * 0.8)
++        gray[:int(h_img * 0.1), :] = 0
++        gray[int(h_img * 0.8):, :] = 0
++        
++        _, mask = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
++        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
++        
++        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++        
++        valid_blobs = []
++        for c in contours:
++            area = cv2.contourArea(c)
++            if area > 400:
++                pts = c.reshape(-1, 2)
++                xs = pts[:, 0]
++                ys = pts[:, 1]
++                valid_blobs.append({
++                    "frame": t,
++                    "min_x": float(xs.min()),
++                    "max_x": float(xs.max()),
++                    "min_y": float(ys.min()),
++                    "max_y": float(ys.max()),
++                    "cx": float(xs.mean()),
++                    "cy": float(ys.mean()),
++                    "area": float(area)
++                })
++                
++        # Filter blobs on track level (cy > h_img * 0.25)
++        track_blobs = [b for b in valid_blobs if b["cy"] > h_img * 0.25]
++        if track_blobs:
++            main_blob = max(track_blobs, key=lambda b: b["area"])
++            per_frame_blobs.append(main_blob)
++            
++    if not per_frame_blobs:
++        return 0, 0
++        
++    # Group active frames into contiguous segments
++    active_frames = sorted([b["frame"] for b in per_frame_blobs])
++    segments = []
++    curr = []
++    for f in active_frames:
++        if not curr or f - curr[-1] <= 3:
++            curr.append(f)
++        else:
++            segments.append(curr)
++            curr = [f]
++    if curr:
++        segments.append(curr)
++        
++    # Pick segment representing the runner pass (highest displacement * total area score)
++    def seg_score(seg):
++        blobs = [b for b in per_frame_blobs if b["frame"] in set(seg)]
++        cxs = [b["cx"] for b in blobs]
++        return (max(cxs) - min(cxs)) * sum(b["area"] for b in blobs)
++
++    best_seg = max(segments, key=seg_score)
++    runner_stats = [b for b in per_frame_blobs if b["frame"] in set(best_seg)]
++    runner_stats.sort(key=lambda b: b["frame"])
++    
++    # Baseline track level Y
++    all_max_y = [b["max_y"] for b in runner_stats]
++    track_y = float(np.percentile(all_max_y, 85))
++    
++    # Apex of jump (minimum max_y)
++    apex_stat = min(runner_stats, key=lambda b: b["max_y"])
++    apex_frame = apex_stat["frame"]
++    
++    # Threshold for ground contact (3% of image height)
++    threshold = 0.03 * h_img
++    
++    # Search backwards from apex for takeoff frame
++    takeoff_frame = apex_frame
++    for s in reversed([b for b in runner_stats if b["frame"] <= apex_frame]):
++        if track_y - s["max_y"] <= threshold:
++            takeoff_frame = s["frame"]
++            break
++            
++    # Search forwards from apex for landing frame
++    land_frame = apex_frame
++    for s in [b for b in runner_stats if b["frame"] >= apex_frame]:
++        if track_y - s["max_y"] <= threshold:
++            land_frame = s["frame"]
++            break
++            
++    return int(takeoff_frame), int(land_frame)
++
++def main():
++    video_path = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    output_path = "/app/output.toml"
++    
++    takeoff_frame, land_frame = analyze_video(video_path)
++    
++    result = {
++        "jump_takeoff_frame_number": takeoff_frame,
++        "jump_land_frame_number": land_frame
++    }
++    
++    os.makedirs(os.path.dirname(output_path), exist_ok=True)
++    with open(output_path, "w") as f:
++        toml.dump(result, f)
++        
++    print(f"Analysis complete. Takeoff: {takeoff_frame}, Landing: {land_frame}")
++    print(f"Output saved to {output_path}")
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 52
++jump_land_frame_number = 62

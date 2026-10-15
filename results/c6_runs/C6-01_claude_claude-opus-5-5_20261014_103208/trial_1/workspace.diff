@@ -1,0 +1,285 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,280 @@
++#!/usr/bin/env python3
++"""Remove JavaScript from an HTML file in-place.
++
++The file is tokenized following the HTML5 tokenizer rules, and only the
++dangerous pieces (script elements, event-handler attributes, javascript:
++URLs, dangerous CSS, ...) are cut out.  Everything else is left byte-for-byte
++untouched.
++"""
++import html
++import re
++import sys
++
++WS = ' \t\n\r\f'
++
++# Elements whose content is not parsed as markup by the browser.
++RAWTEXT = {'style', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript',
++           'title', 'textarea'}
++
++URL_ATTRS = {
++    'href', 'src', 'action', 'formaction', 'data', 'codebase', 'background',
++    'poster', 'lowsrc', 'dynsrc', 'cite', 'longdesc', 'usemap', 'classid',
++    'manifest', 'ping', 'archive', 'icon', 'profile', 'srcset', 'xlink:href',
++}
++
++ALWAYS_BAD_ATTRS = {'srcdoc'}
++
++SCRIPT_SCHEME = re.compile(r'(?:java|vb|live|j|ecma)script:|mocha:')
++CTRL = re.compile(r'[\x00-\x20\x7f]+')
++CSS_BAD = ('expression(', 'javascript:', 'vbscript:', 'livescript:',
++           'behavior:', '-moz-binding', 'behaviour:')
++
++
++def _norm(v):
++    return CTRL.sub('', v).lower()
++
++
++def _decodings(v):
++    once = html.unescape(v)
++    return (v, once, html.unescape(once))
++
++
++def _css_hex(m):
++    cp = int(m.group(1), 16)
++    if cp == 0 or cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
++        return ''
++    return chr(cp)
++
++
++def css_bad(css):
++    for v in _decodings(css):
++        t = re.sub(r'/\*.*?(\*/|$)', '', v, flags=re.S)
++        t = re.sub(r'\\([0-9a-fA-F]{1,6})[ \t\n\r\f]?', _css_hex, t)
++        t = re.sub(r'\\(.)', r'\1', t, flags=re.S)
++        t = re.sub(r'/\*.*?(\*/|$)', '', t, flags=re.S)
++        t = _norm(t)
++        if any(k in t for k in CSS_BAD):
++            return True
++    return False
++
++
++def attr_bad(tag, name, value):
++    local = name.rsplit(':', 1)[-1]
++    if name.startswith('on') or local.startswith('on') or name in ALWAYS_BAD_ATTRS:
++        return True
++    for v in _decodings(value):
++        norm = _norm(v)
++        if SCRIPT_SCHEME.search(norm):
++            return True
++        if name in URL_ATTRS or local == 'href':
++            for part in (norm.split(',') if name == 'srcset' else [norm]):
++                if part.startswith('data:'):
++                    if tag == 'img' and part.startswith('data:image/'):
++                        continue
++                    if re.match(r'data:(image|audio|video|font)/(?!svg)', part):
++                        continue
++                    return True
++        if name == 'attributename' and (norm.startswith('on') or
++                                        norm.rsplit(':', 1)[-1].startswith('on')):
++            return True
++    if name == 'style' and css_bad(value):
++        return True
++    return False
++
++
++def parse_tag(s, i, end_tag):
++    """Parse a tag starting at s[i] == '<'.
++
++    Returns (name, attrs, end, closed); attrs is a list of
++    (name, name_start, attr_end, value, unquoted_value).
++    """
++    n = len(s)
++    k = i + (2 if end_tag else 1)
++    j = k
++    while k < n and s[k] not in WS and s[k] not in '/>':
++        k += 1
++    name = s[j:k].lower()
++    attrs = []
++    while True:
++        while k < n and (s[k] in WS or s[k] == '/'):
++            k += 1
++        if k >= n:
++            return name, attrs, n, False
++        if s[k] == '>':
++            return name, attrs, k + 1, True
++        ns = k
++        k += 1  # first character (even '=') belongs to the name
++        while k < n and s[k] not in WS and s[k] not in '/>=':
++            k += 1
++        aname = s[ns:k].lower()
++        ne = k
++        while k < n and s[k] in WS:
++            k += 1
++        if k < n and s[k] == '=':
++            k += 1
++            while k < n and s[k] in WS:
++                k += 1
++            if k >= n:
++                attrs.append((aname, ns, n, '', False))
++                return name, attrs, n, False
++            c = s[k]
++            if c in '"\'':
++                e = s.find(c, k + 1)
++                if e < 0:
++                    attrs.append((aname, ns, n, s[k + 1:], False))
++                    return name, attrs, n, False
++                attrs.append((aname, ns, e + 1, s[k + 1:e], False))
++                k = e + 1
++            elif c == '>':
++                attrs.append((aname, ns, k, '', False))
++            else:
++                vs = k
++                while k < n and s[k] not in WS and s[k] != '>':
++                    k += 1
++                attrs.append((aname, ns, k, s[vs:k], True))
++        else:
++            attrs.append((aname, ns, ne, '', False))
++
++
++def rebuild_tag(s, start, end, tag, attrs):
++    """Return the original tag text with dangerous attributes cut out."""
++    pieces = []
++    pos = start
++    prev_unquoted = False
++    for aname, ns, ae, value, unquoted in attrs:
++        if attr_bad(tag, aname, value):
++            cut = ns
++            while cut > pos and s[cut - 1] in WS:
++                cut -= 1
++            nxt = s[ae:ae + 1]
++            if prev_unquoted and nxt not in WS + '>' and cut != ns:
++                # keep a separator so the previous unquoted value isn't extended
++                cut = ns
++            pieces.append(s[pos:cut])
++            pos = ae
++        else:
++            prev_unquoted = unquoted
++    pieces.append(s[pos:end])
++    return ''.join(pieces)
++
++
++def find_close(s, pos, name):
++    m = re.compile(r'</' + re.escape(name) + r'[\t\n\r\f />]', re.I).search(s, pos)
++    return m.start() if m else -1
++
++
++def _alpha(c):
++    return c.isascii() and c.isalpha()
++
++
++def sanitize(s):
++    out = []
++    n = len(s)
++    i = 0
++    while i < n:
++        j = s.find('<', i)
++        if j < 0:
++            out.append(s[i:])
++            break
++        out.append(s[i:j])
++        nxt = s[j + 1:j + 2]
++        if s.startswith('<!--', j):
++            if s.startswith('<!-->', j):
++                out.append('<!-->')
++                i = j + 5
++                continue
++            if s.startswith('<!--->', j):
++                out.append('<!--->')
++                i = j + 6
++                continue
++            ends = [e for e in (s.find('-->', j + 4), s.find('--!>', j + 4)) if e >= 0]
++            if not ends:
++                out.append('<!--' + sanitize(s[j + 4:]))
++                break
++            e = min(ends)
++            term = '-->' if s.startswith('-->', e) else '--!>'
++            out.append('<!--' + sanitize(s[j + 4:e]) + term)
++            i = e + len(term)
++        elif nxt in ('!', '?') or (nxt == '/' and not _alpha(s[j + 2:j + 3])):
++            if nxt == '/' and s[j + 2:j + 3] == '>':
++                out.append('</>')
++                i = j + 3
++                continue
++            if nxt == '/' and j + 2 >= n:
++                out.append(s[j:])
++                break
++            e = s.find('>', j + 2)
++            e = n if e < 0 else e + 1
++            out.append(s[j:e])
++            i = e
++        elif nxt == '/':
++            name, attrs, end, closed = parse_tag(s, j, True)
++            out.append(rebuild_tag(s, j, end, name, attrs))
++            i = end
++        elif _alpha(nxt):
++            name, attrs, end, closed = parse_tag(s, j, False)
++            if name == 'script':
++                if not closed:
++                    break
++                c = find_close(s, end, 'script')
++                if c < 0:
++                    break
++                _, _, i, _ = parse_tag(s, c, True)
++                continue
++            if not closed:
++                out.append(rebuild_tag(s, j, end, name, attrs))
++                break
++            if name == 'plaintext':
++                out.append(rebuild_tag(s, j, end, name, attrs))
++                out.append(sanitize(s[end:]))
++                break
++            if name in RAWTEXT:
++                c = find_close(s, end, name)
++                content = s[end:] if c < 0 else s[end:c]
++                if name == 'style' and css_bad(content):
++                    if c < 0:
++                        break
++                    _, _, i, _ = parse_tag(s, c, True)
++                    continue
++                out.append(rebuild_tag(s, j, end, name, attrs))
++                out.append(sanitize(content))
++                if c < 0:
++                    break
++                i = c
++                continue
++            out.append(rebuild_tag(s, j, end, name, attrs))
++            i = end
++        else:
++            out.append('<')
++            i = j + 1
++    return ''.join(out)
++
++
++SCRIPT_LEFTOVER = re.compile(
++    r'<script\b[^>]*>.*?</script\s*>|<script\b[^>]*>?|</script\s*>', re.I | re.S)
++
++
++def clean(s):
++    for _ in range(50):
++        t = SCRIPT_LEFTOVER.sub('', sanitize(s))
++        if t == s:
++            break
++        s = t
++    return s
++
++
++def main():
++    if len(sys.argv) < 2:
++        print('usage: filter.py FILE.html', file=sys.stderr)
++        sys.exit(1)
++    path = sys.argv[1]
++    with open(path, encoding='utf-8', errors='surrogateescape', newline='') as f:
++        data = f.read()
++    result = clean(data)
++    if result != data:
++        with open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='') as f:
++            f.write(result)
++
++
++if __name__ == '__main__':
++    main()

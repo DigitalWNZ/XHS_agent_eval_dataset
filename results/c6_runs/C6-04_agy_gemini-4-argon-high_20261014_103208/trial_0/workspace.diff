@@ -1,0 +1,190 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,178 @@
++#!/usr/bin/env python3
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_video(video_path="/app/example_video.mp4", output_path="/app/output.toml"):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Could not open video file: {video_path}")
++
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if len(frames) < 2:
++        raise ValueError("Video must contain at least 2 frames")
++
++    h, w = frames[0].shape[:2]
++    f0 = frames[0]
++    g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY).astype(np.float32)
++    f0_blur = cv2.GaussianBlur(f0, (5, 5), 0).astype(np.float32)
++
++    open_kernel = np.ones((5, 5), np.uint8)
++    metrics = {}
++
++    for i in range(1, len(frames)):
++        gi = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY).astype(np.float32)
++        (dx, dy), _ = cv2.phaseCorrelate(g0, gi)
++        M = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
++        aligned = cv2.warpAffine(
++            frames[i], M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
++        )
++        al_blur = cv2.GaussianBlur(aligned, (5, 5), 0).astype(np.float32)
++        diff = np.linalg.norm(al_blur - f0_blur, axis=2)
++
++        # Ignore frame borders affected by alignment shift
++        diff[:5, :] = 0
++        diff[-5:, :] = 0
++        diff[:, :5] = 0
++        diff[:, -5:] = 0
++
++        mask = (diff > 25.0).astype(np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
++
++        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
++        if num_labels <= 1:
++            continue
++
++        areas = stats[1:, cv2.CC_STAT_AREA]
++        main_idx = 1 + int(np.argmax(areas))
++        if stats[main_idx, cv2.CC_STAT_AREA] < 1000:
++            continue
++
++        mcx, mcy = centroids[main_idx]
++        runner_mask = np.zeros_like(mask)
++        for lbl in range(1, num_labels):
++            area = stats[lbl, cv2.CC_STAT_AREA]
++            cx, cy = centroids[lbl]
++            if area > 50 and abs(cx - mcx) < 160 and abs(cy - mcy) < 220:
++                runner_mask[labels == lbl] = 1
++
++        total_area = int(runner_mask.sum())
++        if total_area < 2500:
++            continue
++
++        ys, xs = np.where(runner_mask > 0)
++        cx = float(xs.mean())
++        cy = float(ys.mean())
++        p98_y = float(np.percentile(ys, 98))
++        p99_y = float(np.percentile(ys, 99))
++        ymax = float(ys.max())
++
++        metrics[i] = {
++            "area": total_area,
++            "cx": cx,
++            "cy": cy,
++            "p98_y": p98_y,
++            "p99_y": p99_y,
++            "ymax": ymax,
++        }
++
++    # Filter frames where the runner is well within the camera view
++    valid_frames = sorted(
++        f for f, m in metrics.items() if m["area"] >= 4000 and 40.0 < m["cx"] < (w - 40.0)
++    )
++    if not valid_frames:
++        valid_frames = sorted(metrics.keys())
++
++    # Find the apex (peak) of the jump where the runner's center of mass and feet are highest (min y)
++    peak_frame = min(
++        valid_frames,
++        key=lambda f: 0.5 * metrics[f]["cy"] + 0.5 * metrics[f]["p99_y"],
++    )
++
++    # Pre-jump window to determine takeoff frame
++    pre_frames = [f for f in sorted(metrics.keys()) if peak_frame - 12 <= f < peak_frame]
++    if pre_frames:
++        ground_pre = max(metrics[f]["p99_y"] for f in pre_frames)
++        # Walk backwards from peak_frame to find when the foot pushes off the ground
++        takeoff_frame = pre_frames[0]
++        for f in reversed(pre_frames):
++            if metrics[f]["p99_y"] >= ground_pre - 5.0:
++                takeoff_frame = f
++                break
++    else:
++        takeoff_frame = max(0, peak_frame - 5)
++
++    # Post-jump window to determine landing frame
++    post_frames = [f for f in sorted(metrics.keys()) if peak_frame < f <= peak_frame + 12]
++    if post_frames:
++        ground_post = max(metrics[f]["p99_y"] for f in post_frames)
++        # Walk forwards from peak_frame to find when the leading foot lands on the ground
++        land_frame = post_frames[-1]
++        for f in post_frames:
++            if metrics[f]["p99_y"] >= ground_post - 5.0:
++                land_frame = f
++                break
++    else:
++        land_frame = min(len(frames) - 1, peak_frame + 5)
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    with open("/app/output.toml", "w") as f:
++        toml.dump(result, f)
++
++    if output_path and output_path != "/app/output.toml":
++        with open(output_path, "w") as f:
++            toml.dump(result, f)
++
++    return result
++
++
++def main():
++    video_path = "/app/example_video.mp4"
++    output_path = "/app/output.toml"
++
++    args = sys.argv[1:]
++    i = 0
++    positional = []
++    while i < len(args):
++        arg = args[i]
++        if arg in ("-i", "--input", "-v", "--video", "-f", "--file") and i + 1 < len(args):
++            video_path = args[i + 1]
++            i += 2
++        elif arg in ("-o", "--output") and i + 1 < len(args):
++            output_path = args[i + 1]
++            i += 2
++        elif arg.startswith("--input=") or arg.startswith("--video=") or arg.startswith("--file="):
++            video_path = arg.split("=", 1)[1]
++            i += 1
++        elif arg.startswith("--output="):
++            output_path = arg.split("=", 1)[1]
++            i += 1
++        elif not arg.startswith("-"):
++            positional.append(arg)
++            i += 1
++        else:
++            i += 1
++
++    if len(positional) >= 1:
++        video_path = positional[0]
++    if len(positional) >= 2:
++        output_path = positional[1]
++
++    analyze_video(video_path, output_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 52
++jump_land_frame_number = 62

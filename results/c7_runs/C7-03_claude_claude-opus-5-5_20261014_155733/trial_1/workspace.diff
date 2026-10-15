@@ -1,0 +1,70 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,65 @@
++import asyncio
++from typing import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int
++) -> None:
++    """Run ``tasks`` with at most ``max_concurrent`` running at once.
++
++    Tasks are started lazily, in order, as slots free up. If a task raises,
++    the remaining tasks still run and the first exception is re-raised once
++    everything has finished. If ``run_tasks`` itself is cancelled (e.g. by
++    Ctrl+C under ``asyncio.run``), all running tasks are cancelled and
++    awaited so their cleanup code (``finally`` / ``async with``) completes
++    before the cancellation propagates; tasks not yet started are skipped.
++    """
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be >= 1")
++
++    tasks = list(tasks)
++    if not tasks:
++        return
++
++    it = iter(tasks)
++    errors: list[BaseException] = []
++
++    async def worker() -> None:
++        for task in it:
++            try:
++                await task()
++            except asyncio.CancelledError as e:
++                if asyncio.current_task().cancelling():
++                    raise  # we are being cancelled; stop
++                errors.append(e)  # the task cancelled itself; keep going
++            except Exception as e:
++                errors.append(e)
++
++    workers = [
++        asyncio.create_task(worker())
++        for _ in range(min(max_concurrent, len(tasks)))
++    ]
++
++    try:
++        await asyncio.wait(workers)
++    except BaseException:
++        for w in workers:
++            w.cancel()
++        # Wait for every task's cleanup to finish, even if we get
++        # cancelled again while waiting.
++        while True:
++            pending = [w for w in workers if not w.done()]
++            if not pending:
++                break
++            try:
++                await asyncio.wait(pending)
++            except asyncio.CancelledError:
++                for w in pending:
++                    w.cancel()
++        for w in workers:
++            if not w.cancelled():
++                w.exception()  # mark retrieved
++        raise
++
++    if errors:
++        raise errors[0]

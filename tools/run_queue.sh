@@ -4,11 +4,12 @@
 # Usage: run_agy_queue.sh <K> <timeout_min> <rm|keep> <cat:ENTRY> [<cat:ENTRY> ...]
 K=$1; TMO=$2; RM=$3; shift 3
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-XHS=$ROOT/sources/xhs; LOG=$ROOT/runs/agy; mkdir -p "$LOG"
+XHS=$ROOT/sources/xhs; LOG=${LOG_DIR:-$ROOT/runs/agy}; mkdir -p "$LOG"   # LOG_DIR: per-campaign logs
 export GOOGLE_APPLICATION_CREDENTIALS=$HOME/.cache/xhs_c6/agy-adc/adc.json
 AGENT=${AGENT:-agy}
 MODELS=${MODELS:-"gemini-3.6-flash-high gemini-3.8-flash-high"}
 TRIALS=${TRIALS:-3}
+QUALITY=${QUALITY:-machine}   # off | machine | full (LLM judge inline)
 
 one_entry() {
   local cat=${1%%:*} e=${1##*:}
@@ -16,7 +17,7 @@ one_entry() {
   echo "$(date +%T) start $e"
   for m in $MODELS; do
     python3 -u evaluation/run_benchmark.py --category "$cat" --entry "$e" --agent "$AGENT" --model "$m" \
-      --sandbox udocker --trials "$TRIALS" --timeout "$TMO" > "$LOG/${e}_$m.log" 2>&1 &
+      --sandbox udocker --trials "$TRIALS" --timeout "$TMO" --quality "$QUALITY" > "$LOG/${e}_$m.log" 2>&1 &
   done
   wait
   for m in $MODELS; do
@@ -29,6 +30,6 @@ one_entry() {
     udocker --quiet rm "$name" >/dev/null 2>&1 && echo "$(date +%T) removed base for $e"
   fi
 }
-export -f one_entry; export XHS LOG MODELS TRIALS TMO RM AGENT
+export -f one_entry; export XHS LOG MODELS TRIALS TMO RM AGENT QUALITY
 printf '%s\n' "$@" | xargs -P "$K" -I{} bash -c 'one_entry "$@"' _ {}
 echo "$(date +%T) QUEUE DONE"

@@ -1,0 +1,1193 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,1188 @@
++#!/usr/bin/env python3
++"""HTML XSS sanitizer that removes JavaScript while preserving HTML formatting."""
++
++import html
++import re
++import sys
++import urllib.parse
++from typing import List, Optional, Tuple
++from bs4 import BeautifulSoup
++
++
++# Tags that must be completely removed (along with their inner content when paired).
++ALWAYS_REMOVE_CONTAINER_TAGS = {
++    "script",
++    "iframe",
++    "frame",
++    "frameset",
++    "object",
++    "applet",
++    "handler",
++    "foreignobject",
++    "portal",
++    "fencedframe",
++}
++
++# Tags whose start and end tags are always removed (void / animation / legacy XSS tags).
++ALWAYS_REMOVE_TAG_ONLY = {
++    "embed",
++    "base",
++    "bgsound",
++    "keygen",
++    "isindex",
++    "layer",
++    "ilayer",
++    "blink",
++    "param",
++    "use",
++    "set",
++    "animate",
++    "animatemotion",
++    "animatetransform",
++    "animatecolor",
++    "discard",
++    "maction",
++    "xss",
++}
++
++ALL_FORBIDDEN_TAGS = ALWAYS_REMOVE_CONTAINER_TAGS | ALWAYS_REMOVE_TAG_ONLY
++
++# HTML5 RAWTEXT / RCDATA elements whose closing tag is matched directly without
++# parsing nested tag quotes inside the element body.
++RAWTEXT_RCDATA_TAGS = {
++    "textarea",
++    "title",
++    "xmp",
++    "noembed",
++    "noframes",
++    "noscript",
++}
++
++SAFE_LINK_RELS = {
++    "stylesheet",
++    "icon",
++    "shortcut",
++    "apple-touch-icon",
++    "apple-touch-startup-image",
++    "canonical",
++    "alternate",
++    "author",
++    "bookmark",
++    "external",
++    "help",
++    "license",
++    "next",
++    "nofollow",
++    "noopener",
++    "noreferrer",
++    "opener",
++    "prev",
++    "search",
++    "tag",
++}
++
++SAFE_META_HTTP_EQUIV = {
++    "content-type",
++    "x-ua-compatible",
++    "content-language",
++    "cleartype",
++}
++
++URL_ATTRIBUTES = {
++    "href",
++    "xlink:href",
++    "src",
++    "action",
++    "formaction",
++    "data",
++    "codebase",
++    "cite",
++    "background",
++    "poster",
++    "profile",
++    "archive",
++    "classid",
++    "code",
++    "icon",
++    "manifest",
++    "ping",
++    "dynsrc",
++    "lowsrc",
++    "longdesc",
++    "usemap",
++    "srcset",
++    "imagesrcset",
++}
++
++ALWAYS_DANGEROUS_ATTRS = {
++    "srcdoc",
++    "fscommand",
++    "seeksegmenttime",
++    "xml:base",
++    "ev:event",
++}
++
++_NUM_CHARREF_RE = re.compile(r"&#([xX][0-9a-fA-F]+|[0-9]+);?")
++_NAMED_NO_SEMI_RE = re.compile(
++    r"&(colon|tab|newline|lpar|rpar|quot|apos|lt|gt|amp|sol|bsol)(?![a-zA-Z0-9;])",
++    re.IGNORECASE,
++)
++_NAMED_MAP = {
++    "colon": ":",
++    "tab": "\t",
++    "newline": "\n",
++    "lpar": "(",
++    "rpar": ")",
++    "quot": '"',
++    "apos": "'",
++    "lt": "<",
++    "gt": ">",
++    "amp": "&",
++    "sol": "/",
++    "bsol": "\\",
++}
++_STRIP_CHARS_RE = re.compile(r"[\x00-\x20\x7f\xad\u200b-\u200f\u2028\u2029\ufeff]+")
++_CSS_COMMENT_RE = re.compile(r"/\*[\s\S]*?(?:\*/|$)")
++_CSS_HEX_ESCAPE_RE = re.compile(r"\\([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?")
++_CSS_CHAR_ESCAPE_RE = re.compile(r"\\([^\r\n\f0-9a-fA-F])")
++_COMMENT_CLOSE_RE = re.compile(r"--!?>")
++
++
++def _replace_num_charref(match: re.Match) -> str:
++    s = match.group(1)
++    try:
++        cp = int(s[1:], 16) if s[0] in ("x", "X") else int(s, 10)
++        if 0 < cp <= 0x10FFFF:
++            return chr(cp)
++        return ""
++    except (ValueError, OverflowError):
++        return ""
++
++
++def _replace_named_no_semi(match: re.Match) -> str:
++    return _NAMED_MAP.get(match.group(1).lower(), match.group(0))
++
++
++def decode_html_entities(text: str) -> str:
++    """Repeatedly decode HTML numeric, hex, and named character references."""
++    prev = text
++    for _ in range(5):
++        curr = _NUM_CHARREF_RE.sub(_replace_num_charref, prev)
++        curr = _NAMED_NO_SEMI_RE.sub(_replace_named_no_semi, curr)
++        curr = html.unescape(curr)
++        if curr == prev:
++            break
++        prev = curr
++    return curr
++
++
++def decode_css_escapes(css: str) -> str:
++    """Remove CSS comments and decode CSS backslash escapes."""
++    def _hex_repl(m: re.Match) -> str:
++        try:
++            cp = int(m.group(1), 16)
++            if 0 < cp <= 0x10FFFF:
++                return chr(cp)
++        except ValueError:
++            pass
++        return ""
++
++    s = css.replace("\\\r\n", "").replace("\\\n", "").replace("\\\r", "").replace("\\\f", "")
++    s = _CSS_HEX_ESCAPE_RE.sub(_hex_repl, s)
++    s = _CSS_CHAR_ESCAPE_RE.sub(r"\1", s)
++    s = _CSS_COMMENT_RE.sub("", s)
++    s = s.replace("\\\r\n", "").replace("\\\n", "").replace("\\\r", "").replace("\\\f", "")
++    s = _CSS_HEX_ESCAPE_RE.sub(_hex_repl, s)
++    s = _CSS_CHAR_ESCAPE_RE.sub(r"\1", s)
++    return s
++
++
++def normalize_for_check(value: str) -> str:
++    """Decode entities, CSS escapes, URL encoding, and strip control/whitespace chars."""
++    decoded = decode_html_entities(value)
++    css_decoded = decode_css_escapes(decoded)
++    try:
++        unquoted = urllib.parse.unquote(css_decoded)
++    except Exception:
++        unquoted = css_decoded
++    unquoted = decode_html_entities(unquoted)
++    compact = _STRIP_CHARS_RE.sub("", unquoted).lower()
++    return compact
++
++
++def is_safe_Image_data_uri(compact_val: str) -> bool:
++    """Return True only if compact_val is a safe raster data:image/* URI."""
++    if not re.match(
++        r"^data:image/(?:png|jpe?g|gif|webp|bmp|x-icon|vnd\.microsoft\.icon)[;,]",
++        compact_val,
++    ):
++        return False
++    if any(bad in compact_val for bad in ("script", "<", ">", "onload", "onerror", "expression(")):
++        return False
++    return True
++
++
++def is_dangerous_css(css_text: str) -> bool:
++    """Check if CSS string contains JS execution vectors."""
++    decoded_entities = decode_html_entities(css_text)
++    un_escaped = decode_css_escapes(decoded_entities)
++    compact = _STRIP_CHARS_RE.sub("", un_escaped).lower()
++
++    dangerous_substrings = (
++        "expression(",
++        "javascript:",
++        "vbscript:",
++        "livescript:",
++        "mocha:",
++        "jscript:",
++        "ecmascript:",
++        "-moz-binding",
++        "behavior:",
++        "behaviour:",
++        "@import",
++        "<script",
++        "</script",
++        "</style",
++        "onerror=",
++        "onload=",
++    )
++    for sub in dangerous_substrings:
++        if sub in compact:
++            return True
++
++    # Check for data: URIs inside url(...)
++    if "data:" in compact:
++        for m in re.finditer(r"data:[^)\"'\s]+", compact):
++            data_uri = m.group(0)
++            if not is_safe_Image_data_uri(data_uri):
++                return True
++
++    return False
++
++
++def sanitize_inline_style(style_val: str) -> Optional[str]:
++    """Sanitize an inline style attribute value.
++
++    Returns:
++      - The original style_val unchanged if it contains no dangerous CSS.
++      - A filtered style_val with only safe declarations if some are safe.
++      - None if the entire style attribute should be removed.
++    """
++    if not is_dangerous_css(style_val):
++        return style_val
++
++    # Split declarations by ';' outside quotes and parentheses
++    decls = []
++    start = 0
++    in_quote = None
++    paren_depth = 0
++    for idx, ch in enumerate(style_val):
++        if in_quote:
++            if ch == in_quote and (idx == 0 or style_val[idx - 1] != "\\"):
++                in_quote = None
++        else:
++            if ch in ('"', "'"):
++                in_quote = ch
++            elif ch == "(":
++                paren_depth += 1
++            elif ch == ")" and paren_depth > 0:
++                paren_depth -= 1
++            elif ch == ";" and paren_depth == 0:
++                decls.append(style_val[start:idx])
++                start = idx + 1
++    if start < len(style_val):
++        decls.append(style_val[start:])
++
++    safe_decls = []
++    for d in decls:
++        if d.strip() and not is_dangerous_css(d):
++            safe_decls.append(d)
++
++    if not safe_decls:
++        return None
++    return ";".join(safe_decls)
++
++
++def sanitize_style_block(css_body: str) -> Optional[str]:
++    """Sanitize the content of a <style>...</style> element."""
++    # First check if HTML tags like <script> or <img onerror=...> are hidden inside <style>
++    html_cleaned = sanitize_html_once(css_body)
++    if not is_dangerous_css(html_cleaned) and html_cleaned == css_body:
++        return css_body
++
++    # Remove @import statements
++    cleaned = re.sub(
++        r"@(?:\s|\\[0-9a-fA-F]{1,6}\s?|\\.)*i(?:\s|\\[0-9a-fA-F]{1,6}\s?|\\.)*m(?:\s|\\[0-9a-fA-F]{1,6}\s?|\\.)*p(?:\s|\\[0-9a-fA-F]{1,6}\s?|\\.)*o(?:\s|\\[0-9a-fA-F]{1,6}\s?|\\.)*r(?:\s|\\[0-9a-fA-F]{1,6}\s?|\\.)*t[^;{}]*(?:;|$)",
++        "",
++        html_cleaned,
++        flags=re.IGNORECASE,
++    )
++
++    # Sanitize declaration blocks { ... }
++    def _clean_block(m: re.Match) -> str:
++        inner = m.group(1)
++        sanitized_inner = sanitize_inline_style(inner)
++        if sanitized_inner is None:
++            return "{}"
++        return "{" + sanitized_inner + "}"
++
++    cleaned = re.sub(r"\{([^{}]*)\}", _clean_block, cleaned)
++    # Remove rules that became empty `selector {}`
++    cleaned = re.sub(r"[^{};]+\{\s*\}", "", cleaned)
++
++    if is_dangerous_css(cleaned):
++        return None
++    if not cleaned.strip():
++        return None
++    return cleaned
++
++
++def is_dangerous_attribute(tag_name: str, attr_name_raw: str, attr_val: Optional[str]) -> bool:
++    """Return True if an attribute on tag_name is dangerous and should be removed."""
++    lower_name = attr_name_raw.lower().strip()
++    clean_name = re.sub(r"[\x00-\x20\"'`<\\/=]+", "", lower_name)
++
++    if not clean_name:
++        return True
++
++    # Any attribute name containing '<' is malformed markup smuggling
++    if "<" in attr_name_raw:
++        return True
++
++    # Event handler attributes (on*, *:on*, ev:event)
++    if (
++        lower_name.startswith("on")
++        or clean_name.startswith("on")
++        or lower_name.split(":")[-1].startswith("on")
++        or clean_name.split(":")[-1].startswith("on")
++    ):
++        return True
++
++    if lower_name in ALWAYS_DANGEROUS_ATTRS or clean_name in ALWAYS_DANGEROUS_ATTRS:
++        return True
++
++    if attr_val is None:
++        return False
++
++    compact_val = normalize_for_check(attr_val)
++    decoded_val = decode_html_entities(attr_val).lower()
++
++    # Check for dangerous schemes anywhere in URL attributes or at start of any attribute
++    dangerous_schemes = (
++        "javascript:",
++        "vbscript:",
++        "livescript:",
++        "mocha:",
++        "jscript:",
++        "ecmascript:",
++    )
++    stripped_start = compact_val.lstrip("\"'`(")
++    for scheme in dangerous_schemes:
++        if stripped_start.startswith(scheme) or scheme in compact_val:
++            return True
++
++    # Check for data: URIs
++    if stripped_start.startswith("data:") or (
++        clean_name in URL_ATTRIBUTES and "data:" in compact_val
++    ):
++        if tag_name == "img" and clean_name == "src" and is_safe_Image_data_uri(stripped_start):
++            pass
++        else:
++            return True
++
++    # Check for mXSS / RCDATA / RAWTEXT breakout tags or event handlers smuggled in attribute values
++    mxss_markers = (
++        "<script",
++        "</script",
++        "</style",
++        "</textarea",
++        "</title",
++        "</xmp",
++        "</noscript",
++        "</noembed",
++        "</noframes",
++        "</iframe",
++        "javascript:",
++        "vbscript:",
++    )
++    for marker in mxss_markers:
++        if marker in decoded_val or marker in compact_val:
++            return True
++
++    # Check backtick attribute smuggling containing event handlers or tags
++    if "`" in attr_val and any(
++        pat in decoded_val for pat in ("onload=", "onerror=", "onmouseover=", "onfocus=", "onclick=", "<img", "<svg", "<script")
++    ):
++        return True
++
++    # Form / input / button specific checks
++    if clean_name == " style" or clean_name == "style":
++        if sanitize_inline_style(attr_val) is None:
++            return True
++
++    return False
++
++
++class ParsedAttr:
++    def __init__(
++        self,
++        ws_start: int,
++        name_start: int,
++        name_end: int,
++        attr_end: int,
++        name_raw: str,
++        val: Optional[str],
++        val_start: Optional[int],
++        val_end: Optional[int],
++    ):
++        self.ws_start = ws_start
++        self.name_start = name_start
++        self.name_end = name_end
++        self.attr_end = attr_end
++        self.name_raw = name_raw
++        self.val = val
++        self.val_start = val_start
++        self.val_end = val_end
++
++
++def parse_start_tag(s: str, tag_start: int) -> Tuple[str, int, bool, List[ParsedAttr], bool]:
++    """Parse an HTML start tag starting at tag_start ('<').
++
++    Returns:
++      (tag_name_raw, tag_end, is_self_closing, attrs, has_lt_in_tagname)
++    """
++    n = len(s)
++    i = tag_start + 1
++    while i < n and s[i] not in (" ", "\t", "\n", "\r", "\x0c", "/", ">", "<"):
++        i += 1
++
++    tag_name_raw = s[tag_start + 1 : i]
++    if i < n and s[i] == "<":
++        return (tag_name_raw, i, False, [], True)
++
++    attrs: List[ParsedAttr] = []
++    is_self_closing = False
++
++    while i < n:
++        ws_start = i
++        # Skip whitespace and stray '/' (not followed by '>')
++        while i < n:
++            if s[i] in (" ", "\t", "\n", "\r", "\x0c"):
++                i += 1
++            elif s[i] == "/" and not (i + 1 < n and s[i + 1] == ">"):
++                i += 1
++            else:
++                break
++
++        if i >= n:
++            return (tag_name_raw, n, False, attrs, False)
++        if s[i] == ">":
++            return (tag_name_raw, i + 1, False, attrs, False)
++        if s[i] == "/" and i + 1 < n and s[i + 1] == ">":
++            return (tag_name_raw, i + 2, True, attrs, False)
++
++        # Attribute name state
++        name_start = i
++        while i < n and s[i] not in (" ", "\t", "\n", "\r", "\x0c", "=", "/", ">"):
++            i += 1
++        name_end = i
++        name_raw = s[name_start:name_end]
++
++        # After attribute name state
++        after_name_pos = i
++        while i < n and s[i] in (" ", "\t", "\n", "\r", "\x0c"):
++            i += 1
++
++        if i < n and s[i] == "=":
++            i += 1  # consume '='
++            while i < n and s[i] in (" ", "\t", "\n", "\r", "\x0c"):
++                i += 1
++            if i < n and s[i] in ('"', "'"):
++                quote = s[i]
++                i += 1
++                val_start = i
++                while i < n and s[i] != quote:
++                    i += 1
++                val_end = i
++                if i < n and s[i] == quote:
++                    i += 1
++                attr_end = i
++                val = s[val_start:val_end]
++            elif i < n and s[i] == "`":
++                # Check if backtick-delimited attribute value is a dangerous JS/data payload
++                val_start = i
++                closing_bt = s.find("`", i + 1)
++                next_gt = s.find(">", i + 1)
++                if closing_bt != -1 and (next_gt == -1 or closing_bt < next_gt):
++                    candidate = s[i + 1 : closing_bt]
++                    cand_norm = normalize_for_check(candidate)
++                    if any(
++                        cand_norm.startswith(sc)
++                        for sc in ("javascript:", "vbscript:", "data:", "livescript:")
++                    ) or "alert(" in cand_norm:
++                        i = closing_bt + 1
++                        val_end = i
++                        attr_end = i
++                        val = s[val_start:val_end]
++                    else:
++                        while (
++                            i < n
++                            and s[i] not in (" ", "\t", "\n", "\r", "\x0c", ">")
++                            and s[i : i + 2] != "/>"
++                        ):
++                            i += 1
++                        val_end = i
++                        attr_end = i
++                        val = s[val_start:val_end]
++                else:
++                    while (
++                        i < n
++                        and s[i] not in (" ", "\t", "\n", "\r", "\x0c", ">")
++                        and s[i : i + 2] != "/>"
++                    ):
++                        i += 1
++                    val_end = i
++                    attr_end = i
++                    val = s[val_start:val_end]
++            else:
++                val_start = i
++                while (
++                    i < n
++                    and s[i] not in (" ", "\t", "\n", "\r", "\x0c", ">")
++                    and s[i : i + 2] != "/>"
++                ):
++                    i += 1
++                val_end = i
++                attr_end = i
++                val = s[val_start:val_end]
++
++            attrs.append(
++                ParsedAttr(
++                    ws_start=ws_start,
++                    name_start=name_start,
++                    name_end=name_end,
++                    attr_end=attr_end,
++                    name_raw=name_raw,
++                    val=val,
++                    val_start=val_start,
++                    val_end=val_end,
++                )
++            )
++        else:
++            i = after_name_pos
++            attrs.append(
++                ParsedAttr(
++                    ws_start=ws_start,
++                    name_start=name_start,
++                    name_end=name_end,
++                    attr_end=after_name_pos,
++                    name_raw=name_raw,
++                    val=None,
++                    val_start=None,
++                    val_end=None,
++                )
++            )
++
++    return (tag_name_raw, n, is_self_closing, attrs, False)
++
++
++def find_script_end(s: str, tag_end: int, is_self_closing: bool) -> int:
++    """Find the end of a <script> element starting after its opening tag at tag_end."""
++    n = len(s)
++    close_re = re.compile(r"</\s*s\x00*c\x00*r\x00*i\x00*p\x00*t(?=[\t\n\x0c\r />]|$)", re.IGNORECASE)
++    open_re = re.compile(r"<\s*s\x00*c\x00*r\x00*i\x00*p\x00*t(?=[\t\n\x0c\r />]|$)", re.IGNORECASE)
++
++    if is_self_closing:
++        # Check if there is a </script> before the next <script> or </svg>
++        m_close = close_re.search(s, tag_end)
++        if not m_close:
++            return tag_end
++        m_open = open_re.search(s, tag_end)
++        m_svg = re.search(r"</\s*svg(?=[\t\n\x0c\r />]|$)", s[tag_end:], re.IGNORECASE)
++        if m_open and m_open.start() < m_close.start():
++            return tag_end
++        if m_svg and (tag_end + m_svg.start()) < m_close.start():
++            return tag_end
++
++    # Follow HTML5 Script Data / Escaped / Double-Escaped state machine
++    i = tag_end
++    escaped = False
++    double_escaped = False
++    first_close_end = None
++
++    while i < n:
++        if not escaped and s.startswith("<!--", i):
++            escaped = True
++            i += 4
++            continue
++        if escaped and s.startswith("-->", i):
++            escaped = False
++            double_escaped = False
++            i += 3
++            continue
++        if escaped and not double_escaped:
++            m_open = open_re.match(s, i)
++            if m_open:
++                double_escaped = True
++                i = m_open.end()
++                continue
++        m_close = close_re.match(s, i)
++        if m_close:
++            gt = s.find(">", m_close.end())
++            close_end = (gt + 1) if gt != -1 else n
++            if first_close_end is None:
++                first_close_end = close_end
++            if double_escaped:
++                double_escaped = False
++                i = close_end
++                continue
++            return close_end
++        i += 1
++
++    if first_close_end is not None:
++        return first_close_end
++    if is_self_closing:
++        return tag_end
++    # Unclosed <script> with no </script> anywhere in the rest of the document:
++    # Check if the opening <script ...> tag itself had src/href, or stop before the next HTML tag
++    m_next_tag = re.search(r"<(?=[a-zA-Z/!])", s[tag_end:])
++    if m_next_tag:
++        return tag_end + m_next_tag.start()
++    return n
++
++
++def find_matching_end_tag(s: str, pos: int, tag_name: str) -> Optional[Tuple[int, int]]:
++    """Find matching closing tag (close_start, close_end) for tag_name starting at pos."""
++    n = len(s)
++    pattern = re.compile(
++        r"(<\s*/?\s*" + re.escape(tag_name) + r"(?=[\t\n\x0c\r />]|$))",
++        re.IGNORECASE,
++    )
++    depth = 1
++    idx = pos
++    while idx < n:
++        m = pattern.search(s, idx)
++        if not m:
++            return None
++        token = m.group(1)
++        t_start = m.start()
++        if "/" in token:
++            gt = s.find(">", m.end())
++            t_end = (gt + 1) if gt != -1 else n
++            depth -= 1
++            if depth == 0:
++                return (t_start, t_end)
++            idx = t_end
++        else:
++            _, t_end, self_closing, _, _ = parse_start_tag(s, t_start)
++            if not self_closing:
++                depth += 1
++            idx = max(t_end, m.end())
++    return None
++
++
++def find_rawtext_end_tag(s: str, pos: int, tag_name: str) -> Optional[Tuple[int, int]]:
++    """Find the FIRST closing tag for a RAWTEXT/RCDATA element starting at pos."""
++    n = len(s)
++    pattern = re.compile(
++        r"</\s*" + re.escape(tag_name) + r"(?=[\t\n\x0c\r />]|$)",
++        re.IGNORECASE,
++    )
++    m = pattern.search(s, pos)
++    if not m:
++        return None
++    gt = s.find(">", m.end())
++    close_end = (gt + 1) if gt != -1 else n
++    return (m.start(), close_end)
++
++
++def is_dangerous_meta(attrs: List[ParsedAttr]) -> bool:
++    """Return True if a <meta> tag is dangerous and should be removed completely."""
++    has_any_safe = False
++    for a in attrs:
++        name = a.name_raw.lower().strip()
++        val = a.val or ""
++        norm_val = normalize_for_check(val)
++        if name == "http-equiv":
++            if norm_val not in SAFE_META_HTTP_EQUIV:
++                return True
++        if name in ("content", "charset"):
++            if "utf-7" in norm_val or "utf7" in norm_val:
++                return True
++            if any(
++                bad in norm_val
++                for bad in ("javascript:", "vbscript:", "data:", "livescript:", "url=")
++            ):
++                return True
++        if not is_dangerous_attribute("meta", a.name_raw, a.val):
++            has_any_safe = True
++    if attrs and not has_any_safe:
++        return True
++    return False
++
++
++def is_dangerous_link(attrs: List[ParsedAttr]) -> bool:
++    """Return True if a <link> tag is dangerous and should be removed completely."""
++    has_any_safe = False
++    for a in attrs:
++        name = a.name_raw.lower().strip()
++        val = a.val or ""
++        norm_val = normalize_for_check(val)
++        if name == "rel":
++            tokens = decode_html_entities(val).lower().split()
++            if not tokens:
++                return True
++            for tok in tokens:
++                if tok not in SAFE_LINK_RELS:
++                    return True
++        elif name == "as":
++            return True
++        elif name in ("href", "xlink:href"):
++            if is_dangerous_attribute("link", a.name_raw, a.val):
++                return True
++            if norm_val.endswith(".js") or ".js?" in norm_val:
++                return True
++        if not is_dangerous_attribute("link", a.name_raw, a.val):
++            has_any_safe = True
++    if attrs and not has_any_safe:
++        return True
++    return False
++
++
++def reconstruct_start_tag(
++    s: str,
++    tag_start: int,
++    tag_end: int,
++    tag_name: str,
++    attrs: List[ParsedAttr],
++) -> Tuple[str, bool]:
++    """Reconstruct a start tag by excising only dangerous attributes.
++
++    Returns (new_tag_str, modified_bool).
++    """
++    if tag_end == len(s) and s[tag_end - 1] != ">":
++        # Unclosed start tag missing '>' at EOF or container boundary
++        return ("", True)
++
++    # Determine which attributes are removed or modified (for inline style)
++    removals: List[Tuple[int, int, str]] = []
++    kept_count = 0
++
++    for a in attrs:
++        clean_name = re.sub(r"[\x00-\x20\"'`<\\/=]+", "", a.name_raw.lower())
++        if clean_name == "style" and a.val is not None and a.val_start is not None and a.val_end is not None:
++            new_style = sanitize_inline_style(a.val)
++            if new_style is None:
++                removals.append((a.ws_start, a.attr_end, ""))
++            elif new_style != a.val:
++                removals.append((a.val_start, a.val_end, new_style))
++                kept_count += 1
++            else:
++                kept_count += 1
++        elif is_dangerous_attribute(tag_name, a.name_raw, a.val):
++            removals.append((a.ws_start, a.attr_end, ""))
++        else:
++            kept_count += 1
++
++    if not removals:
++        return (s[tag_start:tag_end], False)
++
++    # Merge contiguous full-attribute removals
++    merged: List[Tuple[int, int, str]] = []
++    for start, end, repl in removals:
++        if merged and repl == "" and merged[-1][2] == "" and merged[-1][1] == start:
++            merged[-1] = (merged[-1][0], end, "")
++        else:
++            merged.append((start, end, repl))
++
++    # Build the modified tag string while ensuring adjacent kept tokens don't fuse
++    parts: List[str] = []
++    cursor = tag_start
++    for start, end, repl in merged:
++        parts.append(s[cursor:start])
++        if repl != "":
++            parts.append(repl)
++        else:
++            prev_ch = s[start - 1] if start > tag_start else " "
++            next_ch = s[end] if end < tag_end else ">"
++            if (
++                prev_ch not in (" ", "\t", "\n", "\r", "\x0c")
++                and next_ch not in (" ", "\t", "\n", "\r", "\x0c", "/", ">")
++            ):
++                parts.append(" ")
++            elif next_ch == "/" and end + 1 < tag_end and s[end + 1] != ">":
++                # Replace stray '/' attribute separator with space
++                parts.append(" ")
++                end += 1
++        cursor = end
++
++    tail = s[cursor:tag_end]
++    if kept_count == 0:
++        # Strip leftover spaces before '>' or '/>' when all attributes were removed
++        tail = re.sub(r"^[ \t\n\r\x0c/]+(?=/?>)", "", tail)
++    parts.append(tail)
++    return ("".join(parts), True)
++
++
++def sanitize_html_once(s: str) -> str:
++    """Perform one full HTML5-aware sanitization pass over s."""
++    out: List[str] = []
++    n = len(s)
++    i = 0
++
++    while i < n:
++        lt = s.find("<", i)
++        if lt == -1:
++            out.append(s[i:])
++            break
++        if lt > i:
++            out.append(s[i:lt])
++        i = lt
++
++        # 1. HTML Comment: <!-- ... -->
++        if s.startswith("<!--", i):
++            if s.startswith("<!-->", i):
++                # Abrupt close <!--> is an HTML5 vs html.parser differential vector; strip it
++                i += 5
++                continue
++            if s.startswith("<!--->", i):
++                i += 6
++                continue
++            m = _COMMENT_CLOSE_RE.search(s, i + 4)
++            if m:
++                body = s[i + 4 : m.start()]
++                closer = m.group(0)
++                end_pos = m.end()
++            else:
++                body = s[i + 4 :]
++                closer = ""
++                end_pos = n
++
++            sanitized_body = sanitize_html_once(body)
++            # If comment used --!> differential closer, normalize closer to -->
++            if closer == "--!>":
++                closer = "-->"
++            if sanitized_body != body and not sanitized_body.strip():
++                i = end_pos
++                continue
++            out.append("<!--" + sanitized_body + closer)
++            i = end_pos
++            continue
++
++        # 2. CDATA section: <![CDATA[ ... ]]>
++        if s[i : i + 9].upper() == "<![CDATA[":
++            # In HTML5 outside foreign content, <![CDATA[ is a bogus comment closing at first '>'
++            # Strip '<![CDATA[' wrapper so any tags inside are scanned normally
++            i += 9
++            continue
++
++        # 3. DOCTYPE: <!DOCTYPE ...>
++        if s[i : i + 9].lower() == "<!doctype":
++            gt = s.find(">", i + 9)
++            end_pos = (gt + 1) if gt != -1 else n
++            decl_text = s[i:end_pos]
++            norm_decl = normalize_for_check(decl_text)
++            if not any(bad in norm_decl for bad in ("<script", "javascript:", "vbscript:", "onload=", "onerror=")):
++                out.append(decl_text)
++            i = end_pos
++            continue
++
++        # 4. Bogus comment or processing instruction: <!...> or <?...>
++        if s.startswith("<!", i) or s.startswith("<?", i):
++            gt = s.find(">", i + 2)
++            end_pos = (gt + 1) if gt != -1 else n
++            bogus_text = s[i:end_pos]
++            norm_bogus = normalize_for_check(bogus_text)
++            if any(
++                bad in norm_bogus
++                for bad in (
++                    "script",
++                    "javascript:",
++                    "vbscript:",
++                    "import",
++                    "implementation",
++                    "expression(",
++                    "onload",
++                    "onerror",
++                )
++            ):
++                i = end_pos
++                continue
++            out.append(bogus_text)
++            i = end_pos
++            continue
++
++        # 5. Closing tag: </...>
++        if s.startswith("</", i):
++            if i + 2 < n and s[i + 2].isalpha():
++                j = i + 2
++                while j < n and s[j] not in (" ", "\t", "\n", "\r", "\x0c", "/", ">", "<"):
++                    j += 1
++                close_name_raw = s[i + 2 : j]
++                clean_close = close_name_raw.lower().replace("\x00", "")
++
++                # If another '<' appears right inside the closing tag name (e.g. '</scr</script>ipt>')
++                if j < n and s[j] == "<":
++                    if s[j : j + 8].lower().startswith("</script") or s[j : j + 7].lower().startswith("<script"):
++                        i = j
++                        continue
++                    out.append(s[i:j])
++                    i = j
++                    continue
++
++                gt = s.find(">", j)
++                close_end = (gt + 1) if gt != -1 else n
++                if clean_close in ALL_FORBIDDEN_TAGS:
++                    # Also strip trailing 'ipt>' if this was '</scr</script>ipt>'
++                    i = close_end
++                    continue
++
++                # Strip any attributes smuggled inside a closing tag (e.g. </div onclick=...>)
++                trailing = s[j : close_end - 1] if gt != -1 else s[j:close_end]
++                if trailing.strip():
++                    out.append(f"</{close_name_raw}>")
++                else:
++                    out.append(s[i:close_end])
++                i = close_end
++                continue
++            else:
++                gt = s.find(">", i + 2)
++                close_end = (gt + 1) if gt != -1 else n
++                i = close_end
++                continue
++
++        # 6. Start tag: <[a-zA-Z]...
++        if i + 1 < n and s[i + 1].isalpha():
++            tag_name_raw, tag_end, is_self_closing, attrs, has_lt_in_tagname = parse_start_tag(s, i)
++            clean_tag = tag_name_raw.lower().replace("\x00", "")
++
++            if has_lt_in_tagname:
++                # Example: '<scr<script>ipt>alert(1)</script>' or '<scr<script>alert(1)</script>ipt>alert(2)</script>'
++                # Check what follows at tag_end (which is the nested '<')
++                nested_Rest = s[tag_end:]
++                if re.match(r"<\s*/?\s*s\x00*c\x00*r\x00*i\x00*p\x00*t", nested_Rest, re.IGNORECASE):
++                    _, inner_tag_end, inner_sc, _, _ = parse_start_tag(s, tag_end)
++                    inner_script_end = find_script_end(s, inner_tag_end, inner_sc)
++                    after_inner = s[inner_script_end:]
++                    if re.match(r"^[a-zA-Z0-9]+>", after_inner):
++                        # e.g. '<scr<script>alert(1)</script>ipt>alert(2)</script>'
++                        # Keep '<scr' so it fuses with 'ipt>' and gets completely removed on next pass!
++                        out.append(s[i:tag_end])
++                        i = inner_script_end
++                        continue
++                    else:
++                        # e.g. '<scr<script>ipt>alert(1)</script>' -> drop both '<scr' and the script!
++                        i = inner_script_end
++                        continue
++                out.append(s[i:tag_end])
++                i = tag_end
++                continue
++
++            # 6a. <script>
++            if clean_tag == "script":
++                script_end = find_script_end(s, tag_end, is_self_closing)
++                i = script_end
++                continue
++
++            # 6b. Always-removed container tags (iframe, object, applet, etc.)
++            if clean_tag in ALWAYS_REMOVE_CONTAINER_TAGS:
++                if is_self_closing:
++                    i = tag_end
++                    continue
++                match_end = find_matching_end_tag(s, tag_end, clean_tag)
++                if match_end is not None:
++                    i = match_end[1]
++                else:
++                    i = tag_end
++                continue
++
++            # 6c. Always-removed void / animation / XSS tags
++            if clean_tag in ALWAYS_REMOVE_TAG_ONLY:
++                i = tag_end
++                continue
++
++            # 6d. <meta> and <link>
++            if clean_tag == "meta":
++                if is_dangerous_meta(attrs):
++                    i = tag_end
++                    continue
++                new_tag, _ = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++                out.append(new_tag)
++                i = tag_end
++                continue
++
++            if clean_tag == "link":
++                if is_dangerous_link(attrs):
++                    i = tag_end
++                    continue
++                new_tag, _ = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++                out.append(new_tag)
++                i = tag_end
++                continue
++
++            # 6e. <style>
++            if clean_tag == "style":
++                # Check if <style> has a non-CSS type attribute (e.g. type="text/javascript")
++                bad_style_type = False
++                for a in attrs:
++                    if a.name_raw.lower().strip() == "type" and a.val is not None:
++                        t_val = a.val.strip().lower()
++                        if t_val and t_val != "text/css":
++                            bad_style_type = True
++                            break
++                if is_self_closing:
++                    if bad_style_type:
++                        i = tag_end
++                        continue
++                    new_tag, _ = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++                    out.append(new_tag)
++                    i = tag_end
++                    continue
++
++                raw_end = find_rawtext_end_tag(s, tag_end, "style")
++                if raw_end is None:
++                    close_start, close_end = n, n
++                    close_tag_str = ""
++                else:
++                    close_start, close_end = raw_end
++                    close_tag_str = f"</{s[close_start + 2 : close_end - 1].strip().split()[0]}>"
++                    if not s[close_start + 2 : close_end - 1].strip()[len("style") :].strip():
++                        close_tag_str = s[close_start:close_end]
++
++                if bad_style_type:
++                    i = close_end
++                    continue
++
++                style_body = s[tag_end:close_start]
++                sanitized_body = sanitize_style_block(style_body)
++                if sanitized_body is None:
++                    i = close_end
++                    continue
++
++                new_start_tag, _ = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++                out.append(new_start_tag + sanitized_body + close_tag_str)
++                i = close_end
++                continue
++
++            # 6f. HTML5 RAWTEXT / RCDATA tags (textarea, title, xmp, noembed, noframes, noscript)
++            if clean_tag in RAWTEXT_RCDATA_TAGS and not is_self_closing:
++                new_start_tag, _ = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++                raw_end = find_rawtext_end_tag(s, tag_end, clean_tag)
++                if raw_end is None:
++                    inner = s[tag_end:]
++                    sanitized_inner = sanitize_html_once(inner)
++                    out.append(new_start_tag + sanitized_inner)
++                    i = n
++                    continue
++                close_start, close_end = raw_end
++                inner = s[tag_end:close_start]
++                sanitized_inner = sanitize_html_once(inner)
++                close_tag_raw = s[close_start:close_end]
++                out.append(new_start_tag + sanitized_inner + close_tag_raw)
++                i = close_end
++                continue
++
++            # 6g. <svg> and <math>
++            if clean_tag in ("svg", "math"):
++                new_start_tag, attr_modified = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++                if is_self_closing:
++                    if attr_modified and len(attrs) > 0 and new_start_tag in (f"<{tag_name_raw}/>", f"<{tag_name_raw}>", ""):
++                        i = tag_end
++                        continue
++                    out.append(new_start_tag)
++                    i = tag_end
++                    continue
++
++                match_end = find_matching_end_tag(s, tag_end, clean_tag)
++                if match_end is None:
++                    # Unclosed <svg ...> or <math ...> tag (e.g. <svg onload=alert(1)>)
++                    i = tag_end
++                    continue
++
++                close_start, close_end = match_end
++                inner = s[tag_end:close_start]
++                sanitized_inner = sanitize_html_once(inner)
++                if (attr_modified or sanitized_inner != inner) and not sanitized_inner.strip():
++                    # Empty <svg> or <math> shell left over after stripping XSS payload
++                    i = close_end
++                    continue
++
++                close_tag_raw = s[close_start:close_end]
++                out.append(new_start_tag + sanitized_inner + close_tag_raw)
++                i = close_end
++                continue
++
++            # 6h. Standard HTML tags
++            new_start_tag, _ = reconstruct_start_tag(s, i, tag_end, clean_tag, attrs)
++            out.append(new_start_tag)
++            i = tag_end
++            continue
++
++        # 7. Stray '<' not starting any tag/comment/declaration (e.g. 'a < b' or '<<script>')
++        out.append("<")
++        i += 1
++
++    result = "".join(out)
++    # Clean up any leftover ']]>' from stripped '<![CDATA[' wrappers if '<![CDATA[' was present
++    if "<![cdata[" in s.lower():
++        result = result.replace("]]>", "")
++    return result
++
++
++def verify_with_bs4(html_str: str) -> bool:
++    """Return True if BeautifulSoup sees any remaining dangerous tag or attribute."""
++    try:
++        soup = BeautifulSoup(html_str, "html.parser")
++    except Exception:
++        return False
++
++    for tag in soup.find_all(True):
++        name = (tag.name or "").lower().replace("\x00", "")
++        if name in ALL_FORBIDDEN_TAGS:
++            return True
++        for attr_name, attr_val in list(tag.attrs.items()):
++            if isinstance(attr_val, list):
++                val_str = " ".join(str(v) for v in attr_val)
++            elif attr_val is None:
++                val_str = None
++            else:
++                val_str = str(attr_val)
++            if is_dangerous_attribute(name, str(attr_name), val_str):
++                return True
++    return False
++
++
++def sanitize_html(html_str: str) -> str:
++    """Repeatedly sanitize HTML until convergence."""
++    curr = html_str
++    for _ in range(25):
++        nxt = sanitize_html_once(curr)
++        if nxt == curr:
++            break
++        curr = nxt
++
++    return curr
++
++
++def main() -> None:
++    if len(sys.argv) < 2:
++        sys.exit(1)
++
++    filepath = sys.argv[1]
++    encoding = "utf-8"
++    try:
++        with open(filepath, "r", encoding="utf-8", newline="") as f:
++            content = f.read()
++    except UnicodeDecodeError:
++        encoding = "latin-1"
++        with open(filepath, "r", encoding="latin-1", newline="") as f:
++            content = f.read()
++
++    filtered = sanitize_html(content)
++
++    with open(filepath, "w", encoding=encoding, newline="") as f:
++        f.write(filtered)
++
++
++if __name__ == "__main__":
++    main()

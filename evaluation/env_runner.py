@@ -4,21 +4,24 @@ An entry describes a task that runs inside its own environment (Docker image) in
 xhs-campaign-service git worktree used by C3/C5. Grading is done by a verifier script that runs
 inside the same environment after the agent stops (outcome-based, like Terminal-Bench).
 
-Flow per trial:
+Flow per trial (run_trial):
   1. Start a fresh sandbox from the entry's `environment` (docker; udocker = rootless with the
      exact image; bwrap = host toolchain fallback).
   2. Run the agent:
        agent=loop    built-in minimal agent (Gemini API); every shell command it issues runs
-                     INSIDE the sandbox (`docker exec`). Highest fidelity.
-       agent=agy|claude  the repo's usual CLI agents, run on the host in a workspace directory
-                     that is bind-mounted into the sandbox at the task's workdir (/app). They get
-                     a `task-exec` helper to run commands inside the environment.
+                     INSIDE the sandbox. Highest fidelity.
+       agent=agy|claude  the repo's usual CLI agents, run on the host (inside bwrap with the
+                     benchmark repo hidden, see agent_isolation_prefix) in a workspace directory
+                     that is bind-mounted into the sandbox at the task's workdir. They get a
+                     `task-exec` helper (outside the repo) to run commands inside the environment.
        agent=gold    runs the entry's gold solution script (validates the task + verifier).
        agent=empty   does nothing (validates that an untouched workspace FAILS).
-  3. Copy the verifier into the sandbox and run it; its last stdout line is a JSON verdict
-     {"reward": 0|1, "reason": ..., "checks": [...]}.
-  4. Destroy the sandbox.
-Entry score: D1 = pass rate over N trials, snapped to the rubric tiers (100/80/60/40/20/0).
+  3. agy/claude: capture workspace.diff + workspace_files.txt (capture_workspace).
+  4. Run the entry's verifier (tb2_pytest / swebench / deepswe / harbor_separate / script) in the
+     sandbox -> verdict.json {"reward", "reason", "checks", ...}.
+  5. Destroy the sandbox; agy/claude: quality_grader.grade_trial -> quality.json
+     (CONFIG["quality"]: off | machine = validity audit | full = + LLM judge).
+Entry score: D1 = pass rate over N trials, snapped to the category rubric's D1 tiers.
 """
 
 from __future__ import annotations
@@ -48,7 +51,9 @@ if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
 # Set by run_benchmark.main() from CLI flags.
-CONFIG = {"trials": 5, "sandbox": "docker", "dry_run": False}
+CONFIG = {"trials": 5, "sandbox": "docker", "dry_run": False,
+          "isolate_agent": True,   # run host CLI agents in bwrap with the dataset/results hidden
+          "quality": "machine"}    # post-trial quality grading: off | machine (validity audit only) | full (+ LLM judge)
 
 # Neutral git identity for agents: DeepSWE-derived entries grade only COMMITTED work, and neither the host
 # nor the task images configure user.name/email, so `git commit` would fail. Host CLI agents
@@ -93,10 +98,40 @@ def _run(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(p.pid, 9)
+        # runc (udocker R1) starts the container in its own session, so killpg alone leaves the
+        # task's processes running (e.g. an agent's hanging filter.py at 100% CPU). Kill every
+        # descendant first, then the group.
+        for pid in _descendants(p.pid):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        try:
+            os.killpg(p.pid, 9)
+        except OSError:
+            pass
         p.communicate()
         raise
     return subprocess.CompletedProcess(argv, p.returncode, out, err)
+
+
+def _descendants(root: int) -> list[int]:
+    """All descendant PIDs of `root` (from /proc), deepest first."""
+    children: dict[int, list[int]] = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                stat = Path(f"/proc/{d}/stat").read_text()
+                ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                children.setdefault(ppid, []).append(int(d))
+            except (OSError, ValueError, IndexError):
+                pass
+    out, stack = [], [root]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out[::-1]
 
 
 class DockerSandbox:
@@ -166,7 +201,7 @@ _EXECMODE_CACHE: dict[str, str] = {}
 def _udocker_desired_execmode() -> str:
     """R1 = rootless runc (user namespaces): no ptrace, so Go/JIT runtimes behave (under the
     default proot mode `go` segfaulted ~70% of the time). Needs unprivileged user namespaces and
-    udocker patched for concurrent runs (scripts/patch_udocker_r1.py). Else P1 (proot)."""
+    udocker patched for concurrent runs (tools/patch_udocker_r1.py). Else P1 (proot)."""
     if "mode" in _EXECMODE_CACHE:
         return _EXECMODE_CACHE["mode"]
     mode = os.environ.get("XHS_UDOCKER_EXECMODE", "")
@@ -182,7 +217,7 @@ def _udocker_desired_execmode() -> str:
                 mode = "R1"
             elif ok_ns:
                 print("  [udocker] user namespaces OK but udocker is unpatched for concurrent R1 "
-                      "runs; run scripts/patch_udocker_r1.py. Using P1 (proot).")
+                      "runs; run tools/patch_udocker_r1.py. Using P1 (proot).")
         except (OSError, IndexError):
             pass
     _EXECMODE_CACHE["mode"] = mode
@@ -223,7 +258,7 @@ class UdockerSandbox:
         self.ud = ["udocker", "--quiet"]
         cdir = Path(os.environ.get("UDOCKER_DIR", Path.home() / ".udocker")) / "containers"
         # udocker can't pull `repo@sha256:...`: such images are fetched + loaded under a local
-        # alias (scripts/fetch_oci_digest.py) recorded as environment.udocker_image.
+        # alias (tools/fetch_oci_digest.py) recorded as environment.udocker_image.
         image = image or env.get("udocker_image") or env["prebuilt_image"]
         self.name = "xhs-base-" + re.sub(r"[^a-z0-9]+", "-", image.lower()).strip("-")
         cdir.mkdir(parents=True, exist_ok=True)
@@ -455,19 +490,172 @@ def build_host_agent_prompt(entry: dict, workspace: Path, helper: Path) -> str:
             f"- Run commands INSIDE the task environment with: `{helper} '<command>'` "
             f"(e.g. `{helper} 'cd {workdir} && ls -la'`). Use it to compile/test with the "
             f"environment's toolchain.\n"
-            f"- Grading happens inside the container after you finish.\n")
+            f"- Grading happens inside the container after you finish.\n"
+            f"- Work only from this task description and the environment. Do not search for or "
+            f"download the upstream fix, the original benchmark task, its tests or its reference "
+            f"solution (online or on this machine); doing so is treated as a violation.\n")
+
+
+# ── Agent isolation and workspace capture (coding-quality evidence) ───────
+
+def agent_isolation_prefix(bind_paths: list[Path]) -> list[str]:
+    """bwrap prefix for host CLI agents: the whole host stays visible (the agent CLIs need their
+    config, credentials and network), but the benchmark repo (dataset with hidden tests and
+    reference solutions, results of other runs), the analysis workspace around it and any
+    XHS_AGENT_MASK paths are replaced by empty tmpfs, and /tmp is private (other trials'
+    workspaces are invisible) except for this trial's own paths."""
+    if not CONFIG.get("isolate_agent", True) or not shutil.which("bwrap"):
+        return []
+    repo = BASE_DIR.resolve()
+    masks = {repo}
+    if repo.parent.name == "sources":  # analysis workspace layout: <root>/sources/xhs
+        masks.add(repo.parent.parent)
+    extra = os.environ.get("XHS_AGENT_MASK", "").split(":") + [str(Path.home() / ".gemini" / "jetski" / "brain")]
+    masks |= {Path(m).resolve() for m in extra if m and Path(m).exists()}
+    args = ["bwrap", "--dev-bind", "/", "/", "--die-with-parent", "--tmpfs", "/tmp"]
+    for m in sorted(masks, key=lambda x: len(str(x))):
+        args += ["--tmpfs", str(m)]
+    for b in bind_paths:  # this trial's workspace, helper and container mounts
+        if b and Path(b).exists():
+            args += ["--bind", str(b), str(b)]
+    return args + ["--"]
+
+
+def _sandbox_host_paths(sb) -> list[Path]:
+    """Host paths under /tmp that the sandbox's exec argv mounts (udocker -v src:dst)."""
+    out = []
+    for a in sb.exec_argv(["true"]):
+        for part in re.split(r"[=\s]", a):
+            src = part.split(":", 1)[0]
+            if src.startswith("/tmp/") and Path(src).exists():
+                out.append(Path(src))
+    return out
+
+
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".pytest_cache",
+              ".mypy_cache", "target", ".gradle"}
+_SNAP_MAX_FILE, _SNAP_MAX_TOTAL, _SNAP_MAX_FILES = 512 * 1024, 100 * 1024 * 1024, 20000
+
+
+def _walk(root: Path):
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d not in _SKIP_DIRS]
+        for fn in fns:
+            fp = Path(dp) / fn
+            if fp.is_file() and not fp.is_symlink():
+                yield fp
+
+
+def snapshot_workspace(ws: Path) -> dict | None:
+    """Before the agent runs: remember a non-git workspace (copies of small files, stat of the rest)."""
+    if ws is None or (ws / ".git").exists():
+        return None
+    snap_dir, total, files = Path(tempfile.mkdtemp(prefix="xhs-c6-snap-")), 0, {}
+    for i, fp in enumerate(_walk(ws)):
+        if i >= _SNAP_MAX_FILES:
+            break
+        rel, st = str(fp.relative_to(ws)), fp.stat()
+        files[rel] = (st.st_size, int(st.st_mtime))
+        if st.st_size <= _SNAP_MAX_FILE and total + st.st_size <= _SNAP_MAX_TOTAL:
+            (snap_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fp, snap_dir / rel)
+            total += st.st_size
+    return {"dir": snap_dir, "files": files}
+
+
+def capture_workspace(entry: dict, ws: Path, snap: dict | None, trial_dir: Path) -> None:
+    """After the agent, before grading: write <trial>/workspace.diff (git-style) with every change
+    the agent made in its workdir: for git repos all committed + uncommitted + untracked changes vs
+    the base commit (temporary index, the repo itself is not touched); otherwise a before/after
+    diff of the snapshot."""
+    import difflib
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    try:
+        if (ws / ".git").exists():
+            v = entry["verification"]
+            base = v.get("base_commit")
+            if not base and v.get("instance"):
+                base = json.loads((BASE_DIR / v["instance"]).read_text()).get("base_commit")
+            idx = Path(tempfile.mkdtemp(prefix="xhs-c6-idx-")) / "index"
+            env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+            g = ["git", "-c", "core.fileMode=false", "-c", f"safe.directory={ws}", "-C", str(ws)]
+            subprocess.run(g + ["read-tree", "HEAD"], env=env, capture_output=True, timeout=300)
+            subprocess.run(g + ["add", "-A"], env=env, capture_output=True, timeout=600)
+            d = subprocess.run(g + ["diff", "--cached", base or "HEAD"], env=env, capture_output=True,
+                               text=True, errors="replace", timeout=600)
+            shutil.rmtree(idx.parent, ignore_errors=True)
+            out.append(d.stdout)
+        elif snap is not None:
+            before, after = snap["files"], {}
+            for fp in _walk(ws):
+                st = fp.stat()
+                after[str(fp.relative_to(ws))] = (st.st_size, int(st.st_mtime))
+            for rel in sorted(set(before) | set(after)):
+                old_p, new_p = snap["dir"] / rel, ws / rel
+                if rel in before and rel in after:
+                    if before[rel] == after[rel] and (not old_p.exists() or old_p.read_bytes() == new_p.read_bytes()):
+                        continue
+                    if old_p.exists() and old_p.read_bytes() == new_p.read_bytes():
+                        continue
+                    status = "modified"
+                else:
+                    status = "added" if rel in after else "deleted"
+                head = [f"diff --git a/{rel} b/{rel}"] + (["new file mode 100644"] if status == "added" else
+                                                         ["deleted file mode 100644"] if status == "deleted" else [])
+                def text(p):
+                    try:
+                        return p.read_text() if p.exists() and p.stat().st_size <= _SNAP_MAX_FILE else None
+                    except (UnicodeDecodeError, OSError):
+                        return None
+                a = text(old_p) if status != "added" else ""
+                b = text(new_p) if status != "deleted" else ""
+                if a is None or b is None:
+                    out.append("\n".join(head + [f"Binary or large file {status}: {rel}"]) + "\n")
+                    continue
+                body = difflib.unified_diff(a.splitlines(), b.splitlines(),
+                                            "/dev/null" if status == "added" else f"a/{rel}",
+                                            "/dev/null" if status == "deleted" else f"b/{rel}", lineterm="")
+                out.append("\n".join(head + list(body)) + "\n")
+    except (OSError, subprocess.SubprocessError) as e:
+        out.append(f"# workspace capture failed: {e}\n")
+    finally:
+        if snap is not None:
+            shutil.rmtree(snap["dir"], ignore_errors=True)
+    try:  # final listing of the workdir (for "deliverable consists of exactly ..." rules)
+        listing = sorted(str(fp.relative_to(ws)) for fp in _walk(ws))[:_SNAP_MAX_FILES]
+        (trial_dir / "workspace_files.txt").write_text("\n".join(listing) + "\n")
+    except OSError:
+        pass
+    diff = "".join(out)
+    if len(diff) > 2_000_000:
+        diff = diff[:2_000_000] + "\n# ... truncated at 2 MB\n"
+    (trial_dir / "workspace.diff").write_text(diff)
 
 
 # ── Verification ──────────────────────────────────────────────────────────
 
 def verify_in_sandbox(sb, entry: dict) -> dict:
-    """Grade the sandbox. Graders are serialized host-wide (file lock): several tasks have
-    timing-sensitive tests, which become flaky when many graders run concurrently."""
+    """Grade the sandbox. Concurrent graders are limited host-wide by a file-lock semaphore
+    (XHS_VERIFY_SLOTS, default 3): several tasks have timing-sensitive tests, which become flaky
+    when many graders run at once. Slot 0 is the historical single `verify.lock`."""
     import fcntl  # pylint: disable=g-import-not-at-top
     TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(TOOLS_DIR / "verify.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        return _verify_unlocked(sb, entry)
+    slots = max(1, int(os.environ.get("XHS_VERIFY_SLOTS", "3")))
+    names = [f"verify.lock.{i}" for i in range(1, slots)] + ["verify.lock"]  # slot 0 last
+    while True:
+        for name in names:
+            lock = open(TOOLS_DIR / name, "w")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                continue
+            try:
+                return _verify_unlocked(sb, entry)
+            finally:
+                lock.close()
+        time.sleep(5)
 
 
 def _verify_unlocked(sb, entry: dict) -> dict:
@@ -696,8 +884,19 @@ def _verify_deepswe(sb, entry: dict) -> dict:
             rc, out = None, f"verifier timeout {v.get('timeout_sec', 1800)}s"
         raw = vsb.read_file("/logs/verifier/reward.json")
         txt = (vsb.read_file("/logs/verifier/reward.txt") or "").strip()
+        ctrf_raw = vsb.read_file("/logs/verifier/ctrf.json")  # grader.py: "[f2p] <id>" / "[p2p] <id>"
     finally:
         vsb.close()
+    per_test = []
+    if ctrf_raw:
+        try:
+            for t in json.loads(ctrf_raw).get("results", {}).get("tests", []):
+                m = re.match(r"\[(f2p|p2p)\] (.*)$", t.get("name", ""), re.S)
+                if m:
+                    kind = "FAIL_TO_PASS" if m.group(1) == "f2p" else "PASS_TO_PASS"
+                    per_test.append({"check": f"{kind}::{m.group(2)}", "pass": t.get("status") == "passed"})
+        except json.JSONDecodeError:
+            pass
     rj = {}
     if raw:
         try:
@@ -717,10 +916,10 @@ def _verify_deepswe(sb, entry: dict) -> dict:
         reason = f"{'resolved' if reward else 'not resolved'} ({counts})"
     return {"reward": reward, "reason": reason,
             "checks": [{"check": k, "pass": None, "value": rj[k]} for k in
-                       ("f2p", "p2p", "partial") if k in rj],
+                       ("f2p", "p2p", "partial") if k in rj] + per_test,
             "verifier_rc": rc, "reward_json": rj, "reward_txt": txt,
             "collect_rc": c.returncode, "model_patch_bytes": len(patch),
-            "model_patch": patch[:20000], "test_stdout_tail": out[-4000:]}
+            "model_patch": patch[:400000], "test_stdout_tail": out[-4000:]}
 
 
 # ── Trial + entry runners ─────────────────────────────────────────────────
@@ -729,7 +928,9 @@ def run_trial(entry: dict, agent: str, model: str, timeout_min: int, trial_dir: 
     env = entry["environment"]
     timeout_sec = min(timeout_min * 60, env.get("agent_timeout_sec", timeout_min * 60))
     host_ws = Path(tempfile.mkdtemp(prefix="xhs-c6-host-")) if agent in ("agy", "claude") else None
+    helper_dir = Path(tempfile.mkdtemp(prefix="xhs-c6-bin-")) if host_ws else None
     sb = make_sandbox(entry, host_ws)
+    snap = None
     try:
         if env.get("init_cmd"):  # e.g. FrontierSWE: anchor the agent-visible sandbox-timer
             sb.exec(env["init_cmd"], timeout=120)
@@ -754,13 +955,16 @@ def run_trial(entry: dict, agent: str, model: str, timeout_min: int, trial_dir: 
             ar = {"elapsed_seconds": 0, "num_turns": 0, "usage": {}, "transcript": []}
         elif agent in ("agy", "claude"):
             from run_benchmark import invoke_agent  # lazy: avoid circular import
-            helper = _write_task_exec(sb, trial_dir / "bin")
+            # The helper lives outside the repo so its path doesn't lead the agent to the dataset.
+            helper = _write_task_exec(sb, helper_dir)
             prompt = build_host_agent_prompt(entry, host_ws, helper)
             budget_min = max(1, timeout_sec // 60)
+            snap = snapshot_workspace(host_ws)
+            prefix = agent_isolation_prefix([host_ws, helper_dir] + _sandbox_host_paths(sb))
             t0 = time.time()
             try:
                 r = invoke_agent(agent, model, prompt, host_ws, budget_min, need_file_writes=True,
-                                 trajectory_file=trial_dir / "trajectory.jsonl")
+                                 trajectory_file=trial_dir / "trajectory.jsonl", cmd_prefix=prefix)
                 ar = {"elapsed_seconds": r["elapsed_seconds"], "num_turns": r["num_turns"],
                       "usage": r["usage"], "transcript": [{"response": r["response"],
                                                            "returncode": r["returncode"]}]}
@@ -771,11 +975,17 @@ def run_trial(entry: dict, agent: str, model: str, timeout_min: int, trial_dir: 
                                                    "budget_sec": budget_min * 60}]}
         else:
             raise ValueError(f"Unknown agent for C6: {agent}")
+        if host_ws:
+            capture_workspace(entry, host_ws, snap, trial_dir)
+            snap = None
         verdict = verify_in_sandbox(sb, entry)
     finally:
         sb.close()
         if host_ws:
             shutil.rmtree(host_ws, ignore_errors=True)
+            shutil.rmtree(helper_dir, ignore_errors=True)
+        if snap is not None:
+            shutil.rmtree(snap["dir"], ignore_errors=True)
     trial_dir.mkdir(parents=True, exist_ok=True)
     (trial_dir / "transcript.json").write_text(json.dumps(ar["transcript"], indent=1,
                                                           ensure_ascii=False))
@@ -784,7 +994,17 @@ def run_trial(entry: dict, agent: str, model: str, timeout_min: int, trial_dir: 
     # verification.pass_threshold; the raw value is kept as `score`.
     score = float(verdict.get("reward", 0) or 0)
     passed = int(score >= float(entry["verification"].get("pass_threshold", 1.0)))
-    return {"reward": passed, "score": round(score, 6), "reason": verdict.get("reason"),
+    quality = None
+    if agent in ("agy", "claude") and CONFIG.get("quality", "machine") != "off":
+        try:
+            import quality_grader  # pylint: disable=g-import-not-at-top
+            judge = CONFIG.get("judge", quality_grader.DEFAULT_JUDGE) if CONFIG.get("quality") == "full" else None
+            q = quality_grader.grade_trial(trial_dir, entry, judge=judge)
+            quality = {"quality_score": q["quality_score"], "valid": q["valid"],
+                       "items": {i["id"]: i["level"] for i in q["items"]}}
+        except Exception as e:  # quality grading must never break a run
+            quality = {"error": f"{type(e).__name__}: {e}"}
+    return {"reward": passed, "score": round(score, 6), "reason": verdict.get("reason"), "quality": quality,
             "elapsed_seconds": ar["elapsed_seconds"], "num_turns": ar["num_turns"],
             "usage": ar["usage"], "trial_dir": str(trial_dir)}
 

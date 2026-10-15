@@ -49,7 +49,8 @@ Fields common to all source types:
 | `instance_id` | Current entry ID. Used with `--category c6\|c7 --entry <ID>` and in result directory names (`results/<c6\|c7>_runs/<ID>_<agent>_<model>_<ts>`). |
 | `former_id` | The pre-restructure ID (see above). |
 | `category` / `category_name` | `C6` / 区分度任务（容器化，模型区分）, or `C7` / 日常工作任务（容器化，贴近日常）. The harness uses `category` to pick the rubric and the results directory. |
-| `evaluation_rubric` | `evaluation/rubrics/c6_discriminative.json` or `c7_daily.json`. Both have one dimension, D1: the pass rate over trials (3 by default). |
+| `evaluation_rubric` | `evaluation/rubrics/c6_discriminative.json` or `c7_daily.json`: D1 = pass rate over trials (`--trials`, CLI default 5; our runs use 3), D2 = code quality (LLM judge; see `guide/coding_rubric.md`). Reported side by side, not combined. |
+| `task_rubric` | Path to the case's code-quality rubric, `evaluation/rubrics/tasks/<ID>.json` (1–2 case-specific LLM-judge items; see `guide/coding_rubric.md`). |
 | `discrimination.observed_xhs_runs` | Pass counts per agent/model from our own runs. Per-trial detail is in `results/README_c6_c7.md`. |
 
 # Part 1: Terminal-Bench 2.0 and FrontierSWE v2 entries
@@ -103,7 +104,7 @@ The tests are never shown to the agent. They run in the container only after the
 | `timeout_sec` | Time limit for the grader. |
 | `verifier_image`, `udocker_verifier_image` | *(C6-07)* The separate verifier image (digest-pinned) and its local udocker alias. |
 | `artifact_excludes` | *(C6-07)* Files left out when copying `/app` into the verifier container (build caches, built `.so` files). Taken from the task's `[[artifacts]]`. |
-| `pass_threshold` | *(C6-07)* The score is continuous (0–1); a trial counts as passed at ≥ this value (0.1). The mean score over trials is the primary metric. Binary graders default to 1.0. |
+| `pass_threshold` | *(C6-07)* The score is continuous (0–1); a trial counts as passed at ≥ this value (0.1). D1 is the pass rate; the mean raw score over trials is also recorded (`scores.mean_score`). Binary graders default to 1.0. |
 
 ## `gold_solution`: the reference solution
 
@@ -119,8 +120,9 @@ The gold solution is used only to validate the task: `--agent gold` should pass 
 
 ## `evaluation_rubric`
 
-Path to the rubric: `evaluation/rubrics/c6_discriminative.json` (C6) or `c7_daily.json` (C7).
-It has one dimension, D1: the pass rate over trials.
+Path to the category rubric: `evaluation/rubrics/c6_discriminative.json` (C6) or `c7_daily.json` (C7).
+D1 = pass rate over trials (snapped to the rubric's tiers); D2 = code quality from the LLM judge
+(`guide/coding_rubric.md`).
 
 ## `source`: where the task came from
 
@@ -230,8 +232,8 @@ The gold patch should resolve the issue and an untouched repo (`--agent empty`) 
 
 ## `evaluation_rubric`
 
-As for all entries: `c6_discriminative.json` or `c7_daily.json`, one dimension (D1, resolve rate
-over trials).
+As for all entries: `c6_discriminative.json` or `c7_daily.json` (D1 = resolve rate over trials;
+D2 = code quality from the LLM judge).
 
 ## `source`
 
@@ -271,7 +273,7 @@ hidden test patch decides the result. Supporting files in `dataset/<c6|c7>/envs/
 | Path | Meaning |
 |---|---|
 | `environment/Dockerfile` | The task image's Dockerfile (provenance; the published image is used). |
-| `tests/` | The DeepSWE verifier: `Dockerfile` (verifier image = task image + tests), `test.patch`, `test.sh`, `grader.py`, `config.json` (FAIL_TO_PASS / PASS_TO_PASS lists). Never shown to the agent. |
+| `tests/` | The DeepSWE verifier: `test.patch`, `test.sh`, `grader.py`, `config.json` (FAIL_TO_PASS / PASS_TO_PASS lists), plus the source's `Dockerfile` (provenance; the harness does not build it, it copies `tests/` into a fresh sandbox of the task image). Never shown to the agent. |
 | `solution/` | `solution.patch` + `solve.sh` (gold, validation only). |
 
 Fields that differ from Parts 1–2:
@@ -283,7 +285,7 @@ Fields that differ from Parts 1–2:
 | `environment.prebuilt_image` | The published DeepSWE task image (`public.ecr.aws/...:<ext_id>-v1.1`); the repo is at `/app` at `base_commit` with future history removed. |
 | `environment.agent_timeout_sec` | 10800 s (3 h). |
 | `environment.udocker_rmi_after_create` | Remove the pulled image after the container is created (disk). |
-| `verification.type` | `deepswe`. The harness mirrors Harbor's separate-environment flow: it collects `git diff --binary <base_commit> HEAD` (only **committed** work counts), applies it in a fresh verifier container, then runs `bash /tests/test.sh`, which applies `test.patch` and runs `grader.py`. |
+| `verification.type` | `deepswe`. The harness mirrors Harbor's separate-environment flow: it collects `git diff --binary <base_commit> HEAD` (only **committed** work counts), applies it in a fresh sandbox of the task image, then runs `bash /tests/test.sh`, which applies `test.patch` and runs `grader.py`. `verdict.json` records `reward_json` (F2P/P2P counts), per-test `checks` (`FAIL_TO_PASS::<id>` / `PASS_TO_PASS::<id>`, runs since 2026-10-14) and `model_patch` (up to 400 KB). |
 | `verification.collect_command`, `command`, `timeout_sec` | The diff collection command, the grader command and its time limit. |
 | `verification.reward` | 1 iff every FAIL_TO_PASS test passes and no PASS_TO_PASS test fails (`/logs/verifier/reward.json`). |
 | `verification.fail_to_pass_count`, `pass_to_pass_count`, `report_format` | Test counts and the report converter (e.g. `vitest-junit-to-ctrf`). |

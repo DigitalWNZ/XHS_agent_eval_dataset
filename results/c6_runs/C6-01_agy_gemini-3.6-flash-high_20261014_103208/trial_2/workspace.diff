@@ -1,0 +1,592 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,294 @@
++#!/usr/bin/env python3
++import sys
++import re
++import html
++
++def sanitize_attribute_value(val):
++    if not val:
++        return ""
++    v = val
++    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
++        v = v[1:-1]
++    decoded = html.unescape(v)
++    cleaned = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', decoded).lower()
++    return cleaned
++
++def is_dangerous_attribute(name, val):
++    name_lower = name.lower()
++    if name_lower.startswith("on"):
++        return True
++    if val is not None:
++        cleaned = sanitize_attribute_value(val)
++        if "javascript:" in cleaned or "vbscript:" in cleaned:
++            return True
++        if cleaned.startswith("data:"):
++            if not (cleaned.startswith("data:image/png") or 
++                    cleaned.startswith("data:image/jpeg") or 
++                    cleaned.startswith("data:image/jpg") or 
++                    cleaned.startswith("data:image/gif") or 
++                    cleaned.startswith("data:image/webp") or 
++                    cleaned.startswith("data:image/avif") or 
++                    cleaned.startswith("data:audio/") or 
++                    cleaned.startswith("data:video/") or 
++                    cleaned.startswith("data:font/")):
++                return True
++        if name_lower == "style":
++            if "expression(" in cleaned or "-moz-binding" in cleaned or "behavior:" in cleaned:
++                return True
++        if name_lower == "srcdoc":
++            if "<script" in cleaned or "javascript:" in cleaned or "on" in cleaned:
++                return True
++        if name_lower == "content":
++            if "javascript:" in cleaned:
++                return True
++    return False
++
++def sanitize_tag(tag_str):
++    m = re.match(r"^(<\s*([a-zA-Z0-9:-]+))", tag_str)
++    if not m:
++        return tag_str
++    tag_prefix = m.group(1)
++    tag_name = m.group(2)
++    if tag_str.endswith("/>"):
++        closing = "/>"
++        attr_str = tag_str[len(tag_prefix):-2]
++    elif tag_str.endswith(">"):
++        closing = ">"
++        attr_str = tag_str[len(tag_prefix):-1]
++    else:
++        return tag_str
++
++    clean_attrs = ""
++    i = 0
++    length = len(attr_str)
++    while i < length:
++        ws_start = i
++        while i < length and attr_str[i].isspace():
++            i += 1
++        ws = attr_str[ws_start:i]
++        if i >= length:
++            clean_attrs += ws
++            break
++        name_start = i
++        while i < length and not attr_str[i].isspace() and attr_str[i] not in ("=", ">", "/", '"', "'"):
++            i += 1
++        name = attr_str[name_start:i]
++        if not name:
++            clean_attrs += ws + attr_str[i]
++            i += 1
++            continue
++        val = None
++        equals_and_val_slice = ""
++        eq_scan = i
++        while eq_scan < length and attr_str[eq_scan].isspace():
++            eq_scan += 1
++        if eq_scan < length and attr_str[eq_scan] == "=":
++            val_start = eq_scan + 1
++            while val_start < length and attr_str[val_start].isspace():
++                val_start += 1
++            if val_start < length:
++                quote_char = attr_str[val_start]
++                if quote_char in ('"', "'"):
++                    val_end = val_start + 1
++                    while val_end < length and attr_str[val_end] != quote_char:
++                        val_end += 1
++                    if val_end < length:
++                        val_end += 1
++                    val = attr_str[val_start:val_end]
++                    i = val_end
++                else:
++                    val_end = val_start
++                    while val_end < length and not attr_str[val_end].isspace() and attr_str[val_end] not in (">", "/"):
++                        val_end += 1
++                    val = attr_str[val_start:val_end]
++                    i = val_end
++            else:
++                i = length
++            equals_and_val_slice = attr_str[name_start + len(name):i]
++        else:
++            i = name_start + len(name)
++            equals_and_val_slice = ""
++
++        full_attr_slice = ws + name + equals_and_val_slice
++        if is_dangerous_attribute(name, val):
++            pass
++        else:
++            clean_attrs += full_attr_slice
++    return tag_prefix + clean_attrs + closing
++
++def filter_html_once(content):
++    pos = 0
++    out = []
++    length = len(content)
++
++    while pos < length:
++        if content.startswith('<!--', pos):
++            if content.startswith('<!-->', pos):
++                end_comment = pos + 5
++            else:
++                idx = content.find('-->', pos + 4)
++                if idx != -1:
++                    end_comment = idx + 3
++                else:
++                    end_comment = length
++            out.append(content[pos:end_comment])
++            pos = end_comment
++            continue
++
++        if content.startswith('<![CDATA[', pos):
++            idx = content.find(']]>', pos + 9)
++            if idx != -1:
++                end_cdata = idx + 3
++            else:
++                end_cdata = length
++            out.append(content[pos:end_cdata])
++            pos = end_cdata
++            continue
++
++        if content[pos] == '<':
++            m_script = re.match(r'^<\s*script(?=[\s/>]|$)', content[pos:], re.IGNORECASE)
++            if m_script:
++                tag_end = pos + len(m_script.group(0))
++                in_quote = None
++                is_self_closing = False
++                while tag_end < length:
++                    ch = content[tag_end]
++                    if in_quote:
++                        if ch == in_quote:
++                            in_quote = None
++                    else:
++                        if ch in ('"', "'"):
++                            in_quote = ch
++                        elif ch == '>':
++                            if tag_end > pos and content[tag_end-1] == '/':
++                                is_self_closing = True
++                            tag_end += 1
++                            break
++                    tag_end += 1
++
++                if is_self_closing:
++                    pos = tag_end
++                    continue
++                else:
++                    m_close = re.search(r'</\s*script\s*>', content[tag_end:], re.IGNORECASE)
++                    if m_close:
++                        script_block_end = tag_end + m_close.end()
++                    else:
++                        script_block_end = length
++                    pos = script_block_end
++                    continue
++
++            m_style = re.match(r'^<\s*style(?=[\s/>]|$)', content[pos:], re.IGNORECASE)
++            if m_style:
++                tag_end = pos + len(m_style.group(0))
++                in_quote = None
++                is_self_closing = False
++                while tag_end < length:
++                    ch = content[tag_end]
++                    if in_quote:
++                        if ch == in_quote:
++                            in_quote = None
++                    else:
++                        if ch in ('"', "'"):
++                            in_quote = ch
++                        elif ch == '>':
++                            if tag_end > pos and content[tag_end-1] == '/':
++                                is_self_closing = True
++                            tag_end += 1
++                            break
++                    tag_end += 1
++
++                if is_self_closing:
++                    pos = tag_end
++                    continue
++
++                m_close = re.search(r'</\s*style\s*>', content[tag_end:], re.IGNORECASE)
++                if m_close:
++                    style_content = content[tag_end : tag_end + m_close.start()]
++                    style_block_end = tag_end + m_close.end()
++                else:
++                    style_content = content[tag_end:]
++                    style_block_end = length
++
++                cleaned_style = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', html.unescape(style_content)).lower()
++                if 'javascript:' in cleaned_style or 'expression(' in cleaned_style or '-moz-binding' in cleaned_style or 'behavior:' in cleaned_style or '<script' in cleaned_style:
++                    pos = style_block_end
++                    continue
++                else:
++                    out.append(content[pos:style_block_end])
++                    pos = style_block_end
++                    continue
++
++            tag_end = pos + 1
++            in_quote = None
++            found_gt = False
++            while tag_end < length:
++                ch = content[tag_end]
++                if in_quote:
++                    if ch == in_quote:
++                        in_quote = None
++                else:
++                    if ch in ('"', "'"):
++                        in_quote = ch
++                    elif ch == '<':
++                        break
++                    elif ch == '>':
++                        tag_end += 1
++                        found_gt = True
++                        break
++                tag_end += 1
++
++            if found_gt:
++                raw_tag = content[pos:tag_end]
++                if raw_tag.startswith('</'):
++                    out.append(raw_tag)
++                else:
++                    sanitized = sanitize_tag(raw_tag)
++                    out.append(sanitized)
++                pos = tag_end
++                continue
++            else:
++                out.append(content[pos])
++                pos += 1
++                continue
++
++        out.append(content[pos])
++        pos += 1
++
++    return "".join(out)
++
++def filter_html(content):
++    prev = None
++    curr = content
++    for _ in range(10):
++        if curr == prev:
++            break
++        prev = curr
++        curr = filter_html_once(curr)
++    return curr
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: filter.py <path_to_html_file>", file=sys.stderr)
++        sys.exit(1)
++
++    filepath = sys.argv[1]
++
++    try:
++        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
++            content = f.read()
++    except Exception as e:
++        print(f"Error reading file {filepath}: {e}", file=sys.stderr)
++        sys.exit(1)
++
++    filtered = filter_html(content)
++
++    try:
++        with open(filepath, 'w', encoding='utf-8') as f:
++            f.write(filtered)
++    except Exception as e:
++        print(f"Error writing file {filepath}: {e}", file=sys.stderr)
++        sys.exit(1)
++
++if __name__ == '__main__':
++    main()
+diff --git a/scratch/test_filter.py b/scratch/test_filter.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_filter.py
+@@ -0,0 +1,288 @@
++import sys
++import re
++import html
++
++def sanitize_attribute_value(val):
++    if not val:
++        return ""
++    v = val
++    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
++        v = v[1:-1]
++    decoded = html.unescape(v)
++    cleaned = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', decoded).lower()
++    return cleaned
++
++def is_dangerous_attribute(name, val):
++    name_lower = name.lower()
++    if name_lower.startswith("on"):
++        return True
++    if val is not None:
++        cleaned = sanitize_attribute_value(val)
++        if "javascript:" in cleaned or "vbscript:" in cleaned:
++            return True
++        if cleaned.startswith("data:text/html") or cleaned.startswith("data:image/svg+xml") or cleaned.startswith("data:text/javascript") or cleaned.startswith("data:application/javascript"):
++            return True
++        if name_lower == "style":
++            if "expression(" in cleaned or "-moz-binding" in cleaned or "behavior:" in cleaned:
++                return True
++        if name_lower == "srcdoc":
++            if "<script" in cleaned or "javascript:" in cleaned or "on" in cleaned:
++                return True
++        if name_lower == "content":
++            if "javascript:" in cleaned:
++                return True
++    return False
++
++def sanitize_tag(tag_str):
++    m = re.match(r"^(<\s*([a-zA-Z0-9:-]+))", tag_str)
++    if not m:
++        return tag_str
++    tag_prefix = m.group(1)
++    tag_name = m.group(2)
++    if tag_str.endswith("/>"):
++        closing = "/>"
++        attr_str = tag_str[len(tag_prefix):-2]
++    elif tag_str.endswith(">"):
++        closing = ">"
++        attr_str = tag_str[len(tag_prefix):-1]
++    else:
++        return tag_str
++
++    clean_attrs = ""
++    i = 0
++    length = len(attr_str)
++    while i < length:
++        ws_start = i
++        while i < length and attr_str[i].isspace():
++            i += 1
++        ws = attr_str[ws_start:i]
++        if i >= length:
++            clean_attrs += ws
++            break
++        name_start = i
++        while i < length and not attr_str[i].isspace() and attr_str[i] not in ("=", ">", "/", '"', "'"):
++            i += 1
++        name = attr_str[name_start:i]
++        if not name:
++            clean_attrs += ws + attr_str[i]
++            i += 1
++            continue
++        val = None
++        equals_and_val_slice = ""
++        eq_scan = i
++        while eq_scan < length and attr_str[eq_scan].isspace():
++            eq_scan += 1
++        if eq_scan < length and attr_str[eq_scan] == "=":
++            val_start = eq_scan + 1
++            while val_start < length and attr_str[val_start].isspace():
++                val_start += 1
++            if val_start < length:
++                quote_char = attr_str[val_start]
++                if quote_char in ('"', "'"):
++                    val_end = val_start + 1
++                    while val_end < length and attr_str[val_end] != quote_char:
++                        val_end += 1
++                    if val_end < length:
++                        val_end += 1
++                    val = attr_str[val_start:val_end]
++                    i = val_end
++                else:
++                    val_end = val_start
++                    while val_end < length and not attr_str[val_end].isspace() and attr_str[val_end] not in (">", "/"):
++                        val_end += 1
++                    val = attr_str[val_start:val_end]
++                    i = val_end
++            else:
++                i = length
++            equals_and_val_slice = attr_str[name_start + len(name):i]
++        else:
++            i = name_start + len(name)
++            equals_and_val_slice = ""
++
++        full_attr_slice = ws + name + equals_and_val_slice
++        if is_dangerous_attribute(name, val):
++            pass
++        else:
++            clean_attrs += full_attr_slice
++    return tag_prefix + clean_attrs + closing
++
++def filter_html_once(content):
++    pos = 0
++    out = []
++    length = len(content)
++
++    while pos < length:
++        if content.startswith('<!--', pos):
++            if content.startswith('<!-->', pos):
++                end_comment = pos + 5
++            else:
++                idx = content.find('-->', pos + 4)
++                if idx != -1:
++                    end_comment = idx + 3
++                else:
++                    end_comment = length
++            out.append(content[pos:end_comment])
++            pos = end_comment
++            continue
++
++        if content.startswith('<![CDATA[', pos):
++            idx = content.find(']]>', pos + 9)
++            if idx != -1:
++                end_cdata = idx + 3
++            else:
++                end_cdata = length
++            out.append(content[pos:end_cdata])
++            pos = end_cdata
++            continue
++
++        if content[pos] == '<':
++            m_script = re.match(r'^<\s*script(?=[\s/>]|$)', content[pos:], re.IGNORECASE)
++            if m_script:
++                tag_end = pos + len(m_script.group(0))
++                in_quote = None
++                is_self_closing = False
++                while tag_end < length:
++                    ch = content[tag_end]
++                    if in_quote:
++                        if ch == in_quote:
++                            in_quote = None
++                    else:
++                        if ch in ('"', "'"):
++                            in_quote = ch
++                        elif ch == '>':
++                            if tag_end > pos and content[tag_end-1] == '/':
++                                is_self_closing = True
++                            tag_end += 1
++                            break
++                    tag_end += 1
++
++                if is_self_closing:
++                    pos = tag_end
++                    continue
++                else:
++                    m_close = re.search(r'</\s*script\s*>', content[tag_end:], re.IGNORECASE)
++                    if m_close:
++                        script_block_end = tag_end + m_close.end()
++                    else:
++                        script_block_end = length
++                    pos = script_block_end
++                    continue
++
++            m_style = re.match(r'^<\s*style(?=[\s/>]|$)', content[pos:], re.IGNORECASE)
++            if m_style:
++                tag_end = pos + len(m_style.group(0))
++                in_quote = None
++                is_self_closing = False
++                while tag_end < length:
++                    ch = content[tag_end]
++                    if in_quote:
++                        if ch == in_quote:
++                            in_quote = None
++                    else:
++                        if ch in ('"', "'"):
++                            in_quote = ch
++                        elif ch == '>':
++                            if tag_end > pos and content[tag_end-1] == '/':
++                                is_self_closing = True
++                            tag_end += 1
++                            break
++                    tag_end += 1
++
++                if is_self_closing:
++                    pos = tag_end
++                    continue
++
++                m_close = re.search(r'</\s*style\s*>', content[tag_end:], re.IGNORECASE)
++                if m_close:
++                    style_content = content[tag_end : tag_end + m_close.start()]
++                    style_block_end = tag_end + m_close.end()
++                else:
++                    style_content = content[tag_end:]
++                    style_block_end = length
++
++                cleaned_style = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', html.unescape(style_content)).lower()
++                if 'javascript:' in cleaned_style or 'expression(' in cleaned_style or '-moz-binding' in cleaned_style or 'behavior:' in cleaned_style or '<script' in cleaned_style:
++                    pos = style_block_end
++                    continue
++                else:
++                    out.append(content[pos:style_block_end])
++                    pos = style_block_end
++                    continue
++
++            tag_end = pos + 1
++            in_quote = None
++            found_gt = False
++            while tag_end < length:
++                ch = content[tag_end]
++                if in_quote:
++                    if ch == in_quote:
++                        in_quote = None
++                else:
++                    if ch in ('"', "'"):
++                        in_quote = ch
++                    elif ch == '<':
++                        break
++                    elif ch == '>':
++                        tag_end += 1
++                        found_gt = True
++                        break
++                tag_end += 1
++
++            if found_gt:
++                raw_tag = content[pos:tag_end]
++                if raw_tag.startswith('</'):
++                    out.append(raw_tag)
++                else:
++                    sanitized = sanitize_tag(raw_tag)
++                    out.append(sanitized)
++                pos = tag_end
++                continue
++            else:
++                out.append(content[pos])
++                pos += 1
++                continue
++
++        out.append(content[pos])
++        pos += 1
++
++    return "".join(out)
++
++def filter_html(content):
++    prev = None
++    curr = content
++    for _ in range(10):
++        if curr == prev:
++            break
++        prev = curr
++        curr = filter_html_once(curr)
++    return curr
++
++# Expanded test suite
++tests = [
++    ('<a class="link" href="javascript:alert(1)" id="my-link">', '<a class="link" id="my-link">'),
++    ('<button onclick="alert(1)">Click</button>', '<button>Click</button>'),
++    ('<img src="pic.jpg" alt="Photo" />', '<img src="pic.jpg" alt="Photo" />'),
++    ('<script>alert("XSS")</script>', ''),
++    ('<SCRIPT SRC="malicious.js"></SCRIPT>', ''),
++    ('<a href="java&#x09;script:alert(1)">Link</a>', '<a>Link</a>'),
++    ('<!-- <script>alert(1)</script> -->', '<!-- <script>alert(1)</script> -->'),
++    ('<!--><script>alert(1)</script>-->', '<!-->-->'),
++    ('<div style="color: red;">Hello</div>', '<div style="color: red;">Hello</div>'),
++    ('<div style="background: url(\'javascript:alert(1)\')">Hi</div>', '<div>Hi</div>'),
++    ('<table><tr><td>Data 1</td></tr></table>', '<table><tr><td>Data 1</td></tr></table>'),
++    ('<a onclick = "alert(1)" href="http://example.com">', '<a href="http://example.com">'),
++    ('<img src=x onerror=alert(1)>', '<img src=x>'),
++    ('<a href=javascript:alert(1) class=active>', '<a class=active>'),
++    ('<svg><script>alert(1)</script></svg>', '<svg></svg>'),
++    ('<svg><animate onbegin=alert(1)></svg>', '<svg><animate></svg>'),
++    ('<meta http-equiv="refresh" content="0; url=javascript:alert(1)">', '<meta http-equiv="refresh">'),
++    ('<div style="xss:expression(alert(1))">', '<div>'),
++    ('<p>5 &lt; 10 and 10 &gt; 5 &amp; "quotes"</p>', '<p>5 &lt; 10 and 10 &gt; 5 &amp; "quotes"</p>'),
++    ('<form action="/submit" method="post"><input type="text" name="username" value="john_doe" required /><input type="submit" value="Submit" /></form>',
++     '<form action="/submit" method="post"><input type="text" name="username" value="john_doe" required /><input type="submit" value="Submit" /></form>')
++]
++
++for idx, (inp, expected) in enumerate(tests):
++    res = filter_html(inp)
++    assert res == expected, f"Test {idx} failed:\nInput:    {repr(inp)}\nGot:      {repr(res)}\nExpected: {repr(expected)}"
++print("ALL EXTENDED TESTS PASSED!")

@@ -1,0 +1,68 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,63 @@
++import asyncio
++from typing import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]],
++    max_concurrent: int,
++) -> None:
++    """Run ``tasks`` with at most ``max_concurrent`` running at any one time.
++
++    If this coroutine is cancelled (e.g. by Ctrl+C under ``asyncio.run``),
++    tasks that have not started yet are skipped, running tasks are cancelled,
++    and we wait for them to finish so their cleanup (``finally`` /
++    ``async with`` exits) runs before cancellation propagates.
++
++    If any task raises, the remaining tasks still run; the first exception is
++    re-raised once everything has finished.
++    """
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be >= 1")
++
++    queue = list(reversed(tasks))
++    errors: list[BaseException] = []
++
++    async def worker() -> None:
++        while queue:
++            job = queue.pop()
++            try:
++                await job()
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:
++                errors.append(e)
++
++    workers = [
++        asyncio.create_task(worker())
++        for _ in range(min(max_concurrent, len(tasks)))
++    ]
++    if not workers:
++        return
++
++    try:
++        await asyncio.gather(*workers)
++    except BaseException:
++        # Cancelled (or interrupted): stop scheduling new jobs, cancel running
++        # ones, and wait for their cleanup to complete.
++        queue.clear()
++        for w in workers:
++            w.cancel()
++        while True:
++            try:
++                # asyncio.wait (unlike gather) never cancels the workers
++                # itself, so a second cancellation won't interrupt cleanup.
++                await asyncio.wait(workers)
++                break
++            except asyncio.CancelledError:
++                # Repeated cancellation (e.g. second Ctrl+C); keep waiting
++                # for cleanup, the original cancellation is re-raised below.
++                continue
++        raise
++
++    if errors:
++        raise errors[0]

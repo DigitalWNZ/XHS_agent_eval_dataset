@@ -1,0 +1,116 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..66ff8f693f 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -79,6 +79,19 @@ class ForeignKeyDeferredAttribute(DeferredAttribute):
+         instance.__dict__[self.field.attname] = value
+ 
+ 
++def _has_prefetch_lookup(queryset, lookup_name):
++    if not queryset:
++        return False
++    for lookup in getattr(queryset, '_prefetch_related_lookups', ()):
++        if hasattr(lookup, 'prefetch_through'):
++            lookup_str = lookup.prefetch_through
++        else:
++            lookup_str = str(lookup)
++        if lookup_str.split('__')[0] == lookup_name:
++            return True
++    return False
++
++
+ class ForwardManyToOneDescriptor:
+     """
+     Accessor to the related object on the forward side of a many-to-one or
+@@ -143,9 +156,12 @@ class ForwardManyToOneDescriptor:
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+         if not remote_field.multiple:
+-            for rel_obj in queryset:
+-                instance = instances_dict[rel_obj_attr(rel_obj)]
+-                remote_field.set_cached_value(rel_obj, instance)
++            rel_is_prefetched = _has_prefetch_lookup(queryset, remote_field.get_accessor_name())
++            if not rel_is_prefetched:
++                for rel_obj in queryset:
++                    if not remote_field.is_cached(rel_obj):
++                        instance = instances_dict[rel_obj_attr(rel_obj)]
++                        remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+ 
+     def get_object(self, instance):
+@@ -375,9 +391,12 @@ class ReverseOneToOneDescriptor:
+ 
+         # Since we're going to assign directly in the cache,
+         # we must manage the reverse relation cache manually.
+-        for rel_obj in queryset:
+-            instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
++        rel_is_prefetched = _has_prefetch_lookup(queryset, self.related.field.name)
++        if not rel_is_prefetched:
++            for rel_obj in queryset:
++                if not self.related.field.is_cached(rel_obj):
++                    instance = instances_dict[rel_obj_attr(rel_obj)]
++                    self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -645,9 +664,12 @@ def create_reverse_many_to_one_manager(superclass, rel):
+ 
+             # Since we just bypassed this class' get_queryset(), we must manage
+             # the reverse relation manually.
+-            for rel_obj in queryset:
+-                instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
++            rel_is_prefetched = _has_prefetch_lookup(queryset, self.field.name)
++            if not rel_is_prefetched:
++                for rel_obj in queryset:
++                    if not self.field.is_cached(rel_obj):
++                        instance = instances_dict[rel_obj_attr(rel_obj)]
++                        setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 4ea7fccd5e..e894ac38d0 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -1614,3 +1614,39 @@ class ReadPrefetchedObjectsCacheTests(TestCase):
+         with self.assertNumQueries(4):
+             # AuthorWithAge -> Author -> FavoriteAuthors, Book
+             self.assertSequenceEqual(authors, [self.author1, self.author2])
++
++    def test_prefetch_deferred_fields_foreign_key(self):
++        house = House.objects.create(name='Villa', address='123 Main St')
++        Room.objects.create(name='Living Room', house=house)
++        qs = House.objects.only('name').prefetch_related(
++            Prefetch(
++                'rooms',
++                queryset=Room.objects.prefetch_related(
++                    Prefetch('house', queryset=House.objects.only('address'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            house = qs.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(house.rooms.all()[0].house.address, '123 Main St')
++            self.assertEqual(
++                house.rooms.all()[0].house.get_deferred_fields(),
++                {'name', 'owner_id', 'main_room_id'},
++            )
++
++    def test_prefetch_deferred_fields_one_to_one(self):
++        author = Author.objects.create(name='Charlotte_Unique', first_book=self.book1)
++        Bio.objects.create(author=author)
++        qs = Author.objects.filter(id=author.id).only('name').prefetch_related(
++            Prefetch(
++                'bio',
++                queryset=Bio.objects.prefetch_related(
++                    Prefetch('author', queryset=Author.objects.only('name', 'first_book'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            author = qs.first()
++        with self.assertNumQueries(0):
++            self.assertEqual(author.bio.author.first_book_id, self.book1.id)

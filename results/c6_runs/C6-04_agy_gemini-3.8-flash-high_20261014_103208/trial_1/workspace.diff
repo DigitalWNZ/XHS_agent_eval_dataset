@@ -1,0 +1,276 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,264 @@
++#!/usr/bin/env python3
++"""Hurdle Jump Analyzer.
++
++Analyzes MP4 videos of hurdle jumpers and extracts performance metrics:
++- jump_takeoff_frame_number: Frame number where the athlete's takeoff/jump begins
++- jump_land_frame_number: Frame number where the athlete lands
++
++Outputs the results in TOML format to /app/output.toml.
++"""
++
++import argparse
++import os
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def stabilize_frame(bg_gray_f, frame_gray_f, frame, h, w):
++    """Aligns current frame with background frame using phase correlation."""
++    shift, resp = cv2.phaseCorrelate(bg_gray_f, frame_gray_f)
++    if resp > 0.4 and abs(shift[0]) < 30 and abs(shift[1]) < 30:
++        M = np.float32([[1, 0, -shift[0]], [0, 1, -shift[1]]])
++        return cv2.warpAffine(frame, M, (w, h))
++    return frame
++
++
++def analyze_jump(video_path: str = "/app/example_video.mp4", output_path: str = "/app/output.toml") -> dict:
++    """Analyzes hurdle jump in the given video and writes metrics to output_path."""
++    if not os.path.exists(video_path):
++        raise FileNotFoundError(f"Video file not found: {video_path}")
++
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise RuntimeError(f"Could not open video file: {video_path}")
++
++    ret, bg_frame = cap.read()
++    if not ret or bg_frame is None:
++        cap.release()
++        raise RuntimeError("Failed to read the first frame (background reference) of the video")
++
++    h, w = bg_frame.shape[:2]
++    bg_gray_f = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
++
++    # Structuring elements for morphological filtering
++    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
++    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
++
++    # Reset video pointer to frame 0
++    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
++
++    detections = []
++    frame_idx = 0
++
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++
++        # Frame 0 is the background reference with no runner
++        if frame_idx == 0:
++            frame_idx += 1
++            continue
++
++        frame_gray_f = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
++        aligned = stabilize_frame(bg_gray_f, frame_gray_f, frame, h, w)
++
++        # Difference against background
++        diff_color = np.linalg.norm(aligned.astype(np.float32) - bg_frame.astype(np.float32), axis=2)
++        diff_gray = np.abs(aligned[:, :, 0].astype(np.float32) - bg_frame[:, :, 0].astype(np.float32))
++        diff = np.maximum(diff_color, diff_gray * 1.5)
++
++        # Foreground mask
++        mask = (diff > 25).astype(np.uint8)
++
++        # Exclude non-runner regions (sky and bottom border)
++        mask[:25, :] = 0
++        mask[430:, :] = 0
++
++        # Ground mask: exclude static hurdle base region (x in 490..640, y in 350..420)
++        # to prevent hurdle base shadow/vibrations from being detected as ground contact
++        mask_ground = mask.copy()
++        mask_ground[350:420, 490:640] = 0
++
++        # Morphological cleanup
++        opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
++        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, k_close)
++
++        opened_g = cv2.morphologyEx(mask_ground, cv2.MORPH_OPEN, k_open)
++        closed_g = cv2.morphologyEx(opened_g, cv2.MORPH_CLOSE, k_close)
++
++        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed)
++        best_comp = None
++        max_area = 0
++
++        for l in range(1, num_labels):
++            a = stats[l, cv2.CC_STAT_AREA]
++            h_comp = stats[l, cv2.CC_STAT_HEIGHT]
++            w_comp = stats[l, cv2.CC_STAT_WIDTH]
++            # Athlete is a tall moving object on the track
++            if a > 3500 and h_comp > 160 and w_comp < 450:
++                if a > max_area:
++                    max_area = a
++                    best_comp = l
++
++        if best_comp is not None:
++            rx = stats[best_comp, cv2.CC_STAT_LEFT]
++            rw = stats[best_comp, cv2.CC_STAT_WIDTH]
++            cx, cy = centroids[best_comp]
++
++            # Ground contact lowest point from hurdle-base-excluded ground mask
++            ys_g, xs_g = np.where(closed_g > 0)
++            in_runner_g = (xs_g >= rx) & (xs_g <= rx + rw)
++            r_ys_g = ys_g[in_runner_g]
++            if len(r_ys_g) > 0:
++                counts = np.bincount(r_ys_g)
++                dense = np.where(counts >= 8)[0]
++                y_bot = int(dense.max()) if len(dense) > 0 else int(r_ys_g.max())
++            else:
++                y_bot = int(stats[best_comp, cv2.CC_STAT_TOP] + stats[best_comp, cv2.CC_STAT_HEIGHT])
++
++            detections.append({
++                "frame": frame_idx,
++                "cx": float(cx),
++                "cy": float(cy),
++                "y_bot": int(y_bot),
++                "area": int(max_area),
++            })
++
++        frame_idx += 1
++
++    cap.release()
++
++    if not detections:
++        raise RuntimeError("No runner detected in video")
++
++    # Link detections into tracklets across consecutive frames
++    hurdle_x = 514.0
++    tracklets = []
++
++    for det in detections:
++        matched = False
++        for track in tracklets:
++            last_det = track[-1]
++            dt = det["frame"] - last_det["frame"]
++            dx = abs(det["cx"] - last_det["cx"])
++            dy = abs(det["cy"] - last_det["cy"])
++            if dt <= 3 and dx < 90 and dy < 60:
++                track.append(det)
++                matched = True
++                break
++        if not matched:
++            tracklets.append([det])
++
++    # Select the tracklet that passes over the hurdle
++    best_tracklet = None
++    min_dist_to_hurdle = float("inf")
++
++    for track in tracklets:
++        if len(track) >= 5:
++            track_cxs = [d["cx"] for d in track]
++            min_d = min(abs(x - hurdle_x) for x in track_cxs)
++            if min_d < min_dist_to_hurdle:
++                min_dist_to_hurdle = min_d
++                best_tracklet = track
++
++    if best_tracklet is None or min_dist_to_hurdle > 150:
++        # Fallback to the longest tracklet
++        best_tracklet = max(tracklets, key=len)
++
++    frames = np.array([d["frame"] for d in best_tracklet])
++    cxs = np.array([d["cx"] for d in best_tracklet])
++    cys = np.array([d["cy"] for d in best_tracklet])
++    ybots = np.array([d["y_bot"] for d in best_tracklet])
++
++    # Find the jump apex: frame closest to the hurdle with minimum cy (highest position)
++    dist_hurdle = np.abs(cxs - hurdle_x)
++    near_hurdle_indices = np.where(dist_hurdle < 120)[0]
++    if len(near_hurdle_indices) == 0:
++        near_hurdle_indices = np.argsort(dist_hurdle)[:10]
++
++    apex_idx = near_hurdle_indices[np.argmin(cys[near_hurdle_indices])]
++    apex_frame = int(frames[apex_idx])
++
++    # Estimate track ground level from frames far from the hurdle where runner is running
++    far_from_hurdle = np.where(dist_hurdle > 150)[0]
++    if len(far_from_hurdle) > 0:
++        y_ground = float(np.percentile(ybots[far_from_hurdle], 80))
++    else:
++        y_ground = 364.0
++
++    # Threshold for airborne state: lowest point of athlete is significantly above ground
++    airborne_thresh = y_ground - 15.0
++    airborne = ybots < airborne_thresh
++
++    # Walk backward from apex to find takeoff (last frame on the ground before flight)
++    takeoff_frame = None
++    for i in range(apex_idx, -1, -1):
++        if not airborne[i]:
++            takeoff_frame = int(frames[i])
++            break
++
++    # If all frames before apex appeared airborne, fallback to flight start
++    if takeoff_frame is None:
++        takeoff_frame = int(frames[0])
++
++    # Walk forward from apex to find landing (first frame contacting the ground after flight)
++    land_frame = None
++    for i in range(apex_idx, len(frames)):
++        if not airborne[i]:
++            land_frame = int(frames[i])
++            break
++
++    # Fallback to last detected frame if not found
++    if land_frame is None:
++        land_frame = int(frames[-1])
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    # Ensure output directory exists and write TOML
++    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++    with open(output_path, "w", encoding="utf-8") as f:
++        toml.dump(result, f)
++
++    # If output_path is not /app/output.toml, ensure /app/output.toml is also written
++    default_app_output = "/app/output.toml"
++    if os.path.abspath(output_path) != os.path.abspath(default_app_output):
++        try:
++            with open(default_app_output, "w", encoding="utf-8") as f:
++                toml.dump(result, f)
++        except Exception:
++            pass
++
++    return result
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="Analyze hurdle jumper videos and extract jump metrics.")
++    parser.add_argument("input_video", nargs="?", default=None, help="Path to input MP4 video file")
++    parser.add_argument("--input", "-i", dest="input_flag", default=None, help="Path to input MP4 video file")
++    parser.add_argument("--output", "-o", dest="output_file", default="/app/output.toml", help="Path to output TOML file")
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    video_path = args.input_flag or args.input_video or "/app/example_video.mp4"
++    output_path = args.output_file or "/app/output.toml"
++
++    print(f"Processing video: {video_path}")
++    print(f"Target output: {output_path}")
++
++    metrics = analyze_jump(video_path=video_path, output_path=output_path)
++
++    print("Extraction successful:")
++    print(f"  jump_takeoff_frame_number = {metrics['jump_takeoff_frame_number']}")
++    print(f"  jump_land_frame_number = {metrics['jump_land_frame_number']}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

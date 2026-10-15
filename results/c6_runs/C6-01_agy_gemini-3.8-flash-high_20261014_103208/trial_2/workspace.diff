@@ -1,0 +1,315 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,310 @@
++#!/usr/bin/env python3
++import sys
++import re
++import html
++import urllib.parse
++
++def is_dangerous_url(val):
++    if not val:
++        return False
++    # Decode HTML entities repeatedly (up to 3 times)
++    prev = val
++    for _ in range(3):
++        curr = html.unescape(prev)
++        if curr == prev:
++            break
++        prev = curr
++    
++    # Strip whitespace and ascii control chars
++    cleaned = re.sub(r"[\s\x00-\x20\x7f-\x9f]+", "", prev)
++    dangerous_schemes = (
++        "javascript:",
++        "vbscript:",
++        "data:text/html",
++        "data:text/javascript",
++        "data:image/svg+xml",
++    )
++    if cleaned.lower().startswith(dangerous_schemes):
++        return True
++    
++    # Also check url-unquoted
++    unquoted = urllib.parse.unquote(cleaned)
++    unquoted_cleaned = re.sub(r"[\s\x00-\x20\x7f-\x9f]+", "", unquoted)
++    if unquoted_cleaned.lower().startswith(dangerous_schemes):
++        return True
++    
++    return False
++
++def is_dangerous_style(val):
++    if not val:
++        return False
++    prev = val
++    for _ in range(3):
++        curr = html.unescape(prev)
++        if curr == prev:
++            break
++        prev = curr
++    cleaned = re.sub(r"[\s\x00-\x20\x7f-\x9f]+", "", prev).lower()
++    if "expression(" in cleaned:
++        return True
++    if "url(javascript:" in cleaned or "url('javascript:" in cleaned or 'url("javascript:' in cleaned:
++        return True
++    if "behavior:" in cleaned:
++        return True
++    if "-moz-binding:" in cleaned:
++        return True
++    return False
++
++def is_dangerous_srcdoc(val):
++    if not val:
++        return False
++    prev = val
++    for _ in range(3):
++        curr = html.unescape(prev)
++        if curr == prev:
++            break
++        prev = curr
++    if re.search(r"<(?:[a-zA-Z0-9_-]+:)?script[\s/>]", prev, re.IGNORECASE):
++        return True
++    if re.search(r"\bon[a-zA-Z]+\s*=", prev, re.IGNORECASE):
++        return True
++    if re.search(r"javascript:", prev, re.IGNORECASE):
++        return True
++    return False
++
++def is_dangerous_attr(attr_name, attr_val):
++    name_lower = attr_name.lower()
++    if name_lower.startswith("on"):
++        return True
++    if name_lower == "attributename" and attr_val and attr_val.lower().startswith("on"):
++        return True
++    if attr_val is not None:
++        if is_dangerous_url(attr_val):
++            return True
++        if name_lower == "style" and is_dangerous_style(attr_val):
++            return True
++        if name_lower == "srcdoc" and is_dangerous_srcdoc(attr_val):
++            return True
++        if name_lower == "content":
++            # Check for meta refresh url=javascript:
++            m = re.search(r"url\s*=\s*(.*)", attr_val, re.IGNORECASE)
++            if m:
++                url_part = m.group(1).strip(" '\"")
++                if is_dangerous_url(url_part):
++                    return True
++    return False
++
++def sanitize_tag(tag_str):
++    m = re.match(r"^<(/?[a-zA-Z][a-zA-Z0-9:-]*)", tag_str)
++    if not m:
++        return tag_str
++    
++    tag_prefix = m.group(0)
++    out = [tag_prefix]
++    pos = m.end()
++    n = len(tag_str)
++    
++    while pos < n:
++        # Check for closing > or />
++        if re.match(r"^\s*/>", tag_str[pos:]) or re.match(r"^\s*>", tag_str[pos:]):
++            out.append(tag_str[pos:])
++            break
++        
++        delim_m = re.match(r"^([\s/]+)", tag_str[pos:])
++        delim = delim_m.group(0) if delim_m else ""
++        after_delim = pos + len(delim)
++        
++        if after_delim >= n or tag_str[after_delim] == ">":
++            out.append(tag_str[pos:])
++            break
++        
++        # Attribute name
++        name_m = re.match(r"^([^\s/>=\"'\x00-\x1f\x7f-\x9f]+)", tag_str[after_delim:])
++        if not name_m:
++            out.append(tag_str[pos:])
++            break
++        
++        attr_name = name_m.group(1)
++        after_name = after_delim + len(attr_name)
++        
++        eq_m = re.match(r"^(\s*=\s*)", tag_str[after_name:])
++        if eq_m:
++            val_start = after_name + len(eq_m.group(0))
++            if val_start < n:
++                q = tag_str[val_start]
++                if q in ("'", '"'):
++                    end_q = tag_str.find(q, val_start + 1)
++                    if end_q == -1:
++                        attr_val = tag_str[val_start + 1:]
++                        attr_end = n
++                    else:
++                        attr_val = tag_str[val_start + 1:end_q]
++                        attr_end = end_q + 1
++                else:
++                    unq_m = re.match(r"^([^\s>]+)", tag_str[val_start:])
++                    if unq_m:
++                        attr_val = unq_m.group(1)
++                        attr_end = val_start + len(attr_val)
++                    else:
++                        attr_val = ""
++                        attr_end = val_start
++            else:
++                attr_val = ""
++                attr_end = val_start
++        else:
++            attr_val = None
++            attr_end = after_name
++        
++        if not is_dangerous_attr(attr_name, attr_val):
++            slice_to_append = tag_str[pos:attr_end]
++            if out and not (out[-1].endswith((' ', '\t', '\n', '\r', '/')) or slice_to_append.startswith((' ', '\t', '\n', '\r', '/'))):
++                out.append(" ")
++            out.append(slice_to_append)
++        
++        pos = attr_end
++        
++    return "".join(out)
++
++def find_tag_end(text, start):
++    pos = start
++    n = len(text)
++    in_quote = None
++    while pos < n:
++        c = text[pos]
++        if in_quote:
++            if c == in_quote:
++                in_quote = None
++        else:
++            if c in ('"', "'"):
++                in_quote = c
++            elif c == '>':
++                return pos + 1
++        pos += 1
++    return n
++
++def filter_html_once(html_text):
++    res = []
++    i = 0
++    n = len(html_text)
++    
++    while i < n:
++        # 1. Comments
++        if html_text.startswith("<!--", i):
++            m = re.match(r"<!--(?:>|->|[\s\S]*?--!?>|[\s\S]*$)", html_text[i:])
++            if m:
++                res.append(m.group(0))
++                i += len(m.group(0))
++                continue
++        
++        # 2. DOCTYPE, CDATA, XML declaration
++        if html_text.startswith("<![CDATA[", i):
++            cdata_end = html_text.find("]]>", i + 9)
++            if cdata_end != -1:
++                res.append(html_text[i : cdata_end + 3])
++                i = cdata_end + 3
++            else:
++                res.append(html_text[i:])
++                i = n
++            continue
++        
++        if html_text.startswith("<!DOCTYPE", i) or html_text.startswith("<!doctype", i):
++            doc_end = find_tag_end(html_text, i)
++            res.append(html_text[i:doc_end])
++            i = doc_end
++            continue
++        
++        if html_text.startswith("<?", i):
++            pi_end = html_text.find("?>", i + 2)
++            if pi_end != -1:
++                res.append(html_text[i : pi_end + 2])
++                i = pi_end + 2
++            else:
++                res.append(html_text[i:])
++                i = n
++            continue
++        
++        # 3. Script tag
++        if re.match(r"^<(?:[a-zA-Z0-9_-]+:)?script[\s/>]", html_text[i:], re.IGNORECASE):
++            start_tag_end = find_tag_end(html_text, i)
++            start_tag = html_text[i:start_tag_end]
++            close_m = re.search(r"</(?:[a-zA-Z0-9_-]+:)?script[\s/>]", html_text[start_tag_end:], re.IGNORECASE)
++            if close_m:
++                close_tag_start = start_tag_end + close_m.start()
++                close_tag_end = find_tag_end(html_text, close_tag_start)
++                i = close_tag_end
++            else:
++                if start_tag.rstrip().endswith("/>"):
++                    i = start_tag_end
++                elif re.search(r"\bsrc\s*=", start_tag, re.IGNORECASE):
++                    i = start_tag_end
++                else:
++                    i = n
++            continue
++        
++        # Orphan </script>
++        if re.match(r"^</(?:[a-zA-Z0-9_-]+:)?script[\s/>]", html_text[i:], re.IGNORECASE):
++            i = find_tag_end(html_text, i)
++            continue
++        
++        # 4. Style tag
++        if re.match(r"^<(?:[a-zA-Z0-9_-]+:)?style[\s/>]", html_text[i:], re.IGNORECASE):
++            start_tag_end = find_tag_end(html_text, i)
++            close_m = re.search(r"</(?:[a-zA-Z0-9_-]+:)?style[\s/>]", html_text[start_tag_end:], re.IGNORECASE)
++            if close_m:
++                close_tag_start = start_tag_end + close_m.start()
++                close_tag_end = find_tag_end(html_text, close_tag_start)
++                style_content = html_text[start_tag_end:close_tag_start]
++                if is_dangerous_style(style_content):
++                    i = close_tag_end
++                    continue
++                else:
++                    sanitized_start = sanitize_tag(html_text[i:start_tag_end])
++                    res.append(sanitized_start)
++                    res.append(html_text[start_tag_end:close_tag_end])
++                    i = close_tag_end
++                    continue
++        
++        # 5. Other tags
++        if re.match(r"^</?[a-zA-Z][a-zA-Z0-9:-]*", html_text[i:]):
++            tag_end = find_tag_end(html_text, i)
++            raw_tag = html_text[i:tag_end]
++            res.append(sanitize_tag(raw_tag))
++            i = tag_end
++            continue
++        
++        # 6. Plain text until next <
++        next_lt = html_text.find("<", i + 1)
++        if next_lt == -1:
++            res.append(html_text[i:])
++            i = n
++        else:
++            res.append(html_text[i:next_lt])
++            i = next_lt
++            
++    return "".join(res)
++
++def filter_html(content):
++    prev = content
++    for _ in range(10):
++        curr = filter_html_once(prev)
++        if curr == prev:
++            break
++        prev = curr
++    return curr
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: filter.py <html-file>", file=sys.stderr)
++        sys.exit(1)
++    
++    filepath = sys.argv[1]
++    with open(filepath, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
++        content = f.read()
++    
++    filtered_content = filter_html(content)
++    
++    with open(filepath, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
++        f.write(filtered_content)
++
++if __name__ == "__main__":
++    main()

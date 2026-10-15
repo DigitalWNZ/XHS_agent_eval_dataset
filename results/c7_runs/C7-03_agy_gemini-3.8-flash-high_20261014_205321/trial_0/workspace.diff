@@ -1,0 +1,347 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,119 @@
++from __future__ import annotations
++
++import asyncio
++import inspect
++import signal
++import threading
++from collections.abc import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]],
++    max_concurrent: int,
++) -> None:
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be greater than 0")
++
++    tasks_list = list(tasks)
++    if not tasks_list:
++        return
++
++    loop = asyncio.get_running_loop()
++    current_task = asyncio.current_task()
++    worker_tasks: list[asyncio.Task[None]] = []
++    exceptions: list[BaseException] = []
++    interrupted = False
++    interrupt_count = 0
++    orig_handler = None
++
++    def on_sigint(signum: int, frame: object) -> None:
++        nonlocal interrupted, interrupt_count
++        interrupt_count += 1
++        if interrupt_count == 1:
++            interrupted = True
++            if current_task and not current_task.done():
++                current_task.cancel()
++                loop.call_soon_threadsafe(lambda: None)
++            else:
++                for wt in worker_tasks:
++                    if not wt.done():
++                        wt.cancel()
++                loop.call_soon_threadsafe(lambda: None)
++        else:
++            raise KeyboardInterrupt()
++
++    if threading.current_thread() is threading.main_thread():
++        try:
++            orig_handler = signal.getsignal(signal.SIGINT)
++            if orig_handler is not signal.SIG_IGN:
++                signal.signal(signal.SIGINT, on_sigint)
++            else:
++                orig_handler = None
++        except (ValueError, OSError):
++            orig_handler = None
++
++    task_iter = iter(tasks_list)
++    stop = False
++
++    async def worker() -> None:
++        nonlocal stop
++        while not stop:
++            try:
++                t = next(task_iter)
++            except StopIteration:
++                break
++            try:
++                coro = t() if callable(t) else t
++                if inspect.isawaitable(coro):
++                    await coro
++            except asyncio.CancelledError:
++                raise
++            except BaseException as e:
++                exceptions.append(e)
++                stop = True
++                for wt in worker_tasks:
++                    if wt is not asyncio.current_task():
++                        wt.cancel()
++                break
++
++    num_workers = min(max_concurrent, len(tasks_list))
++    for _ in range(num_workers):
++        worker_tasks.append(asyncio.create_task(worker()))
++
++    outer_exc: BaseException | None = None
++    try:
++        await asyncio.gather(*worker_tasks)
++    except BaseException as exc:
++        outer_exc = exc
++        stop = True
++        for wt in worker_tasks:
++            wt.cancel()
++    finally:
++        clean_fut = asyncio.gather(*worker_tasks, return_exceptions=True)
++        while not clean_fut.done():
++            try:
++                await asyncio.shield(clean_fut)
++            except asyncio.CancelledError:
++                pass
++
++        if orig_handler is not None:
++            try:
++                signal.signal(signal.SIGINT, orig_handler)
++            except (ValueError, OSError):
++                pass
++
++    if (
++        interrupted
++        or isinstance(outer_exc, KeyboardInterrupt)
++        or any(isinstance(e, KeyboardInterrupt) for e in exceptions)
++    ):
++        if current_task and hasattr(current_task, "uncancel"):
++            while current_task.cancelling() > 0:
++                current_task.uncancel()
++        raise KeyboardInterrupt() from None
++
++    if outer_exc is not None:
++        raise outer_exc
++
++    if exceptions:
++        raise exceptions[0]
+diff --git a/test_run.py b/test_run.py
+new file mode 100644
+--- /dev/null
++++ b/test_run.py
+@@ -0,0 +1,218 @@
++import sys
++sys.path.insert(0, "/app")
++import asyncio
++import signal
++import os
++import threading
++import time
++from run import run_tasks
++
++# Test 1: Basic execution
++async def test_basic():
++    results = []
++    async def task(i):
++        results.append(i)
++    tasks = [lambda i=i: task(i) for i in range(5)]
++    res = await run_tasks(tasks, 2)
++    assert res is None
++    assert sorted(results) == [0, 1, 2, 3, 4]
++    print("Test 1 (Basic execution) passed")
++
++asyncio.run(test_basic())
++
++# Test 2: Empty list
++async def test_empty():
++    res = await run_tasks([], 5)
++    assert res is None
++    print("Test 2 (Empty list) passed")
++
++asyncio.run(test_empty())
++
++# Test 3: Concurrency limit
++async def test_concurrency():
++    current_conc = 0
++    max_conc = 0
++    async def task():
++        nonlocal current_conc, max_conc
++        current_conc += 1
++        if current_conc > max_conc:
++            max_conc = current_conc
++        await asyncio.sleep(0.02)
++        current_conc -= 1
++    tasks = [task for _ in range(20)]
++    await run_tasks(tasks, 3)
++    assert max_conc == 3, f"Expected max_conc=3, got {max_conc}"
++    print("Test 3 (Concurrency limit) passed")
++
++asyncio.run(test_concurrency())
++
++# Test 4: max_concurrent > len(tasks)
++async def test_large_concurrency():
++    done = []
++    async def task(i):
++        done.append(i)
++    tasks = [lambda i=i: task(i) for i in range(3)]
++    await run_tasks(tasks, 10)
++    assert sorted(done) == [0, 1, 2]
++    print("Test 4 (Large concurrency) passed")
++
++asyncio.run(test_large_concurrency())
++
++# Test 5: Invalid max_concurrent
++async def test_invalid_max_conc():
++    try:
++        await run_tasks([], 0)
++        assert False, "Should have raised ValueError"
++    except ValueError:
++        pass
++    try:
++        await run_tasks([], -1)
++        assert False, "Should have raised ValueError"
++    except ValueError:
++        pass
++    print("Test 5 (Invalid max_concurrent) passed")
++
++asyncio.run(test_invalid_max_conc())
++
++# Test 6: Task exception
++async def test_exception():
++    cleanup_done = []
++    started = []
++    async def failing():
++        started.append("fail")
++        await asyncio.sleep(0.02)
++        raise RuntimeError("boom")
++    async def long_task(i):
++        started.append(i)
++        try:
++            await asyncio.sleep(0.5)
++        finally:
++            await asyncio.sleep(0.02)
++            cleanup_done.append(i)
++    tasks = [failing, lambda: long_task(1), lambda: long_task(2)]
++    try:
++        await run_tasks(tasks, 2)
++        assert False, "Should have raised RuntimeError"
++    except RuntimeError as e:
++        assert str(e) == "boom"
++    assert 1 in cleanup_done
++    assert 2 not in started
++    print("Test 6 (Task exception) passed")
++
++asyncio.run(test_exception())
++
++# Test 7: SIGINT with asyncio.run
++def test_sigint_asyncio_run():
++    cleaned = []
++    started = []
++    async def task(i):
++        started.append(i)
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.05)
++            cleaned.append(i)
++    async def main():
++        loop = asyncio.get_running_loop()
++        loop.call_later(0.05, lambda: signal.raise_signal(signal.SIGINT))
++        tasks = [lambda i=i: task(i) for i in range(6)]
++        await run_tasks(tasks, 2)
++    try:
++        asyncio.run(main())
++        assert False, "Should have raised KeyboardInterrupt"
++    except KeyboardInterrupt:
++        pass
++    assert started == [0, 1]
++    assert cleaned == [0, 1]
++    print("Test 7 (SIGINT with asyncio.run) passed")
++
++test_sigint_asyncio_run()
++
++# Test 8: SIGINT with loop.run_until_complete
++def test_sigint_run_until_complete():
++    cleaned = []
++    started = []
++    async def task(i):
++        started.append(i)
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.05)
++            cleaned.append(i)
++    tasks = [lambda i=i: task(i) for i in range(6)]
++    loop = asyncio.new_event_loop()
++    loop.call_later(0.05, lambda: signal.raise_signal(signal.SIGINT))
++    try:
++        loop.run_until_complete(run_tasks(tasks, 2))
++        assert False, "Should have raised KeyboardInterrupt"
++    except KeyboardInterrupt:
++        pass
++    finally:
++        loop.close()
++    assert started == [0, 1]
++    assert cleaned == [0, 1]
++    print("Test 8 (SIGINT with run_until_complete) passed")
++
++test_sigint_run_until_complete()
++
++# Test 9: Cancellation via task.cancel()
++async def test_cancellation():
++    cleaned = []
++    async def task(i):
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.02)
++            cleaned.append(i)
++    t = asyncio.create_task(run_tasks([lambda: task(0), lambda: task(1)], 2))
++    await asyncio.sleep(0.02)
++    t.cancel()
++    try:
++        await t
++        assert False, "Should have raised CancelledError"
++    except asyncio.CancelledError:
++        pass
++    assert cleaned == [0, 1]
++    print("Test 9 (Cancellation via task.cancel()) passed")
++
++asyncio.run(test_cancellation())
++
++# Test 10: Task raising KeyboardInterrupt directly
++async def test_task_raises_kb_interrupt():
++    cleaned = []
++    async def kb_task():
++        await asyncio.sleep(0.01)
++        raise KeyboardInterrupt()
++    async def other_task():
++        try:
++            await asyncio.sleep(10)
++        finally:
++            await asyncio.sleep(0.02)
++            cleaned.append("other")
++    try:
++        await run_tasks([kb_task, other_task], 2)
++        assert False, "Should have raised KeyboardInterrupt"
++    except KeyboardInterrupt:
++        pass
++    assert cleaned == ["other"]
++    print("Test 10 (Task raises KeyboardInterrupt) passed")
++
++asyncio.run(test_task_raises_kb_interrupt())
++
++# Test 11: Background thread execution
++def test_background_thread():
++    res = []
++    def runner():
++        async def main():
++            await run_tasks([lambda: asyncio.sleep(0.01)], 1)
++            res.append(True)
++        asyncio.run(main())
++    th = threading.Thread(target=runner)
++    th.start()
++    th.join()
++    assert res == [True]
++    print("Test 11 (Background thread execution) passed")
++
++test_background_thread()
++
++print("\nALL TESTS PASSED SUCCESSFULLY!")

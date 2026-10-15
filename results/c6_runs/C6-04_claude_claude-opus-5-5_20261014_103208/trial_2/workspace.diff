@@ -1,0 +1,142 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python3
++"""Detect hurdle jump takeoff and landing frames in a video.
++
++Usage: python3 jump_analyzer.py [video.mp4] [output.toml]
++"""
++import sys
++
++import cv2
++import numpy as np
++import toml
++
++HURDLE_X = 490          # approximate hurdle x position (pixels, 960 wide)
++DIFF_THRESH = 40        # per-channel foreground threshold
++AIR_MARGIN = 12         # pixels above ground level to count as airborne
++MIN_AREA = 300          # minimum foreground area for runner presence
++
++
++def read_frames(path):
++    cap = cv2.VideoCapture(path)
++    frames = []
++    while True:
++        ok, f = cap.read()
++        if not ok:
++            break
++        frames.append(f)
++    cap.release()
++    return frames
++
++
++def build_background(frames):
++    # Median over (sub-sampled) frames; runner passes quickly so the median is
++    # the empty scene. Fall back to the first frame for very short videos.
++    if len(frames) < 5:
++        return cv2.GaussianBlur(frames[0], (5, 5), 0).astype(np.int16)
++    step = max(1, len(frames) // 60)
++    sample = [cv2.GaussianBlur(f, (5, 5), 0) for f in frames[::step]]
++    return np.median(np.stack(sample), axis=0).astype(np.int16)
++
++
++def runner_extent(frame, bg):
++    """Return (lowest_y, x_at_lowest, min_x, max_x, area) or None."""
++    blur = cv2.GaussianBlur(frame, (5, 5), 0).astype(np.int16)
++    d = np.abs(blur - bg).max(axis=2)
++    m = (d > DIFF_THRESH).astype(np.uint8)
++    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
++    n, labels, stats, _ = cv2.connectedComponentsWithStats(m)
++    if n < 2:
++        return None
++    k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
++    x, y, w, h, area = stats[k]
++    if area < MIN_AREA:
++        return None
++    # include nearby smaller blobs (detached feet / legs): any foreground in
++    # the columns around the main blob, below its top edge
++    pad = 80
++    keep = np.zeros(n, bool)
++    for j in range(1, n):
++        xj, yj, wj, hj, aj = stats[j]
++        if aj < 15:
++            continue
++        if xj < x + w + pad and xj + wj > x - pad and yj + hj > y - 20:
++            keep[j] = True
++    sel = keep[labels]
++    ys, xs = np.nonzero(sel)
++    i = int(np.argmax(ys))
++    return int(ys[i]), int(xs[i]), int(xs.min()), int(xs.max()), int(sel.sum())
++
++
++def analyze(path):
++    frames = read_frames(path)
++    if not frames:
++        return 0, 0
++    bg = build_background(frames)
++    width = frames[0].shape[1]
++    info = [runner_extent(f, bg) for f in frames]
++
++    present = [i for i, v in enumerate(info) if v is not None]
++    if not present:
++        return 0, len(frames) - 1
++    lows = np.array([info[i][0] for i in present])
++    ground = float(np.percentile(lows, 90))
++
++    # airborne = runner fully visible and lowest point above ground level
++    air = np.zeros(len(frames), bool)
++    for i in present:
++        low, _, x0, x1, _ = info[i]
++        if x0 > 2 and x1 < width - 3 and low < ground - AIR_MARGIN:
++            air[i] = True
++
++    runs = []
++    i = 0
++    while i < len(frames):
++        if air[i]:
++            j = i
++            while j + 1 < len(frames) and air[j + 1]:
++                j += 1
++            runs.append((i, j))
++            i = j + 1
++        else:
++            i += 1
++
++    if not runs:
++        # fallback: frame closest to the hurdle
++        c = min(present, key=lambda k: abs(info[k][1] - HURDLE_X))
++        return max(0, c - 4), min(len(frames) - 1, c + 4)
++
++    def score(run):
++        a, b = run
++        xs = [(info[k][2] + info[k][3]) / 2 for k in range(a, b + 1)]
++        crosses = min(xs) - 60 <= HURDLE_X <= max(xs) + 60
++        return (crosses, b - a + 1)
++
++    a, b = max(runs, key=score)
++    takeoff = max(0, a - 1)
++    land = min(len(frames) - 1, b + 1)
++    return takeoff, land
++
++
++def main():
++    video = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    out = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++    takeoff, land = analyze(video)
++    with open(out, "w") as f:
++        toml.dump({"jump_takeoff_frame_number": int(takeoff),
++                   "jump_land_frame_number": int(land)}, f)
++    print(f"takeoff={takeoff} land={land}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

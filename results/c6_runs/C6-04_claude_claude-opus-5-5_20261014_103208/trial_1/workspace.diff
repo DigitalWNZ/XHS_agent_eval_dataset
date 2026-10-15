@@ -1,0 +1,167 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python3
++"""Detect hurdle jump takeoff and landing frames in an MP4 video.
++
++Approach:
++  * The first frame is an empty background (camera is static).
++  * For each frame, segment the athlete by background differencing and take
++    the largest foreground blob.
++  * Track the lowest point of the blob (the feet).  During flight the feet are
++    clearly above the ground level that they rest on while running.
++  * The flight peak is the frame where the lowest point is highest; walk
++    backwards to the last ground contact (takeoff) and forwards to the first
++    ground contact (landing).
++"""
++import sys
++
++import cv2
++import numpy as np
++import toml
++
++DIFF_THRESH = 40        # per-channel colour difference to count as foreground
++MIN_BLOB_AREA = 1500    # minimum blob size (px) to be considered the athlete
++TAKEOFF_TOL = 10        # px above ground still counted as contact at takeoff
++LANDING_TOL = 25        # px above ground counted as touchdown on landing
++GROUND_WINDOW = 12      # frames each side of the peak used to estimate ground
++HURDLE_X = 490          # approximate hurdle column (fixed camera / hurdle)
++HURDLE_RANGE = 260      # the flight peak must lie within this many px of it
++MIN_BLOB_HEIGHT = 80    # athlete blob must be at least this tall
++MIN_BOTTOM_Y = 150      # athlete must reach down below the fence line
++
++
++def read_frames(path):
++    cap = cv2.VideoCapture(path)
++    frames = []
++    while True:
++        ok, frame = cap.read()
++        if not ok:
++            break
++        frames.append(cv2.GaussianBlur(frame, (5, 5), 0))
++    cap.release()
++    return frames
++
++
++def athlete_bottoms(frames):
++    """Return per-frame (bottom_y, center_x) of the athlete, or None."""
++    bg = frames[0].astype(np.int16)
++    open_k = np.ones((3, 3), np.uint8)
++    close_k = np.ones((15, 15), np.uint8)
++    out = []
++    bg_med = np.median(bg.reshape(-1, 3), axis=0).astype(np.float32) + 1.0
++    for f in frames:
++        # Compensate for global exposure / lighting changes.
++        gain = bg_med / (np.median(f.reshape(-1, 3), axis=0).astype(np.float32) + 1.0)
++        fc = np.clip(f.astype(np.float32) * gain, 0, 255).astype(np.int16)
++        d = np.abs(fc - bg).max(axis=2)
++        raw = (d > DIFF_THRESH).astype(np.uint8)
++        raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, open_k)
++        m = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, close_k)
++        n, labels, stats, _ = cv2.connectedComponentsWithStats(m)
++        if n <= 1:
++            out.append(None)
++            continue
++        k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
++        if (stats[k, cv2.CC_STAT_AREA] < MIN_BLOB_AREA
++                or stats[k, cv2.CC_STAT_HEIGHT] < MIN_BLOB_HEIGHT):
++            out.append(None)
++            continue
++        ys, xs = np.nonzero((labels == k) & (raw > 0))
++        if len(ys) == 0:
++            out.append(None)
++            continue
++        if ys.max() < MIN_BOTTOM_Y:
++            out.append(None)
++            continue
++        out.append((float(ys.max()), float(xs.mean())))
++    return out
++
++
++def detect_jump(frames):
++    info = athlete_bottoms(frames)
++    n = len(info)
++    present = [i for i in range(n) if info[i] is not None]
++    if not present:
++        return 0, 0
++    bottom = np.full(n, np.nan)
++    for i in present:
++        bottom[i] = info[i][0]
++
++    # Flight peak: highest lowest-point among frames where the athlete is
++    # near the hurdle.
++    # Restrict to the longest run of detections (gaps of <= 2 frames allowed),
++    # which is the athlete's pass; isolated blobs are lighting noise.
++    runs, cur = [], [present[0]]
++    for i in present[1:]:
++        if i - cur[-1] <= 3:
++            cur.append(i)
++        else:
++            runs.append(cur)
++            cur = [i]
++    runs.append(cur)
++    present = max(runs, key=lambda r: r[-1] - r[0])
++    cand = [i for i in present if abs(info[i][1] - HURDLE_X) < HURDLE_RANGE]
++    if not cand:
++        cand = present
++    # Smooth a little to resist single-frame segmentation glitches.
++    sm = bottom.copy()
++    for i in cand:
++        nb = [bottom[j] for j in (i - 1, i, i + 1)
++              if 0 <= j < n and not np.isnan(bottom[j])]
++        sm[i] = np.median(nb)
++    peak = min(cand, key=lambda i: sm[i])
++
++    def ground(rng):
++        vals = [bottom[j] for j in rng if 0 <= j < n and not np.isnan(bottom[j])]
++        return max(vals) if vals else bottom[peak]
++
++    g_before = ground(range(peak - GROUND_WINDOW, peak))
++    g_after = ground(range(peak + 1, peak + GROUND_WINDOW + 1))
++
++    takeoff = peak
++    for j in range(peak - 1, -1, -1):
++        if np.isnan(bottom[j]):
++            break
++        takeoff = j
++        if bottom[j] >= g_before - TAKEOFF_TOL:
++            break
++
++    landing = peak
++    for j in range(peak + 1, n):
++        if np.isnan(bottom[j]):
++            break
++        landing = j
++        if bottom[j] >= g_after - LANDING_TOL:
++            break
++
++    return int(takeoff), int(landing)
++
++
++def main():
++    video = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    output = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++    frames = read_frames(video)
++    if not frames:
++        takeoff, landing = 0, 0
++    else:
++        takeoff, landing = detect_jump(frames)
++    with open(output, "w") as fh:
++        toml.dump({
++            "jump_takeoff_frame_number": takeoff,
++            "jump_land_frame_number": landing,
++        }, fh)
++    print(f"takeoff={takeoff} landing={landing}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 61

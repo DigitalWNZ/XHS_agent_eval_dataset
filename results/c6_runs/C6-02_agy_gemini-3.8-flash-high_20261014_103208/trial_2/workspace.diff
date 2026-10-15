@@ -1,0 +1,1571 @@
+diff --git a/drizzle-orm/src/gel-core/dialect.ts b/drizzle-orm/src/gel-core/dialect.ts
+index 6c154128..1195b426 100644
+--- a/drizzle-orm/src/gel-core/dialect.ts
++++ b/drizzle-orm/src/gel-core/dialect.ts
+@@ -25,6 +25,7 @@ import {
+ 	type TableRelationalConfig,
+ 	type TablesRelationalConfig,
+ } from '~/relations.ts';
++import { buildWindowSpecSql } from '~/sql/expressions/window.ts';
+ import { and, eq, View } from '~/sql/index.ts';
+ import {
+ 	type DriverValueEncoder,
+@@ -344,6 +345,7 @@ export class GelDialect {
+ 			joins,
+ 			orderBy,
+ 			groupBy,
++			windows,
+ 			limit,
+ 			offset,
+ 			lockingClause,
+@@ -432,8 +434,22 @@ export class GelDialect {
+ 			}
+ 			lockingClauseSql.append(clauseSql);
+ 		}
++
++		let windowSql: SQL | undefined;
++		if (windows && windows.length > 0) {
++			const windowChunks: SQL[] = [sql` window `];
++			for (const [i, w] of windows.entries()) {
++				const specSql = buildWindowSpecSql(w.spec);
++				windowChunks.push(sql`${sql.identifier(w.name)} as (${specSql})`);
++				if (i < windows.length - 1) {
++					windowChunks.push(sql`, `);
++				}
++			}
++			windowSql = sql.join(windowChunks);
++		}
++
+ 		const finalQuery =
+-			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
++			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
+ 
+ 		if (setOperators.length > 0) {
+ 			return this.buildSetOperations(finalQuery, setOperators);
+diff --git a/drizzle-orm/src/gel-core/query-builders/select.ts b/drizzle-orm/src/gel-core/query-builders/select.ts
+index 2e1f0675..ce470e1b 100644
+--- a/drizzle-orm/src/gel-core/query-builders/select.ts
++++ b/drizzle-orm/src/gel-core/query-builders/select.ts
+@@ -20,6 +20,7 @@ import type {
+ import { QueryPromise } from '~/query-promise.ts';
+ import type { RunnableQuery } from '~/runnable-query.ts';
+ import { SelectionProxyHandler } from '~/selection-proxy.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
+ import { SQL, View } from '~/sql/sql.ts';
+ import type { ColumnsSelection, Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
+ import { Subquery } from '~/subquery.ts';
+@@ -909,6 +910,48 @@ export abstract class GelSelectQueryBuilderBase<
+ 		return this as any;
+ 	}
+ 
++	/**
++	 * Adds a `window` clause to the query.
++	 *
++	 * Calling this method will specify named windows that can be referenced by window functions.
++	 *
++	 * @param name the window name.
++	 * @param spec the window specification.
++	 */
++	window(
++		name: string,
++		spec:
++			| WindowSpec
++			| SQLWrapper
++			| string
++			| ((aliases: this['_']['selection']) => WindowSpec | SQLWrapper | string),
++	): this {
++		if (typeof name !== 'string' || name.length === 0) {
++			throw new Error('Window name must be a non-empty string');
++		}
++		if (name.trim().length === 0) {
++			throw new Error('Window name cannot be whitespace-only');
++		}
++
++		let resolvedSpec: WindowSpec | SQLWrapper | string;
++		if (typeof spec === 'function') {
++			resolvedSpec = spec(
++				new Proxy(
++					this.config.fields,
++					new SelectionProxyHandler({ sqlAliasedBehavior: 'alias', sqlBehavior: 'sql' }),
++				) as TSelection,
++			);
++		} else {
++			resolvedSpec = spec;
++		}
++
++		if (!this.config.windows) {
++			this.config.windows = [];
++		}
++		this.config.windows.push({ name, spec: resolvedSpec as any });
++		return this;
++	}
++
+ 	/**
+ 	 * Adds a `limit` clause to the query.
+ 	 *
+diff --git a/drizzle-orm/src/gel-core/query-builders/select.types.ts b/drizzle-orm/src/gel-core/query-builders/select.types.ts
+index d8b85b36..2adcc433 100644
+--- a/drizzle-orm/src/gel-core/query-builders/select.types.ts
++++ b/drizzle-orm/src/gel-core/query-builders/select.types.ts
+@@ -20,6 +20,7 @@ import type {
+ 	SelectResult,
+ 	SetOperator,
+ } from '~/query-builders/select.types.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
+ import type { ColumnsSelection, Placeholder, SQL, SQLWrapper, View } from '~/sql/sql.ts';
+ import type { Subquery } from '~/subquery.ts';
+ import type { Table, UpdateTableConfig } from '~/table.ts';
+@@ -62,6 +63,10 @@ export interface GelSelectConfig {
+ 	joins?: GelSelectJoinConfig[];
+ 	orderBy?: (GelColumn | SQL | SQL.Aliased)[];
+ 	groupBy?: (GelColumn | SQL | SQL.Aliased)[];
++	windows?: {
++		name: string;
++		spec: WindowSpec | SQLWrapper;
++	}[];
+ 	lockingClause?: {
+ 		strength: LockStrength;
+ 		config: LockConfig;
+diff --git a/drizzle-orm/src/mysql-core/dialect.ts b/drizzle-orm/src/mysql-core/dialect.ts
+index 053ddc0c..373bdba5 100644
+--- a/drizzle-orm/src/mysql-core/dialect.ts
++++ b/drizzle-orm/src/mysql-core/dialect.ts
+@@ -17,6 +17,7 @@ import {
+ 	type TablesRelationalConfig,
+ } from '~/relations.ts';
+ import { and, eq } from '~/sql/expressions/index.ts';
++import { buildWindowSpecSql } from '~/sql/expressions/window.ts';
+ import { Param, SQL, sql, View } from '~/sql/sql.ts';
+ import type { Name, Placeholder, QueryWithTypings, SQLChunk } from '~/sql/sql.ts';
+ import { Subquery } from '~/subquery.ts';
+@@ -285,6 +286,7 @@ export class MySqlDialect {
+ 			joins,
+ 			orderBy,
+ 			groupBy,
++			windows,
+ 			limit,
+ 			offset,
+ 			lockingClause,
+@@ -417,8 +419,21 @@ export class MySqlDialect {
+ 			}
+ 		}
+ 
++		let windowSql: SQL | undefined;
++		if (windows && windows.length > 0) {
++			const windowChunks: SQL[] = [sql` window `];
++			for (const [i, w] of windows.entries()) {
++				const specSql = buildWindowSpecSql(w.spec);
++				windowChunks.push(sql`${sql.identifier(w.name)} as (${specSql})`);
++				if (i < windows.length - 1) {
++					windowChunks.push(sql`, `);
++				}
++			}
++			windowSql = sql.join(windowChunks);
++		}
++
+ 		const finalQuery =
+-			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${useIndexSql}${forceIndexSql}${ignoreIndexSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
++			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${useIndexSql}${forceIndexSql}${ignoreIndexSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
+ 
+ 		if (setOperators.length > 0) {
+ 			return this.buildSetOperations(finalQuery, setOperators);
+diff --git a/drizzle-orm/src/mysql-core/query-builders/select.ts b/drizzle-orm/src/mysql-core/query-builders/select.ts
+index 374f36b8..86d1fc9c 100644
+--- a/drizzle-orm/src/mysql-core/query-builders/select.ts
++++ b/drizzle-orm/src/mysql-core/query-builders/select.ts
+@@ -17,7 +17,8 @@ import type {
+ } from '~/query-builders/select.types.ts';
+ import { QueryPromise } from '~/query-promise.ts';
+ import { SelectionProxyHandler } from '~/selection-proxy.ts';
+-import type { ColumnsSelection, Placeholder, Query } from '~/sql/sql.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
++import type { ColumnsSelection, Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
+ import { SQL, View } from '~/sql/sql.ts';
+ import { Subquery } from '~/subquery.ts';
+ import { Table } from '~/table.ts';
+@@ -963,6 +964,48 @@ export abstract class MySqlSelectQueryBuilderBase<
+ 		return this as any;
+ 	}
+ 
++	/**
++	 * Adds a `window` clause to the query.
++	 *
++	 * Calling this method will specify named windows that can be referenced by window functions.
++	 *
++	 * @param name the window name.
++	 * @param spec the window specification.
++	 */
++	window(
++		name: string,
++		spec:
++			| WindowSpec
++			| SQLWrapper
++			| string
++			| ((aliases: this['_']['selection']) => WindowSpec | SQLWrapper | string),
++	): this {
++		if (typeof name !== 'string' || name.length === 0) {
++			throw new Error('Window name must be a non-empty string');
++		}
++		if (name.trim().length === 0) {
++			throw new Error('Window name cannot be whitespace-only');
++		}
++
++		let resolvedSpec: WindowSpec | SQLWrapper | string;
++		if (typeof spec === 'function') {
++			resolvedSpec = spec(
++				new Proxy(
++					this.config.fields,
++					new SelectionProxyHandler({ sqlAliasedBehavior: 'alias', sqlBehavior: 'sql' }),
++				) as TSelection,
++			);
++		} else {
++			resolvedSpec = spec;
++		}
++
++		if (!this.config.windows) {
++			this.config.windows = [];
++		}
++		this.config.windows.push({ name, spec: resolvedSpec as any });
++		return this;
++	}
++
+ 	/**
+ 	 * Adds a `limit` clause to the query.
+ 	 *
+diff --git a/drizzle-orm/src/mysql-core/query-builders/select.types.ts b/drizzle-orm/src/mysql-core/query-builders/select.types.ts
+index b86d1d92..6d6f53e9 100644
+--- a/drizzle-orm/src/mysql-core/query-builders/select.types.ts
++++ b/drizzle-orm/src/mysql-core/query-builders/select.types.ts
+@@ -18,7 +18,8 @@ import type {
+ 	SelectResult,
+ 	SetOperator,
+ } from '~/query-builders/select.types.ts';
+-import type { ColumnsSelection, Placeholder, SQL, View } from '~/sql/sql.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
++import type { ColumnsSelection, Placeholder, SQL, SQLWrapper, View } from '~/sql/sql.ts';
+ import type { Subquery } from '~/subquery.ts';
+ import type { Table, UpdateTableConfig } from '~/table.ts';
+ import type { Assume, ValidateShape } from '~/utils.ts';
+@@ -66,6 +67,10 @@ export interface MySqlSelectConfig {
+ 	joins?: MySqlSelectJoinConfig[];
+ 	orderBy?: (MySqlColumn | SQL | SQL.Aliased)[];
+ 	groupBy?: (MySqlColumn | SQL | SQL.Aliased)[];
++	windows?: {
++		name: string;
++		spec: WindowSpec | SQLWrapper;
++	}[];
+ 	lockingClause?: {
+ 		strength: LockStrength;
+ 		config: LockConfig;
+diff --git a/drizzle-orm/src/pg-core/dialect.ts b/drizzle-orm/src/pg-core/dialect.ts
+index be5ecdb2..694b9f50 100644
+--- a/drizzle-orm/src/pg-core/dialect.ts
++++ b/drizzle-orm/src/pg-core/dialect.ts
+@@ -37,6 +37,7 @@ import {
+ 	type TableRelationalConfig,
+ 	type TablesRelationalConfig,
+ } from '~/relations.ts';
++import { buildWindowSpecSql } from '~/sql/expressions/window.ts';
+ import { and, eq, View } from '~/sql/index.ts';
+ import {
+ 	type DriverValueEncoder,
+@@ -349,6 +350,7 @@ export class PgDialect {
+ 			joins,
+ 			orderBy,
+ 			groupBy,
++			windows,
+ 			limit,
+ 			offset,
+ 			lockingClause,
+@@ -437,8 +439,22 @@ export class PgDialect {
+ 			}
+ 			lockingClauseSql.append(clauseSql);
+ 		}
++
++		let windowSql: SQL | undefined;
++		if (windows && windows.length > 0) {
++			const windowChunks: SQL[] = [sql` window `];
++			for (const [i, w] of windows.entries()) {
++				const specSql = buildWindowSpecSql(w.spec);
++				windowChunks.push(sql`${sql.identifier(w.name)} as (${specSql})`);
++				if (i < windows.length - 1) {
++					windowChunks.push(sql`, `);
++				}
++			}
++			windowSql = sql.join(windowChunks);
++		}
++
+ 		const finalQuery =
+-			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
++			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
+ 
+ 		if (setOperators.length > 0) {
+ 			return this.buildSetOperations(finalQuery, setOperators);
+diff --git a/drizzle-orm/src/pg-core/query-builders/select.ts b/drizzle-orm/src/pg-core/query-builders/select.ts
+index dafdb963..bf709a31 100644
+--- a/drizzle-orm/src/pg-core/query-builders/select.ts
++++ b/drizzle-orm/src/pg-core/query-builders/select.ts
+@@ -20,6 +20,7 @@ import type {
+ import { QueryPromise } from '~/query-promise.ts';
+ import type { RunnableQuery } from '~/runnable-query.ts';
+ import { SelectionProxyHandler } from '~/selection-proxy.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
+ import { SQL, View } from '~/sql/sql.ts';
+ import type { ColumnsSelection, Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
+ import { Subquery } from '~/subquery.ts';
+@@ -916,6 +917,48 @@ export abstract class PgSelectQueryBuilderBase<
+ 		return this as any;
+ 	}
+ 
++	/**
++	 * Adds a `window` clause to the query.
++	 *
++	 * Calling this method will specify named windows that can be referenced by window functions.
++	 *
++	 * @param name the window name.
++	 * @param spec the window specification.
++	 */
++	window(
++		name: string,
++		spec:
++			| WindowSpec
++			| SQLWrapper
++			| string
++			| ((aliases: this['_']['selection']) => WindowSpec | SQLWrapper | string),
++	): this {
++		if (typeof name !== 'string' || name.length === 0) {
++			throw new Error('Window name must be a non-empty string');
++		}
++		if (name.trim().length === 0) {
++			throw new Error('Window name cannot be whitespace-only');
++		}
++
++		let resolvedSpec: WindowSpec | SQLWrapper | string;
++		if (typeof spec === 'function') {
++			resolvedSpec = spec(
++				new Proxy(
++					this.config.fields,
++					new SelectionProxyHandler({ sqlAliasedBehavior: 'alias', sqlBehavior: 'sql' }),
++				) as TSelection,
++			);
++		} else {
++			resolvedSpec = spec;
++		}
++
++		if (!this.config.windows) {
++			this.config.windows = [];
++		}
++		this.config.windows.push({ name, spec: resolvedSpec as any });
++		return this;
++	}
++
+ 	/**
+ 	 * Adds a `limit` clause to the query.
+ 	 *
+diff --git a/drizzle-orm/src/pg-core/query-builders/select.types.ts b/drizzle-orm/src/pg-core/query-builders/select.types.ts
+index 6a120306..ce1384d1 100644
+--- a/drizzle-orm/src/pg-core/query-builders/select.types.ts
++++ b/drizzle-orm/src/pg-core/query-builders/select.types.ts
+@@ -20,6 +20,7 @@ import type {
+ 	SelectResult,
+ 	SetOperator,
+ } from '~/query-builders/select.types.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
+ import type { ColumnsSelection, Placeholder, SQL, SQLWrapper, View } from '~/sql/sql.ts';
+ import type { Subquery } from '~/subquery.ts';
+ import type { Table, UpdateTableConfig } from '~/table.ts';
+@@ -62,6 +63,10 @@ export interface PgSelectConfig {
+ 	joins?: PgSelectJoinConfig[];
+ 	orderBy?: (PgColumn | SQL | SQL.Aliased)[];
+ 	groupBy?: (PgColumn | SQL | SQL.Aliased)[];
++	windows?: {
++		name: string;
++		spec: WindowSpec | SQLWrapper;
++	}[];
+ 	lockingClause?: {
+ 		strength: LockStrength;
+ 		config: LockConfig;
+diff --git a/drizzle-orm/src/singlestore-core/dialect.ts b/drizzle-orm/src/singlestore-core/dialect.ts
+index b0791c35..a54f9303 100644
+--- a/drizzle-orm/src/singlestore-core/dialect.ts
++++ b/drizzle-orm/src/singlestore-core/dialect.ts
+@@ -17,6 +17,7 @@ import {
+ 	type TablesRelationalConfig,
+ } from '~/relations.ts';
+ import { and, eq } from '~/sql/expressions/index.ts';
++import { buildWindowSpecSql } from '~/sql/expressions/window.ts';
+ import type { Name, Placeholder, QueryWithTypings, SQLChunk } from '~/sql/sql.ts';
+ import { Param, SQL, sql, View } from '~/sql/sql.ts';
+ import { Subquery } from '~/subquery.ts';
+@@ -272,6 +273,7 @@ export class SingleStoreDialect {
+ 			joins,
+ 			orderBy,
+ 			groupBy,
++			windows,
+ 			limit,
+ 			offset,
+ 			lockingClause,
+@@ -390,8 +392,21 @@ export class SingleStoreDialect {
+ 			}
+ 		}
+ 
++		let windowSql: SQL | undefined;
++		if (windows && windows.length > 0) {
++			const windowChunks: SQL[] = [sql` window `];
++			for (const [i, w] of windows.entries()) {
++				const specSql = buildWindowSpecSql(w.spec);
++				windowChunks.push(sql`${sql.identifier(w.name)} as (${specSql})`);
++				if (i < windows.length - 1) {
++					windowChunks.push(sql`, `);
++				}
++			}
++			windowSql = sql.join(windowChunks);
++		}
++
+ 		const finalQuery =
+-			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
++			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
+ 
+ 		if (setOperators.length > 0) {
+ 			return this.buildSetOperations(finalQuery, setOperators);
+diff --git a/drizzle-orm/src/singlestore-core/query-builders/select.ts b/drizzle-orm/src/singlestore-core/query-builders/select.ts
+index 5b0fb39f..03c6212e 100644
+--- a/drizzle-orm/src/singlestore-core/query-builders/select.ts
++++ b/drizzle-orm/src/singlestore-core/query-builders/select.ts
+@@ -22,7 +22,8 @@ import type {
+ } from '~/singlestore-core/session.ts';
+ import type { SubqueryWithSelection } from '~/singlestore-core/subquery.ts';
+ import type { SingleStoreTable } from '~/singlestore-core/table.ts';
+-import type { ColumnsSelection, Query } from '~/sql/sql.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
++import type { ColumnsSelection, Query, SQLWrapper } from '~/sql/sql.ts';
+ import { SQL } from '~/sql/sql.ts';
+ import { Subquery } from '~/subquery.ts';
+ import { Table } from '~/table.ts';
+@@ -836,6 +837,48 @@ export abstract class SingleStoreSelectQueryBuilderBase<
+ 		return this as any;
+ 	}
+ 
++	/**
++	 * Adds a `window` clause to the query.
++	 *
++	 * Calling this method will specify named windows that can be referenced by window functions.
++	 *
++	 * @param name the window name.
++	 * @param spec the window specification.
++	 */
++	window(
++		name: string,
++		spec:
++			| WindowSpec
++			| SQLWrapper
++			| string
++			| ((aliases: this['_']['selection']) => WindowSpec | SQLWrapper | string),
++	): this {
++		if (typeof name !== 'string' || name.length === 0) {
++			throw new Error('Window name must be a non-empty string');
++		}
++		if (name.trim().length === 0) {
++			throw new Error('Window name cannot be whitespace-only');
++		}
++
++		let resolvedSpec: WindowSpec | SQLWrapper | string;
++		if (typeof spec === 'function') {
++			resolvedSpec = spec(
++				new Proxy(
++					this.config.fields,
++					new SelectionProxyHandler({ sqlAliasedBehavior: 'alias', sqlBehavior: 'sql' }),
++				) as TSelection,
++			);
++		} else {
++			resolvedSpec = spec;
++		}
++
++		if (!this.config.windows) {
++			this.config.windows = [];
++		}
++		this.config.windows.push({ name, spec: resolvedSpec as any });
++		return this;
++	}
++
+ 	/**
+ 	 * Adds a `limit` clause to the query.
+ 	 *
+diff --git a/drizzle-orm/src/singlestore-core/query-builders/select.types.ts b/drizzle-orm/src/singlestore-core/query-builders/select.types.ts
+index 0108edad..bccb7e07 100644
+--- a/drizzle-orm/src/singlestore-core/query-builders/select.types.ts
++++ b/drizzle-orm/src/singlestore-core/query-builders/select.types.ts
+@@ -18,7 +18,8 @@ import type {
+ } from '~/query-builders/select.types.ts';
+ import type { SingleStoreColumn } from '~/singlestore-core/columns/index.ts';
+ import type { SingleStoreTable, SingleStoreTableWithColumns } from '~/singlestore-core/table.ts';
+-import type { ColumnsSelection, Placeholder, SQL, View } from '~/sql/sql.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
++import type { ColumnsSelection, Placeholder, SQL, SQLWrapper, View } from '~/sql/sql.ts';
+ import type { Subquery } from '~/subquery.ts';
+ import type { Table, UpdateTableConfig } from '~/table.ts';
+ import type { Assume, ValidateShape } from '~/utils.ts';
+@@ -61,6 +62,10 @@ export interface SingleStoreSelectConfig {
+ 	joins?: SingleStoreSelectJoinConfig[];
+ 	orderBy?: (SingleStoreColumn | SQL | SQL.Aliased)[];
+ 	groupBy?: (SingleStoreColumn | SQL | SQL.Aliased)[];
++	windows?: {
++		name: string;
++		spec: WindowSpec | SQLWrapper;
++	}[];
+ 	lockingClause?: {
+ 		strength: LockStrength;
+ 		config: LockConfig;
+diff --git a/drizzle-orm/src/sql/expressions/index.ts b/drizzle-orm/src/sql/expressions/index.ts
+index b27ea76f..670e9480 100644
+--- a/drizzle-orm/src/sql/expressions/index.ts
++++ b/drizzle-orm/src/sql/expressions/index.ts
+@@ -1,2 +1,3 @@
+ export * from './conditions.ts';
+ export * from './select.ts';
++export * from './window.ts';
+diff --git a/drizzle-orm/src/sql/expressions/window.ts b/drizzle-orm/src/sql/expressions/window.ts
+new file mode 100644
+index 00000000..1998eef6
+--- /dev/null
++++ b/drizzle-orm/src/sql/expressions/window.ts
+@@ -0,0 +1,323 @@
++import { type AnyColumn, Column } from '~/column.ts';
++import { entityKind, is } from '~/entity.ts';
++import { isSQLWrapper, SQL, sql, type SQLWrapper } from '../sql.ts';
++
++export type GetColumnOrSqlDataType<T, TFallback = unknown> = T extends Column ? T['_']['data']
++	: T extends SQL<infer U> ? U
++	: T extends SQL.Aliased<infer U> ? U
++	: T extends SQLWrapper ? TFallback
++	: T;
++
++export class FrameBoundary implements SQLWrapper {
++	static readonly [entityKind]: string = 'FrameBoundary';
++
++	constructor(
++		readonly type: 'unboundedPreceding' | 'preceding' | 'currentRow' | 'following' | 'unboundedFollowing',
++		readonly order: number,
++		readonly sqlChunk: SQL,
++		readonly offset?: number,
++	) {}
++
++	getSQL(): SQL {
++		return this.sqlChunk;
++	}
++}
++
++export const unboundedPreceding = new FrameBoundary('unboundedPreceding', -Infinity, sql`unbounded preceding`);
++export const currentRow = new FrameBoundary('currentRow', 0, sql`current row`);
++export const unboundedFollowing = new FrameBoundary('unboundedFollowing', Infinity, sql`unbounded following`);
++
++export function preceding(offset: number): FrameBoundary {
++	if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0) {
++		throw new Error(`preceding: expected non-negative integer, received ${offset}`);
++	}
++	return new FrameBoundary('preceding', -offset, sql`${sql.raw(String(offset))} preceding`, offset);
++}
++
++export function following(offset: number): FrameBoundary {
++	if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0) {
++		throw new Error(`following: expected non-negative integer, received ${offset}`);
++	}
++	return new FrameBoundary('following', offset, sql`${sql.raw(String(offset))} following`, offset);
++}
++
++export interface FrameSpec {
++	from: FrameBoundary;
++	to?: FrameBoundary;
++}
++
++function validateFrame(type: 'rows' | 'range', spec: FrameSpec): void {
++	if (!spec || !spec.from) {
++		throw new Error(`${type}: specification must include a 'from' boundary`);
++	}
++	if (spec.to !== undefined) {
++		const fromOrder = typeof spec.from === 'object' && 'order' in spec.from ? spec.from.order : 0;
++		const toOrder = typeof spec.to === 'object' && 'order' in spec.to ? spec.to.order : 0;
++		if (fromOrder > toOrder) {
++			throw new Error(`${type}: 'from' boundary cannot be ordered after 'to' boundary`);
++		}
++	}
++}
++
++export class Frame implements SQLWrapper {
++	static readonly [entityKind]: string = 'Frame';
++
++	constructor(
++		readonly type: 'rows' | 'range',
++		readonly spec: FrameSpec,
++	) {}
++
++	getSQL(): SQL {
++		if (this.spec.to !== undefined) {
++			return sql`${sql.raw(this.type)} between ${this.spec.from.getSQL()} and ${this.spec.to.getSQL()}`;
++		}
++		return sql`${sql.raw(this.type)} ${this.spec.from.getSQL()}`;
++	}
++}
++
++export function rows(spec: FrameSpec): Frame {
++	validateFrame('rows', spec);
++	return new Frame('rows', spec);
++}
++
++export function range(spec: FrameSpec): Frame {
++	validateFrame('range', spec);
++	return new Frame('range', spec);
++}
++
++export interface WindowSpec {
++	partitionBy?: AnyColumn | SQL | SQL.Aliased | SQLWrapper | (AnyColumn | SQL | SQL.Aliased | SQLWrapper)[];
++	orderBy?: AnyColumn | SQL | SQL.Aliased | SQLWrapper | (AnyColumn | SQL | SQL.Aliased | SQLWrapper)[];
++	frame?: Frame | SQLWrapper;
++}
++
++export function buildWindowSpecSql(spec?: WindowSpec | SQLWrapper | string): SQL {
++	if (!spec) {
++		return sql.empty();
++	}
++	if (typeof spec === 'string') {
++		return sql`${sql.identifier(spec)}`;
++	}
++	if (isSQLWrapper(spec)) {
++		return spec.getSQL();
++	}
++	const chunks: SQL[] = [];
++
++	if (spec.partitionBy) {
++		const parts = Array.isArray(spec.partitionBy) ? spec.partitionBy : [spec.partitionBy];
++		const filteredParts = parts.filter((p) => p !== undefined && p !== null);
++		if (filteredParts.length > 0) {
++			chunks.push(sql`partition by ${sql.join(filteredParts, sql`, `)}`);
++		}
++	}
++
++	if (spec.orderBy) {
++		const orders = Array.isArray(spec.orderBy) ? spec.orderBy : [spec.orderBy];
++		const filteredOrders = orders.filter((o) => o !== undefined && o !== null);
++		if (filteredOrders.length > 0) {
++			chunks.push(sql`order by ${sql.join(filteredOrders, sql`, `)}`);
++		}
++	}
++
++	if (spec.frame) {
++		chunks.push(spec.frame.getSQL());
++	}
++
++	if (chunks.length === 0) {
++		return sql.empty();
++	}
++
++	return sql.join(chunks, sql` `);
++}
++
++export class WindowBuilder<T = unknown> {
++	static readonly [entityKind]: string = 'WindowBuilder';
++
++	constructor(protected readonly sqlFn: SQL) {}
++
++	over(spec?: WindowSpec | string): SQL<T> {
++		let overClause: SQL;
++		if (typeof spec === 'string') {
++			if (spec.length === 0) {
++				throw new Error('Window name must be a non-empty string');
++			}
++			if (spec.trim().length === 0) {
++				throw new Error('Window name cannot be whitespace-only');
++			}
++			overClause = sql`over ${sql.identifier(spec)}`;
++		} else if (!spec) {
++			overClause = sql`over ()`;
++		} else {
++			const specSql = buildWindowSpecSql(spec);
++			if (specSql.queryChunks.length === 0) {
++				overClause = sql`over ()`;
++			} else {
++				overClause = sql`over (${specSql})`;
++			}
++		}
++
++		const result = sql<T>`${this.sqlFn} ${overClause}`;
++		result.decoder = this.sqlFn.decoder as any;
++		return result;
++	}
++}
++
++// Ranking helpers
++export function rowNumber(): WindowBuilder<SQL<number>> {
++	const sqlFn = sql`row_number()`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
++
++export function rank(): WindowBuilder<SQL<number>> {
++	const sqlFn = sql`rank()`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
++
++export function denseRank(): WindowBuilder<SQL<number>> {
++	const sqlFn = sql`dense_rank()`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
++
++export function ntile(n: number | SQLWrapper): WindowBuilder<SQL<number>> {
++	if (typeof n === 'number') {
++		if (!Number.isInteger(n) || n <= 0) {
++			throw new Error(`ntile: expected positive integer, received ${n}`);
++		}
++	} else if (!isSQLWrapper(n)) {
++		throw new Error(`ntile: expected positive integer, received ${n}`);
++	}
++	const nSql = typeof n === 'number' ? sql.raw(String(n)) : n;
++	const sqlFn = sql`ntile(${nSql})`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
++
++export function percentRank(): WindowBuilder<SQL<number>> {
++	const sqlFn = sql`percent_rank()`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
++
++export function cumeDist(): WindowBuilder<SQL<number>> {
++	const sqlFn = sql`cume_dist()`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
++
++// Offset helpers
++export function firstValue<T extends SQLWrapper>(
++	value: T,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>> {
++	const sqlFn = sql`first_value(${value})`.mapWith(is(value, Column) ? value : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++export function lastValue<T extends SQLWrapper>(
++	value: T,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>> {
++	const sqlFn = sql`last_value(${value})`.mapWith(is(value, Column) ? value : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++export function nthValue<T extends SQLWrapper>(
++	value: T,
++	n: number | SQLWrapper,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>> {
++	if (typeof n === 'number') {
++		if (!Number.isInteger(n) || n <= 0) {
++			throw new Error(`nthValue: expected positive integer, received ${n}`);
++		}
++	} else if (!isSQLWrapper(n)) {
++		throw new Error(`nthValue: expected positive integer, received ${n}`);
++	}
++	const nSql = typeof n === 'number' ? sql.raw(String(n)) : n;
++	const sqlFn = sql`nth_value(${value}, ${nSql})`.mapWith(is(value, Column) ? value : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++export function lag<T extends SQLWrapper>(
++	value: T,
++	offset?: number | SQLWrapper,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>>;
++export function lag<T extends SQLWrapper, TDefault = GetColumnOrSqlDataType<T>>(
++	value: T,
++	offset: number | SQLWrapper | undefined,
++	defaultValue: TDefault | SQLWrapper,
++): WindowBuilder<SQL<Exclude<GetColumnOrSqlDataType<T>, null> | GetColumnOrSqlDataType<TDefault>>>;
++export function lag(
++	value: SQLWrapper,
++	offset?: number | SQLWrapper,
++	defaultValue?: unknown,
++): WindowBuilder<any> {
++	let sqlFn: SQL;
++	if (defaultValue !== undefined) {
++		const offsetSql = offset !== undefined
++			? (typeof offset === 'number' ? sql.raw(String(offset)) : offset)
++			: sql.raw('1');
++		sqlFn = sql`lag(${value}, ${offsetSql}, ${defaultValue as any})`;
++	} else if (offset !== undefined) {
++		const offsetSql = typeof offset === 'number' ? sql.raw(String(offset)) : offset;
++		sqlFn = sql`lag(${value}, ${offsetSql})`;
++	} else {
++		sqlFn = sql`lag(${value})`;
++	}
++	sqlFn.mapWith(is(value, Column) ? value : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++export function lead<T extends SQLWrapper>(
++	value: T,
++	offset?: number | SQLWrapper,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>>;
++export function lead<T extends SQLWrapper, TDefault = GetColumnOrSqlDataType<T>>(
++	value: T,
++	offset: number | SQLWrapper | undefined,
++	defaultValue: TDefault | SQLWrapper,
++): WindowBuilder<SQL<Exclude<GetColumnOrSqlDataType<T>, null> | GetColumnOrSqlDataType<TDefault>>>;
++export function lead(
++	value: SQLWrapper,
++	offset?: number | SQLWrapper,
++	defaultValue?: unknown,
++): WindowBuilder<any> {
++	let sqlFn: SQL;
++	if (defaultValue !== undefined) {
++		const offsetSql = offset !== undefined
++			? (typeof offset === 'number' ? sql.raw(String(offset)) : offset)
++			: sql.raw('1');
++		sqlFn = sql`lead(${value}, ${offsetSql}, ${defaultValue as any})`;
++	} else if (offset !== undefined) {
++		const offsetSql = typeof offset === 'number' ? sql.raw(String(offset)) : offset;
++		sqlFn = sql`lead(${value}, ${offsetSql})`;
++	} else {
++		sqlFn = sql`lead(${value})`;
++	}
++	sqlFn.mapWith(is(value, Column) ? value : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++// Aggregate helpers
++export function windowSum(expression: SQLWrapper): WindowBuilder<SQL<string | null>> {
++	const sqlFn = sql`sum(${expression})`.mapWith(String);
++	return new WindowBuilder(sqlFn);
++}
++
++export function windowAvg(expression: SQLWrapper): WindowBuilder<SQL<string | null>> {
++	const sqlFn = sql`avg(${expression})`.mapWith(String);
++	return new WindowBuilder(sqlFn);
++}
++
++export function windowMin<T extends SQLWrapper>(
++	expression: T,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>> {
++	const sqlFn = sql`min(${expression})`.mapWith(is(expression, Column) ? expression : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++export function windowMax<T extends SQLWrapper>(
++	expression: T,
++): WindowBuilder<SQL<GetColumnOrSqlDataType<T> | null>> {
++	const sqlFn = sql`max(${expression})`.mapWith(is(expression, Column) ? expression : (String as any));
++	return new WindowBuilder(sqlFn);
++}
++
++export function windowCount(expression?: SQLWrapper): WindowBuilder<SQL<number>> {
++	const sqlFn = sql`count(${expression || sql.raw('*')})`.mapWith(Number);
++	return new WindowBuilder(sqlFn);
++}
+diff --git a/drizzle-orm/src/sqlite-core/dialect.ts b/drizzle-orm/src/sqlite-core/dialect.ts
+index 317c8df1..1cd9ee8e 100644
+--- a/drizzle-orm/src/sqlite-core/dialect.ts
++++ b/drizzle-orm/src/sqlite-core/dialect.ts
+@@ -17,6 +17,7 @@ import {
+ 	type TableRelationalConfig,
+ 	type TablesRelationalConfig,
+ } from '~/relations.ts';
++import { buildWindowSpecSql } from '~/sql/expressions/window.ts';
+ import type { Name, Placeholder } from '~/sql/index.ts';
+ import { and, eq } from '~/sql/index.ts';
+ import { Param, type QueryWithTypings, SQL, sql, type SQLChunk } from '~/sql/sql.ts';
+@@ -311,6 +312,7 @@ export abstract class SQLiteDialect {
+ 			joins,
+ 			orderBy,
+ 			groupBy,
++			windows,
+ 			limit,
+ 			offset,
+ 			distinct,
+@@ -378,8 +380,21 @@ export abstract class SQLiteDialect {
+ 
+ 		const offsetSql = offset ? sql` offset ${offset}` : undefined;
+ 
++		let windowSql: SQL | undefined;
++		if (windows && windows.length > 0) {
++			const windowChunks: SQL[] = [sql` window `];
++			for (const [i, w] of windows.entries()) {
++				const specSql = buildWindowSpecSql(w.spec);
++				windowChunks.push(sql`${sql.identifier(w.name)} as (${specSql})`);
++				if (i < windows.length - 1) {
++					windowChunks.push(sql`, `);
++				}
++			}
++			windowSql = sql.join(windowChunks);
++		}
++
+ 		const finalQuery =
+-			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}`;
++			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowSql}${orderBySql}${limitSql}${offsetSql}`;
+ 
+ 		if (setOperators.length > 0) {
+ 			return this.buildSetOperations(finalQuery, setOperators);
+diff --git a/drizzle-orm/src/sqlite-core/query-builders/select.ts b/drizzle-orm/src/sqlite-core/query-builders/select.ts
+index 950d26f6..0783ccc3 100644
+--- a/drizzle-orm/src/sqlite-core/query-builders/select.ts
++++ b/drizzle-orm/src/sqlite-core/query-builders/select.ts
+@@ -14,6 +14,7 @@ import type {
+ import { QueryPromise } from '~/query-promise.ts';
+ import type { RunnableQuery } from '~/runnable-query.ts';
+ import { SelectionProxyHandler } from '~/selection-proxy.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
+ import { SQL, View } from '~/sql/sql.ts';
+ import type { ColumnsSelection, Placeholder, Query, SQLWrapper } from '~/sql/sql.ts';
+ import type { SQLiteColumn } from '~/sqlite-core/columns/index.ts';
+@@ -764,6 +765,48 @@ export abstract class SQLiteSelectQueryBuilderBase<
+ 		return this as any;
+ 	}
+ 
++	/**
++	 * Adds a `window` clause to the query.
++	 *
++	 * Calling this method will specify named windows that can be referenced by window functions.
++	 *
++	 * @param name the window name.
++	 * @param spec the window specification.
++	 */
++	window(
++		name: string,
++		spec:
++			| WindowSpec
++			| SQLWrapper
++			| string
++			| ((aliases: this['_']['selection']) => WindowSpec | SQLWrapper | string),
++	): this {
++		if (typeof name !== 'string' || name.length === 0) {
++			throw new Error('Window name must be a non-empty string');
++		}
++		if (name.trim().length === 0) {
++			throw new Error('Window name cannot be whitespace-only');
++		}
++
++		let resolvedSpec: WindowSpec | SQLWrapper | string;
++		if (typeof spec === 'function') {
++			resolvedSpec = spec(
++				new Proxy(
++					this.config.fields,
++					new SelectionProxyHandler({ sqlAliasedBehavior: 'alias', sqlBehavior: 'sql' }),
++				) as TSelection,
++			);
++		} else {
++			resolvedSpec = spec;
++		}
++
++		if (!this.config.windows) {
++			this.config.windows = [];
++		}
++		this.config.windows.push({ name, spec: resolvedSpec as any });
++		return this;
++	}
++
+ 	/**
+ 	 * Adds a `limit` clause to the query.
+ 	 *
+diff --git a/drizzle-orm/src/sqlite-core/query-builders/select.types.ts b/drizzle-orm/src/sqlite-core/query-builders/select.types.ts
+index b19aa1c4..92726aa7 100644
+--- a/drizzle-orm/src/sqlite-core/query-builders/select.types.ts
++++ b/drizzle-orm/src/sqlite-core/query-builders/select.types.ts
+@@ -1,4 +1,5 @@
+-import type { ColumnsSelection, Placeholder, SQL, View } from '~/sql/sql.ts';
++import type { WindowSpec } from '~/sql/expressions/window.ts';
++import type { ColumnsSelection, Placeholder, SQL, SQLWrapper, View } from '~/sql/sql.ts';
+ import type { SQLiteColumn } from '~/sqlite-core/columns/index.ts';
+ import type { SQLiteTable, SQLiteTableWithColumns } from '~/sqlite-core/table.ts';
+ import type { Assume, ValidateShape } from '~/utils.ts';
+@@ -61,6 +62,10 @@ export interface SQLiteSelectConfig {
+ 	joins?: SQLiteSelectJoinConfig[];
+ 	orderBy?: (SQLiteColumn | SQL | SQL.Aliased)[];
+ 	groupBy?: (SQLiteColumn | SQL | SQL.Aliased)[];
++	windows?: {
++		name: string;
++		spec: WindowSpec | SQLWrapper;
++	}[];
+ 	distinct?: boolean;
+ 	setOperators: {
+ 		rightSelect: TypedQueryBuilder<any, any>;
+diff --git a/drizzle-orm/tests/window.test.ts b/drizzle-orm/tests/window.test.ts
+new file mode 100644
+index 00000000..2aefa845
+--- /dev/null
++++ b/drizzle-orm/tests/window.test.ts
+@@ -0,0 +1,584 @@
++import { describe, expect, expectTypeOf, test } from 'vitest';
++import { gelTable, integer as gelInteger, text as gelText } from '~/gel-core/index.ts';
++import { QueryBuilder as GelQueryBuilder } from '~/gel-core/query-builders/query-builder.ts';
++import {
++	asc,
++	cumeDist,
++	currentRow,
++	denseRank,
++	desc,
++	firstValue,
++	following,
++	lag,
++	lastValue,
++	lead,
++	nthValue,
++	ntile,
++	percentRank,
++	preceding,
++	range,
++	rank,
++	rowNumber,
++	rows,
++	unboundedFollowing,
++	unboundedPreceding,
++	windowAvg,
++	WindowBuilder,
++	windowCount,
++	windowMax,
++	windowMin,
++	windowSum,
++} from '~/index.ts';
++import { mysqlTable, serial as mysqlSerial, varchar } from '~/mysql-core/index.ts';
++import { QueryBuilder as MySqlQueryBuilder } from '~/mysql-core/query-builders/query-builder.ts';
++import { integer as pgInteger, pgTable as pgTableCore, serial as pgSerial, text as pgText } from '~/pg-core/index.ts';
++import { QueryBuilder as PgQueryBuilder } from '~/pg-core/query-builders/query-builder.ts';
++import {
++	serial as singleStoreSerial,
++	singlestoreTable,
++	varchar as singleStoreVarchar,
++} from '~/singlestore-core/index.ts';
++import { QueryBuilder as SingleStoreQueryBuilder } from '~/singlestore-core/query-builders/query-builder.ts';
++import type { SQL } from '~/sql/index.ts';
++import { integer as sqliteInteger, sqliteTable, text as sqliteText } from '~/sqlite-core/index.ts';
++import { QueryBuilder as SQLiteQueryBuilder } from '~/sqlite-core/query-builders/query-builder.ts';
++
++const users = pgTableCore('users', {
++	id: pgSerial('id').primaryKey(),
++	name: pgText('name').notNull(),
++	dept: pgText('dept').notNull(),
++	salary: pgInteger('salary').notNull(),
++	bio: pgText('bio'),
++});
++
++const mysqlUsers = mysqlTable('users', {
++	id: mysqlSerial('id').primaryKey(),
++	name: varchar('name', { length: 255 }).notNull(),
++	dept: varchar('dept', { length: 255 }).notNull(),
++});
++
++const sqliteUsers = sqliteTable('users', {
++	id: sqliteInteger('id').primaryKey(),
++	name: sqliteText('name').notNull(),
++	dept: sqliteText('dept').notNull(),
++});
++
++const singleStoreUsers = singlestoreTable('users', {
++	id: singleStoreSerial('id').primaryKey(),
++	name: singleStoreVarchar('name', { length: 255 }).notNull(),
++	dept: singleStoreVarchar('dept', { length: 255 }).notNull(),
++});
++
++const gelUsers = gelTable('users', {
++	id: gelInteger('id').primaryKey(),
++	name: gelText('name').notNull(),
++	dept: gelText('dept').notNull(),
++});
++
++describe('Window functions: Acceptance Criteria 1 - Snake case SQL names', () => {
++	const qb = new PgQueryBuilder();
++
++	test('rowNumber compiles to row_number()', () => {
++		const query = qb.select({ val: rowNumber().over() }).from(users).toSQL();
++		expect(query.sql).toContain('row_number() over ()');
++	});
++
++	test('rank compiles to rank()', () => {
++		const query = qb.select({ val: rank().over() }).from(users).toSQL();
++		expect(query.sql).toContain('rank() over ()');
++	});
++
++	test('denseRank compiles to dense_rank()', () => {
++		const query = qb.select({ val: denseRank().over() }).from(users).toSQL();
++		expect(query.sql).toContain('dense_rank() over ()');
++	});
++
++	test('ntile compiles to ntile(n)', () => {
++		const query = qb.select({ val: ntile(4).over() }).from(users).toSQL();
++		expect(query.sql).toContain('ntile(4) over ()');
++	});
++
++	test('percentRank compiles to percent_rank()', () => {
++		const query = qb.select({ val: percentRank().over() }).from(users).toSQL();
++		expect(query.sql).toContain('percent_rank() over ()');
++	});
++
++	test('cumeDist compiles to cume_dist()', () => {
++		const query = qb.select({ val: cumeDist().over() }).from(users).toSQL();
++		expect(query.sql).toContain('cume_dist() over ()');
++	});
++
++	test('lag compiles to lag(...)', () => {
++		const query = qb.select({ val: lag(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('lag("users"."salary") over ()');
++	});
++
++	test('lead compiles to lead(...)', () => {
++		const query = qb.select({ val: lead(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('lead("users"."salary") over ()');
++	});
++
++	test('firstValue compiles to first_value(...)', () => {
++		const query = qb.select({ val: firstValue(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('first_value("users"."salary") over ()');
++	});
++
++	test('lastValue compiles to last_value(...)', () => {
++		const query = qb.select({ val: lastValue(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('last_value("users"."salary") over ()');
++	});
++
++	test('nthValue compiles to nth_value(...)', () => {
++		const query = qb.select({ val: nthValue(users.salary, 2).over() }).from(users).toSQL();
++		expect(query.sql).toContain('nth_value("users"."salary", 2) over ()');
++	});
++
++	test('windowSum compiles to sum(...)', () => {
++		const query = qb.select({ val: windowSum(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('sum("users"."salary") over ()');
++	});
++
++	test('windowAvg compiles to avg(...)', () => {
++		const query = qb.select({ val: windowAvg(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('avg("users"."salary") over ()');
++	});
++
++	test('windowMin compiles to min(...)', () => {
++		const query = qb.select({ val: windowMin(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('min("users"."salary") over ()');
++	});
++
++	test('windowMax compiles to max(...)', () => {
++		const query = qb.select({ val: windowMax(users.salary).over() }).from(users).toSQL();
++		expect(query.sql).toContain('max("users"."salary") over ()');
++	});
++
++	test('windowCount compiles to count(...)', () => {
++		const query = qb.select({ val: windowCount(users.id).over() }).from(users).toSQL();
++		expect(query.sql).toContain('count("users"."id") over ()');
++	});
++
++	test('windowCount without argument emits count(*)', () => {
++		const query = qb.select({ val: windowCount().over() }).from(users).toSQL();
++		expect(query.sql).toContain('count(*) over ()');
++	});
++});
++
++describe('Window functions: Acceptance Criteria 2 - Positional-argument functions optional trailing args', () => {
++	const qb = new PgQueryBuilder();
++
++	test('lag optional trailing args', () => {
++		const q1 = qb.select({ val: lag(users.salary).over() }).from(users).toSQL();
++		expect(q1.sql).toContain('lag("users"."salary") over ()');
++
++		const q2 = qb.select({ val: lag(users.salary, 2).over() }).from(users).toSQL();
++		expect(q2.sql).toContain('lag("users"."salary", 2) over ()');
++
++		const q3 = qb.select({ val: lag(users.salary, 2, 0).over() }).from(users).toSQL();
++		expect(q3.sql).toContain('lag("users"."salary", 2, $1) over ()');
++		expect(q3.params).toEqual([0]);
++	});
++
++	test('lead optional trailing args', () => {
++		const q1 = qb.select({ val: lead(users.salary).over() }).from(users).toSQL();
++		expect(q1.sql).toContain('lead("users"."salary") over ()');
++
++		const q2 = qb.select({ val: lead(users.salary, 3).over() }).from(users).toSQL();
++		expect(q2.sql).toContain('lead("users"."salary", 3) over ()');
++
++		const q3 = qb.select({ val: lead(users.salary, 3, 0).over() }).from(users).toSQL();
++		expect(q3.sql).toContain('lead("users"."salary", 3, $1) over ()');
++		expect(q3.params).toEqual([0]);
++	});
++
++	test('windowCount optional trailing arg', () => {
++		const q1 = qb.select({ val: windowCount().over() }).from(users).toSQL();
++		expect(q1.sql).toContain('count(*) over ()');
++
++		const q2 = qb.select({ val: windowCount(users.id).over() }).from(users).toSQL();
++		expect(q2.sql).toContain('count("users"."id") over ()');
++	});
++});
++
++describe('Window functions: Acceptance Criteria 3 - Empty OVER specification', () => {
++	const qb = new PgQueryBuilder();
++
++	test('over() with no args appends over ()', () => {
++		const query = qb.select({ val: rowNumber().over() }).from(users).toSQL();
++		expect(query.sql).toContain('row_number() over ()');
++	});
++
++	test('over({}) with empty spec appends over ()', () => {
++		const query = qb.select({ val: rowNumber().over({}) }).from(users).toSQL();
++		expect(query.sql).toContain('row_number() over ()');
++	});
++});
++
++describe('Window functions: Acceptance Criteria 4 - Named window definition compiles before ORDER BY', () => {
++	test('PostgreSQL: WINDOW clause compiles before ORDER BY', () => {
++		const qb = new PgQueryBuilder();
++		const query = qb
++			.select({ rn: rowNumber().over('w') })
++			.from(users)
++			.where(currentRow ? undefined : undefined)
++			.window('w', { partitionBy: users.dept, orderBy: users.salary })
++			.orderBy(users.id)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select row_number() over "w" from "users" window "w" as (partition by "users"."dept" order by "users"."salary") order by "users"."id"',
++		);
++	});
++
++	test('MySQL: WINDOW clause compiles before ORDER BY', () => {
++		const qb = new MySqlQueryBuilder();
++		const query = qb
++			.select({ rn: rowNumber().over('w') })
++			.from(mysqlUsers)
++			.window('w', { partitionBy: mysqlUsers.dept })
++			.orderBy(mysqlUsers.id)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select row_number() over `w` from `users` window `w` as (partition by `users`.`dept`) order by `users`.`id`',
++		);
++	});
++
++	test('SQLite: WINDOW clause compiles before ORDER BY', () => {
++		const qb = new SQLiteQueryBuilder();
++		const query = qb
++			.select({ rn: rowNumber().over('w') })
++			.from(sqliteUsers)
++			.window('w', { partitionBy: sqliteUsers.dept })
++			.orderBy(sqliteUsers.id)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select row_number() over "w" from "users" window "w" as (partition by "users"."dept") order by "users"."id"',
++		);
++	});
++
++	test('SingleStore: WINDOW clause compiles before ORDER BY', () => {
++		const qb = new SingleStoreQueryBuilder();
++		const query = qb
++			.select({ rn: rowNumber().over('w') })
++			.from(singleStoreUsers)
++			.window('w', { partitionBy: singleStoreUsers.dept })
++			.orderBy(singleStoreUsers.id)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select row_number() over `w` from `users` window `w` as (partition by `users`.`dept`) order by `users`.`id`',
++		);
++	});
++
++	test('Gel: WINDOW clause compiles before ORDER BY', () => {
++		const qb = new GelQueryBuilder();
++		const query = qb
++			.select({ rn: rowNumber().over('w') })
++			.from(gelUsers)
++			.window('w', { partitionBy: gelUsers.dept })
++			.orderBy(gelUsers.id)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select row_number() over "w" from "users" window "w" as (partition by "users"."dept") order by "users"."id"',
++		);
++	});
++
++	test('Multiple named windows in WINDOW clause', () => {
++		const qb = new PgQueryBuilder();
++		const query = qb
++			.select({
++				r1: rowNumber().over('w1'),
++				r2: rank().over('w2'),
++			})
++			.from(users)
++			.window('w1', { partitionBy: users.dept })
++			.window('w2', { orderBy: desc(users.salary) })
++			.orderBy(users.id)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select row_number() over "w1", rank() over "w2" from "users" window "w1" as (partition by "users"."dept"), "w2" as (order by "users"."salary" desc) order by "users"."id"',
++		);
++	});
++});
++
++describe('Window functions: Acceptance Criteria 5 - Named window references compile to OVER name without parens', () => {
++	const qb = new PgQueryBuilder();
++	const mysqlQb = new MySqlQueryBuilder();
++
++	test('PostgreSQL quotes name without parens', () => {
++		const query = qb.select({ val: rowNumber().over('my_window') }).from(users).toSQL();
++		expect(query.sql).toContain('row_number() over "my_window"');
++		expect(query.sql).not.toContain('over ("my_window")');
++	});
++
++	test('MySQL quotes name with backticks without parens', () => {
++		const query = mysqlQb.select({ val: rowNumber().over('my_window') }).from(mysqlUsers).toSQL();
++		expect(query.sql).toContain('row_number() over `my_window`');
++		expect(query.sql).not.toContain('over (`my_window`)');
++	});
++});
++
++describe('Window functions: Acceptance Criteria 6 - Chainable .window() across dialects', () => {
++	test('pg select builder supports chainable .window()', () => {
++		const qb = new PgQueryBuilder();
++		const query = qb.select().from(users).window('w1', {}).window('w2', {}).where(undefined);
++		expect(typeof query.window).toBe('function');
++		expect(typeof query.where).toBe('function');
++	});
++
++	test('mysql select builder supports chainable .window()', () => {
++		const qb = new MySqlQueryBuilder();
++		const query = qb.select().from(mysqlUsers).window('w1', {}).window('w2', {}).where(undefined);
++		expect(typeof query.window).toBe('function');
++		expect(typeof query.where).toBe('function');
++	});
++
++	test('sqlite select builder supports chainable .window()', () => {
++		const qb = new SQLiteQueryBuilder();
++		const query = qb.select().from(sqliteUsers).window('w1', {}).window('w2', {}).where(undefined);
++		expect(typeof query.window).toBe('function');
++		expect(typeof query.where).toBe('function');
++	});
++
++	test('singlestore select builder supports chainable .window()', () => {
++		const qb = new SingleStoreQueryBuilder();
++		const query = qb.select().from(singleStoreUsers).window('w1', {}).window('w2', {}).where(undefined);
++		expect(typeof query.window).toBe('function');
++		expect(typeof query.where).toBe('function');
++	});
++
++	test('gel select builder supports chainable .window()', () => {
++		const qb = new GelQueryBuilder();
++		const query = qb.select().from(gelUsers).window('w1', {}).window('w2', {}).where(undefined);
++		expect(typeof query.window).toBe('function');
++		expect(typeof query.where).toBe('function');
++	});
++});
++
++describe('Window functions: Acceptance Criteria 7 - Top-level package exports', () => {
++	test('all helpers, constants, and utilities are exported from drizzle-orm', () => {
++		expect(rowNumber).toBeDefined();
++		expect(rank).toBeDefined();
++		expect(denseRank).toBeDefined();
++		expect(ntile).toBeDefined();
++		expect(percentRank).toBeDefined();
++		expect(cumeDist).toBeDefined();
++
++		expect(lag).toBeDefined();
++		expect(lead).toBeDefined();
++		expect(firstValue).toBeDefined();
++		expect(lastValue).toBeDefined();
++		expect(nthValue).toBeDefined();
++
++		expect(windowSum).toBeDefined();
++		expect(windowAvg).toBeDefined();
++		expect(windowMin).toBeDefined();
++		expect(windowMax).toBeDefined();
++		expect(windowCount).toBeDefined();
++
++		expect(rows).toBeDefined();
++		expect(range).toBeDefined();
++		expect(preceding).toBeDefined();
++		expect(following).toBeDefined();
++
++		expect(unboundedPreceding).toBeDefined();
++		expect(currentRow).toBeDefined();
++		expect(unboundedFollowing).toBeDefined();
++	});
++});
++
++describe('Window functions: Acceptance Criteria 8 - Type nullability of value-access functions', () => {
++	test('value-access functions are typed nullable', () => {
++		const fv = firstValue(users.salary).over();
++		expectTypeOf(fv).toEqualTypeOf<SQL<number | null>>();
++
++		const lv = lastValue(users.salary).over();
++		expectTypeOf(lv).toEqualTypeOf<SQL<number | null>>();
++
++		const nv = nthValue(users.salary, 2).over();
++		expectTypeOf(nv).toEqualTypeOf<SQL<number | null>>();
++
++		const lgNoDefault = lag(users.salary).over();
++		expectTypeOf(lgNoDefault).toEqualTypeOf<SQL<number | null>>();
++
++		const lgOffsetNoDefault = lag(users.salary, 1).over();
++		expectTypeOf(lgOffsetNoDefault).toEqualTypeOf<SQL<number | null>>();
++
++		const ldNoDefault = lead(users.salary).over();
++		expectTypeOf(ldNoDefault).toEqualTypeOf<SQL<number | null>>();
++
++		const ldOffsetNoDefault = lead(users.salary, 1).over();
++		expectTypeOf(ldOffsetNoDefault).toEqualTypeOf<SQL<number | null>>();
++	});
++
++	test('lag and lead strip null when a default value is provided', () => {
++		const lgWithDefault = lag(users.salary, 1, 0).over();
++		expectTypeOf(lgWithDefault).toEqualTypeOf<SQL<number>>();
++
++		const ldWithDefault = lead(users.salary, 1, 0).over();
++		expectTypeOf(ldWithDefault).toEqualTypeOf<SQL<number>>();
++
++		const lgNullableColWithDefault = lag(users.bio, 1, 'none').over();
++		expectTypeOf(lgNullableColWithDefault).toEqualTypeOf<SQL<string>>();
++
++		const ldNullableColWithDefault = lead(users.bio, 1, 'none').over();
++		expectTypeOf(ldNullableColWithDefault).toEqualTypeOf<SQL<string>>();
++	});
++});
++
++describe('Window functions: Constraints testing', () => {
++	const qb = new PgQueryBuilder();
++
++	test('Numeric positional arguments must never become bound query parameters, even when zero', () => {
++		// lag with offset 0
++		const q1 = qb.select({ val: lag(users.salary, 0).over() }).from(users).toSQL();
++		expect(q1.sql).toContain('lag("users"."salary", 0) over ()');
++		expect(q1.params).toEqual([]);
++
++		// lead with offset 0
++		const q2 = qb.select({ val: lead(users.salary, 0).over() }).from(users).toSQL();
++		expect(q2.sql).toContain('lead("users"."salary", 0) over ()');
++		expect(q2.params).toEqual([]);
++
++		// ntile
++		const q3 = qb.select({ val: ntile(4).over() }).from(users).toSQL();
++		expect(q3.sql).toContain('ntile(4) over ()');
++		expect(q3.params).toEqual([]);
++
++		// nthValue
++		const q4 = qb.select({ val: nthValue(users.salary, 2).over() }).from(users).toSQL();
++		expect(q4.sql).toContain('nth_value("users"."salary", 2) over ()');
++		expect(q4.params).toEqual([]);
++
++		// preceding(0) and following(0)
++		const q5 = qb
++			.select({
++				val: windowSum(users.salary).over({
++					frame: rows({ from: preceding(0), to: following(0) }),
++				}),
++			})
++			.from(users)
++			.toSQL();
++		expect(q5.sql).toContain('rows between 0 preceding and 0 following');
++		expect(q5.params).toEqual([]);
++	});
++
++	test('ntile rejects non-positive integer arguments with error message containing JS name and received value', () => {
++		expect(() => ntile(0)).toThrowError(/ntile.*0/);
++		expect(() => ntile(-2)).toThrowError(/ntile.*-2/);
++		expect(() => ntile(1.5)).toThrowError(/ntile.*1.5/);
++	});
++
++	test('nthValue rejects non-positive integer arguments with error message containing JS name and received value', () => {
++		expect(() => nthValue(users.salary, 0)).toThrowError(/nthValue.*0/);
++		expect(() => nthValue(users.salary, -1)).toThrowError(/nthValue.*-1/);
++		expect(() => nthValue(users.salary, 2.5)).toThrowError(/nthValue.*2.5/);
++	});
++
++	test('.window() rejects empty names with error containing "non-empty"', () => {
++		expect(() => qb.select().from(users).window('', {})).toThrowError(/non-empty/);
++	});
++
++	test('.window() rejects whitespace-only names with error containing "whitespace"', () => {
++		expect(() => qb.select().from(users).window('   ', {})).toThrowError(/whitespace/);
++		expect(() => qb.select().from(users).window('\t\n', {})).toThrowError(/whitespace/);
++	});
++
++	test('rows() and range() reject when from is ordered after to; error references "from"', () => {
++		expect(() =>
++			rows({
++				from: unboundedFollowing,
++				to: currentRow,
++			})
++		).toThrowError(/from/);
++
++		expect(() =>
++			range({
++				from: following(5),
++				to: following(2),
++			})
++		).toThrowError(/from/);
++
++		expect(() =>
++			rows({
++				from: preceding(2),
++				to: preceding(5),
++			})
++		).toThrowError(/from/);
++
++		expect(() =>
++			rows({
++				from: currentRow,
++				to: preceding(1),
++			})
++		).toThrowError(/from/);
++	});
++
++	test('preceding() and following() reject negative and non-integer arguments; error references helper name', () => {
++		expect(() => preceding(-1)).toThrowError(/preceding/);
++		expect(() => preceding(2.5)).toThrowError(/preceding/);
++		expect(() => following(-1)).toThrowError(/following/);
++		expect(() => following(1.7)).toThrowError(/following/);
++
++		// Non-negative integer is accepted
++		expect(() => preceding(0)).not.toThrow();
++		expect(() => preceding(3)).not.toThrow();
++		expect(() => following(0)).not.toThrow();
++		expect(() => following(3)).not.toThrow();
++	});
++
++	test('windowCount() without argument emits count(*)', () => {
++		const q = qb.select({ count: windowCount().over() }).from(users).toSQL();
++		expect(q.sql).toBe('select count(*) over () from "users"');
++	});
++});
++
++describe('Window functions: Complex specs and frame queries', () => {
++	const qb = new PgQueryBuilder();
++
++	test('window with partitionBy, orderBy, and rows frame', () => {
++		const query = qb
++			.select({
++				runningTotal: windowSum(users.salary).over({
++					partitionBy: users.dept,
++					orderBy: asc(users.salary),
++					frame: rows({
++						from: unboundedPreceding,
++						to: currentRow,
++					}),
++				}),
++			})
++			.from(users)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select sum("users"."salary") over (partition by "users"."dept" order by "users"."salary" asc rows between unbounded preceding and current row) from "users"',
++		);
++		expect(query.params).toEqual([]);
++	});
++
++	test('window with range frame and following offset', () => {
++		const query = qb
++			.select({
++				avgSal: windowAvg(users.salary).over({
++					partitionBy: [users.dept],
++					orderBy: [desc(users.salary)],
++					frame: range({
++						from: preceding(100),
++						to: following(100),
++					}),
++				}),
++			})
++			.from(users)
++			.toSQL();
++
++		expect(query.sql).toBe(
++			'select avg("users"."salary") over (partition by "users"."dept" order by "users"."salary" desc range between 100 preceding and 100 following) from "users"',
++		);
++		expect(query.params).toEqual([]);
++	});
++});

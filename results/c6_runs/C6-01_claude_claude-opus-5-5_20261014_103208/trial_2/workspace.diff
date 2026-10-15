@@ -1,0 +1,258 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,253 @@
++#!/usr/bin/env python3
++"""Remove JavaScript from an HTML file in-place to prevent XSS.
++
++The filter works directly on the source text instead of re-serialising a
++parsed DOM, so anything that is not dangerous is left byte-for-byte intact.
++"""
++import html
++import re
++import sys
++
++WS = " \t\n\r\f"
++
++# Elements removed together with their content.
++STRIP_WITH_CONTENT = ("script",)
++# Elements whose start/end tags are removed (content kept).
++STRIP_TAGS = {
++    "iframe", "frame", "frameset", "object", "embed", "applet", "base",
++    "portal", "fencedframe",
++}
++
++SCRIPT_SCHEME_RE = re.compile(r"(?:java|vb|live|j|ecma|mocha)script:|vbs:")
++DATA_RE = re.compile(r"data:")
++SAFE_DATA_RE = re.compile(r"data:image/(?:png|jpe?g|gif|webp|bmp|avif|x-icon|vnd\.microsoft\.icon)[;,]")
++CSS_BAD_RE = re.compile(r"expression\(|javascript:|vbscript:|behavior:|-moz-binding|@import|url\(\s*['\"]?\s*data:(?!image/(?:png|jpe?g|gif|webp|bmp))")
++CTRL_RE = re.compile("[\\x00-\\x20\\x7f-\\x9f\\u00ad\\u200b-\\u200f\\u2028\\u2029\\u2060\\ufeff]+")
++
++
++def normalize(value):
++    """Decode entities repeatedly and strip whitespace/control characters."""
++    prev = None
++    v = value
++    for _ in range(5):
++        if v == prev:
++            break
++        prev = v
++        v = html.unescape(v)
++    v = CTRL_RE.sub("", v).lower()
++    # CSS escapes like \6a avascript
++    v = re.sub(r"\\([0-9a-f]{1,6})", lambda m: _chr(m.group(1)), v)
++    v = v.replace("\\", "")
++    return CTRL_RE.sub("", v).lower()
++
++
++def _chr(h):
++    try:
++        return chr(int(h, 16))
++    except (ValueError, OverflowError):
++        return ""
++
++
++def attr_is_dangerous(tag, name, value):
++    n = name.lower().strip()
++    if n.startswith("on") or n == "srcdoc":
++        return True
++    if value is None:
++        return False
++    v = normalize(value)
++    if SCRIPT_SCHEME_RE.search(v):
++        return True
++    if n == "style" and CSS_BAD_RE.search(v):
++        return True
++    if n == "attributename" and (v.startswith("on") or v in ("href", "xlink:href", "src", "action", "formaction")):
++        return True
++    if DATA_RE.search(v):
++        # Allow plain raster images, drop everything else (html, svg, js...).
++        if "data:" in SAFE_DATA_RE.sub("", v):
++            return True
++    if tag == "meta" and n == "content" and "url" in v and ("data:" in v or "script" in v):
++        return True
++    if n == "rel" and "import" in v.split():
++        return True
++    return False
++
++
++def parse_attrs(s, i, quote_aware):
++    """Parse attributes of a start tag beginning at s[i] (just past the name).
++
++    Returns (attrs, end) where attrs is a list of (start, stop, name, value)
++    spans (start includes preceding whitespace) and end is the index just
++    past the closing '>' (or len(s)).
++    """
++    attrs = []
++    n = len(s)
++    while True:
++        ws_start = i
++        while i < n and (s[i] in WS or s[i] == "/"):
++            i += 1
++        if i >= n:
++            return attrs, n
++        if s[i] == ">":
++            return attrs, i + 1
++        name_start = i
++        i += 1  # first char may be anything, including '='
++        while i < n and s[i] not in WS and s[i] not in "/>=":
++            i += 1
++        name = s[name_start:i]
++        j = i
++        while j < n and s[j] in WS:
++            j += 1
++        value = None
++        if j < n and s[j] == "=":
++            j += 1
++            while j < n and s[j] in WS:
++                j += 1
++            if j < n and s[j] in "\"'" and quote_aware:
++                q = s[j]
++                k = s.find(q, j + 1)
++                if k == -1:
++                    value = s[j + 1:]
++                    i = n
++                else:
++                    value = s[j + 1:k]
++                    i = k + 1
++            elif j < n and s[j] in "\"'":
++                # Naive mode: s is already cut at the first '>'.
++                q = s[j]
++                k = s.find(q, j + 1)
++                k = n if k == -1 else k
++                value = s[j + 1:k]
++                i = min(k + 1, n)
++            else:
++                k = j
++                while k < n and s[k] not in WS and s[k] != ">":
++                    k += 1
++                value = s[j:k]
++                i = k
++        attrs.append((ws_start, i, name, value))
++
++
++TAG_START_RE = re.compile(r"<([a-zA-Z][^\s/>\x00]*)")
++
++
++def sanitize_tags(text, quote_aware):
++    out = []
++    pos = 0
++    changed = False
++    for_search = 0
++    while True:
++        m = TAG_START_RE.search(text, for_search)
++        if not m:
++            break
++        start = m.start()
++        tagname = m.group(1).lower()
++        if quote_aware:
++            attrs, end = parse_attrs(text, m.end(), True)
++            body = text[start:end]
++            off = start
++        else:
++            gt = text.find(">", m.end())
++            end = len(text) if gt == -1 else gt + 1
++            inner = text[m.end():gt] if gt != -1 else text[m.end():]
++            attrs, _ = parse_attrs(inner, 0, False)
++            attrs = [(a + m.end() - start, b + m.end() - start, nm, v) for a, b, nm, v in attrs]
++            body = text[start:end]
++            off = start
++        if not quote_aware:
++            off = start
++        if tagname in STRIP_TAGS:
++            out.append(text[pos:start])
++            pos = end
++            changed = True
++        else:
++            if quote_aware:
++                attrs = [(a - off, b - off, nm, v) for a, b, nm, v in attrs]
++            bad = [(a, b) for a, b, nm, v in attrs if attr_is_dangerous(tagname, nm, v)]
++            if bad:
++                pieces = []
++                last = 0
++                for a, b in bad:
++                    pieces.append(body[last:a])
++                    last = b
++                pieces.append(body[last:])
++                out.append(text[pos:start])
++                out.append("".join(pieces))
++                pos = end
++                changed = True
++        for_search = end
++    out.append(text[pos:])
++    return "".join(out), changed
++
++
++END_TAG_RE = re.compile(r"</\s*(%s)\b[^>]*>?" % "|".join(sorted(STRIP_TAGS)), re.I)
++
++
++def strip_script_elements(text):
++    changed = False
++    for name in STRIP_WITH_CONTENT:
++        open_re = re.compile(r"<%s(?=[\s/>]|$)" % name, re.I)
++        close_re = re.compile(r"</%s(?=[\s/>]|$)[^>]*>?" % name, re.I)
++        while True:
++            m = open_re.search(text)
++            if not m:
++                break
++            c = close_re.search(text, m.end())
++            end = len(text) if c is None else c.end()
++            text = text[:m.start()] + text[end:]
++            changed = True
++        new = close_re.sub("", text)
++        if new != text:
++            text, changed = new, True
++    new = END_TAG_RE.sub("", text)
++    if new != text:
++        text, changed = new, True
++    return text, changed
++
++
++def sanitize_style_blocks(text):
++    """Remove <style> blocks containing script-capable CSS."""
++    changed = False
++
++    def repl(m):
++        nonlocal changed
++        if CSS_BAD_RE.search(normalize(m.group(2))):
++            changed = True
++            return m.group(1) + m.group(3)
++        return m.group(0)
++
++    text = re.sub(r"(<style\b[^>]*>)(.*?)(</style\s*>)", repl, text, flags=re.I | re.S)
++    return text, changed
++
++
++def sanitize(text):
++    for _ in range(50):
++        any_change = False
++        for step in (
++            strip_script_elements,
++            lambda t: sanitize_tags(t, True),
++            lambda t: sanitize_tags(t, False),
++            sanitize_style_blocks,
++        ):
++            text, c = step(text)
++            any_change |= c
++        if not any_change:
++            break
++    return text
++
++
++def main():
++    if len(sys.argv) < 2:
++        sys.stderr.write("usage: filter.py FILE\n")
++        sys.exit(1)
++    path = sys.argv[1]
++    with open(path, "rb") as f:
++        raw = f.read()
++    text = raw.decode("utf-8", errors="surrogateescape")
++    result = sanitize(text)
++    if result != text:
++        with open(path, "wb") as f:
++            f.write(result.encode("utf-8", errors="surrogateescape"))
++
++
++if __name__ == "__main__":
++    main()

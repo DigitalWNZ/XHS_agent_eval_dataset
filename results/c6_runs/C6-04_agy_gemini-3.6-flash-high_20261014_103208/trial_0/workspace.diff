@@ -1,0 +1,173 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,161 @@
++import sys
++import os
++import cv2
++import numpy as np
++import toml
++
++def analyze_jump(video_path):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Cannot open video file: {video_path}")
++        
++    ret, bg_frame = cap.read()
++    if not ret:
++        raise ValueError("Failed to read first frame from video.")
++        
++    bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)
++    height, width = bg_gray.shape
++    
++    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
++    
++    prev_gray = None
++    frame_idx = 0
++    
++    runner_data = []
++    
++    # Restrict track region Y range to track surface (between 35% and 72% of image height)
++    y_min_track = int(height * 0.35)
++    y_max_track = int(height * 0.72)
++    
++    while cap.isOpened():
++        ret, frame = cap.read()
++        if not ret:
++            break
++            
++        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++        
++        if prev_gray is not None:
++            motion_diff = cv2.absdiff(prev_gray, gray)
++            _, motion_thresh = cv2.threshold(motion_diff, 20, 255, cv2.THRESH_BINARY)
++            
++            motion_mask = np.zeros_like(motion_thresh)
++            motion_mask[y_min_track:y_max_track, :] = motion_thresh[y_min_track:y_max_track, :]
++            
++            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
++            motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
++            
++            cnts, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++            valid_cnts = [c for c in cnts if cv2.contourArea(c) > 150]
++            
++            if valid_cnts:
++                all_pts = np.vstack(valid_cnts)
++                x, y, w, h = cv2.boundingRect(all_pts)
++                center_x = x + w / 2.0
++                
++                # Window around center_x
++                w1 = max(0, int(center_x - 80))
++                w2 = min(width, int(center_x + 80))
++                
++                bg_diff = cv2.absdiff(bg_gray, gray)
++                _, bg_thresh = cv2.threshold(bg_diff, 25, 255, cv2.THRESH_BINARY)
++                
++                local_mask = np.zeros_like(bg_thresh)
++                local_mask[y_min_track:y_max_track, w1:w2] = bg_thresh[y_min_track:y_max_track, w1:w2]
++                local_mask = cv2.morphologyEx(local_mask, cv2.MORPH_OPEN, kernel)
++                
++                ys, xs = np.where(local_mask > 0)
++                
++                if len(ys) > 30:
++                    foot_y = np.max(ys)
++                    head_y = np.min(ys)
++                    torso_y = np.median(ys)
++                    
++                    runner_data.append({
++                        'frame': frame_idx,
++                        'center_x': center_x,
++                        'foot_y': foot_y,
++                        'torso_y': torso_y,
++                        'head_y': head_y,
++                        'present': True
++                    })
++                else:
++                    runner_data.append({'frame': frame_idx, 'present': False})
++            else:
++                runner_data.append({'frame': frame_idx, 'present': False})
++        else:
++            runner_data.append({'frame': frame_idx, 'present': False})
++            
++        prev_gray = gray
++        frame_idx += 1
++        
++    cap.release()
++    
++    active_entries = [d for d in runner_data if d['present']]
++    if not active_entries:
++        raise ValueError("No active runner detected in video.")
++        
++    foot_ys = [d['foot_y'] for d in active_entries]
++    
++    # Baseline ground level
++    ground_y = np.percentile(foot_ys, 90)
++    
++    # Airborne threshold
++    elevation_threshold = 15
++    airborne_frames = [d['frame'] for d in active_entries if d['foot_y'] < ground_y - elevation_threshold]
++    
++    if not airborne_frames:
++        elevation_threshold = 10
++        airborne_frames = [d['frame'] for d in active_entries if d['foot_y'] < ground_y - elevation_threshold]
++        
++    if not airborne_frames:
++        raise ValueError("Could not detect airborne jump frames.")
++        
++    blocks = []
++    curr = []
++    for f in airborne_frames:
++        if not curr or f == curr[-1] + 1 or f <= curr[-1] + 2:
++            curr.append(f)
++        else:
++            blocks.append(curr)
++            curr = [f]
++    if curr:
++        blocks.append(curr)
++        
++    jump_block = max(blocks, key=len)
++    
++    first_airborne = jump_block[0]
++    takeoff_frame = first_airborne
++    
++    last_airborne = jump_block[-1]
++    land_frame = last_airborne + 1
++    
++    for d in active_entries:
++        if d['frame'] > last_airborne and d['foot_y'] >= ground_y - 8:
++            land_frame = d['frame']
++            break
++            
++    return int(takeoff_frame), int(land_frame)
++
++def main():
++    if len(sys.argv) > 1:
++        video_path = sys.argv[1]
++    else:
++        video_path = '/app/example_video.mp4'
++        
++    output_path = '/app/output.toml'
++    
++    takeoff_frame, land_frame = analyze_jump(video_path)
++    
++    output_data = {
++        'jump_takeoff_frame_number': int(takeoff_frame),
++        'jump_land_frame_number': int(land_frame)
++    }
++    
++    with open(output_path, 'w') as f:
++        toml.dump(output_data, f)
++        
++    print(f"Analysis complete. Results written to {output_path}:")
++    print(toml.dumps(output_data))
++
++if __name__ == '__main__':
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 54
++jump_land_frame_number = 62

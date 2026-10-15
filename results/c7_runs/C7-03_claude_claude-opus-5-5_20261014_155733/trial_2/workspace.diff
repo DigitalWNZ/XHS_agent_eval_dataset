@@ -1,0 +1,65 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,60 @@
++import asyncio
++from typing import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]],
++    max_concurrent: int,
++) -> None:
++    """Run ``tasks`` with at most ``max_concurrent`` running at once.
++
++    Tasks are started lazily (a task's callable is only invoked once a slot is
++    free). If ``run_tasks`` is cancelled (e.g. via KeyboardInterrupt under
++    ``asyncio.run``), every task that has already started is cancelled and
++    awaited so its cleanup code (``finally`` / ``async with`` exits) runs before
++    ``run_tasks`` returns. Tasks that never started are never invoked.
++
++    A failing task does not stop the others; after all tasks finish, the first
++    exception raised by a task is re-raised.
++    """
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be >= 1")
++
++    pending = iter(list(tasks))
++    errors: list[BaseException] = []
++
++    async def worker() -> None:
++        for task in pending:
++            try:
++                await task()
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                errors.append(exc)
++
++    workers = [
++        asyncio.create_task(worker())
++        for _ in range(min(max_concurrent, len(tasks)))
++    ]
++    if not workers:
++        return
++
++    try:
++        await asyncio.gather(*workers)
++    except BaseException:
++        # Cancelled (or something unexpected): cancel all running tasks and
++        # wait for their cleanup to finish, even if we're cancelled again.
++        for w in workers:
++            w.cancel()
++        while True:
++            try:
++                await asyncio.gather(*workers, return_exceptions=True)
++                break
++            except asyncio.CancelledError:
++                for w in workers:
++                    if not w.done():
++                        w.cancel()
++        raise
++
++    if errors:
++        raise errors[0]

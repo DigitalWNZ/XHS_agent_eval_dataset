@@ -1,0 +1,202 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,190 @@
++#!/usr/bin/env python3
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_video(video_path: str) -> dict:
++    cap = cv2.VideoCapture(video_path)
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if not frames:
++        return {
++            "jump_takeoff_frame_number": 0,
++            "jump_land_frame_number": 0,
++        }
++
++    num_frames = len(frames)
++    h, w = frames[0].shape[:2]
++
++    ref_top = cv2.cvtColor(frames[0][16:80, 224:736], cv2.COLOR_BGR2GRAY).astype(np.float32)
++    ref_bot = cv2.cvtColor(frames[0][410:474, 224:736], cv2.COLOR_BGR2GRAY).astype(np.float32)
++    f0_blur = cv2.GaussianBlur(frames[0], (5, 5), 0).astype(np.float32)
++
++    aligned_blurs = []
++    for f in frames:
++        g_top = cv2.cvtColor(f[16:80, 224:736], cv2.COLOR_BGR2GRAY).astype(np.float32)
++        g_bot = cv2.cvtColor(f[410:474, 224:736], cv2.COLOR_BGR2GRAY).astype(np.float32)
++        s1, _ = cv2.phaseCorrelate(ref_top, g_top)
++        s2, _ = cv2.phaseCorrelate(ref_bot, g_bot)
++        dx = float(np.clip((s1[0] + s2[0]) * 0.5, -15.0, 15.0))
++        dy = float(np.clip((s1[1] + s2[1]) * 0.5, -15.0, 15.0))
++        m_mat = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
++        fi = cv2.warpAffine(f, m_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
++        aligned_blurs.append(cv2.GaussianBlur(fi, (5, 5), 0).astype(np.float32))
++
++    y_top, y_bot = 238, 400
++    y_max_arr = np.full(num_frames, np.nan)
++    track_area_arr = np.zeros(num_frames, dtype=int)
++    hurdle_score_arr = np.zeros(num_frames, dtype=int)
++
++    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
++
++    for i in range(num_frames):
++        fi_blur = aligned_blurs[i]
++
++        # Track region foreground (y in [238, 400])
++        delta_track = fi_blur[y_top:y_bot, :] - f0_blur[y_top:y_bot, :]
++        bg_shift = np.median(delta_track, axis=(0, 1), keepdims=True)
++        diff_track = np.linalg.norm(delta_track - bg_shift, axis=2)
++
++        mask = (diff_track > 28.0).astype(np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
++
++        num_l, lbls, stats, _ = cv2.connectedComponentsWithStats(mask)
++        clean = np.zeros_like(mask)
++        for l in range(1, num_l):
++            if stats[l, cv2.CC_STAT_AREA] >= 30:
++                clean[lbls == l] = 1
++
++        ys, _ = np.where(clean > 0)
++        track_area_arr[i] = len(ys)
++        if len(ys) > 0:
++            ys_full = ys + y_top
++            y_max_arr[i] = float(np.percentile(ys_full, 99.5))
++
++        # Hurdle clearance box score (x in [430, 570], y in [120, 320])
++        prev_idx = max(0, i - 6)
++        next_idx = min(num_frames - 1, i + 6)
++        d0_box = np.linalg.norm(fi_blur[120:320, 430:570] - f0_blur[120:320, 430:570], axis=2)
++        dp_box = np.linalg.norm(fi_blur[120:320, 430:570] - aligned_blurs[prev_idx][120:320, 430:570], axis=2)
++        dn_box = np.linalg.norm(fi_blur[120:320, 430:570] - aligned_blurs[next_idx][120:320, 430:570], axis=2)
++        d_box = np.minimum(d0_box, np.maximum(dp_box, dn_box))
++        hurdle_score_arr[i] = int(np.sum(d_box > 35.0))
++
++    # Find active runner window on track
++    active_indices = np.where(track_area_arr > 800)[0]
++    if len(active_indices) > 0:
++        start_f = int(active_indices[0])
++        end_f = int(active_indices[-1])
++    else:
++        start_f = 0
++        end_f = num_frames - 1
++
++    y_track = y_max_arr.copy()
++    for i in range(start_f, end_f + 1):
++        if np.isnan(y_track[i]):
++            y_track[i] = float(y_top)
++
++    # Locate apex of hurdle jump
++    if np.max(hurdle_score_arr) > 300:
++        hurdle_pass = int(np.argmax(hurdle_score_arr))
++        search_l = max(start_f, hurdle_pass - 6)
++        search_r = min(end_f, hurdle_pass + 6)
++        sub = y_track[search_l : search_r + 1]
++        padded = np.pad(sub, (1, 1), mode="edge")
++        y_smooth = (padded[:-2] + padded[1:-1] + padded[2:]) / 3.0
++        apex_idx = search_l + int(np.argmin(y_smooth))
++    else:
++        sub = y_track[start_f : end_f + 1]
++        padded = np.pad(sub, (1, 1), mode="edge")
++        y_smooth = (padded[:-2] + padded[1:-1] + padded[2:]) / 3.0
++        apex_idx = start_f + int(np.argmin(y_smooth))
++
++    # Estimate local ground level before and after hurdle jump
++    pre_window = y_track[max(start_f, apex_idx - 12) : max(start_f + 1, apex_idx - 1)]
++    post_window = y_track[min(end_f, apex_idx + 2) : min(end_f + 1, apex_idx + 13)]
++
++    overall_ground_y = float(np.nanpercentile(y_track[start_f : end_f + 1], 85))
++    if len(pre_window) >= 3:
++        takeoff_ground_y = float(np.median(np.sort(pre_window)[-3:]))
++    else:
++        takeoff_ground_y = overall_ground_y
++
++    if len(post_window) >= 3:
++        land_ground_y = float(np.median(np.sort(post_window)[-3:]))
++    else:
++        land_ground_y = overall_ground_y
++
++    takeoff_thresh = takeoff_ground_y - 11.0
++    land_thresh = land_ground_y - 11.0
++
++    takeoff_frame = apex_idx
++    for i in range(apex_idx, start_f - 1, -1):
++        if y_track[i] >= takeoff_thresh:
++            takeoff_frame = i
++            break
++
++    land_frame = apex_idx
++    for i in range(apex_idx, end_f + 1):
++        if y_track[i] >= land_thresh:
++            land_frame = i
++            break
++
++    return {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++
++def main():
++    video_path = "/app/example_video.mp4"
++    output_path = "/app/output.toml"
++
++    args = sys.argv[1:]
++    pos_args = []
++    i = 0
++    while i < len(args):
++        arg = args[i]
++        if arg in ("-i", "--input", "-v", "--video") and i + 1 < len(args):
++            video_path = args[i + 1]
++            i += 2
++        elif arg in ("-o", "--output") and i + 1 < len(args):
++            output_path = args[i + 1]
++            i += 2
++        elif arg.startswith("--input=") or arg.startswith("--video="):
++            video_path = arg.split("=", 1)[1]
++            i += 1
++        elif arg.startswith("--output="):
++            output_path = arg.split("=", 1)[1]
++            i += 1
++        elif not arg.startswith("-"):
++            pos_args.append(arg)
++            i += 1
++        else:
++            i += 1
++
++    if len(pos_args) >= 1:
++        video_path = pos_args[0]
++    if len(pos_args) >= 2:
++        output_path = pos_args[1]
++
++    result = analyze_video(video_path)
++
++    with open("/app/output.toml", "w") as f:
++        toml.dump(result, f)
++
++    if output_path != "/app/output.toml":
++        with open(output_path, "w") as f:
++            toml.dump(result, f)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

@@ -1,0 +1,1737 @@
+diff --git a/batch.go b/batch.go
+index f439133a..d63071e1 100644
+--- a/batch.go
++++ b/batch.go
+@@ -379,6 +379,12 @@ type batchInternal struct {
+ 	// then it will only contain key kinds of IngestSST/Excise.
+ 	ingestedSSTBatch bool
+ 
++	// Durability tracking fields.
++	syncCommit          bool
++	commitJobID         int
++	commitCorrelationID uint64
++	applyDuration       time.Duration
++
+ 	// committing is set to true when a batch begins to commit. It's used to
+ 	// ensure the batch is not mutated concurrently. It is not an atomic
+ 	// deliberately, so as to avoid the overhead on batch mutations. This is
+diff --git a/commit.go b/commit.go
+index c86e378b..3755d174 100644
+--- a/commit.go
++++ b/commit.go
+@@ -8,6 +8,7 @@ import (
+ 	"runtime"
+ 	"sync"
+ 	"sync/atomic"
++	"time"
+ 
+ 	"github.com/cockroachdb/crlib/crtime"
+ 	"github.com/cockroachdb/pebble/batchrepr"
+@@ -324,13 +325,19 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
+ 	}
+ 
+ 	// Apply the batch to the memtable.
++	applyStartTime := crtime.NowMono()
+ 	if err := p.env.apply(b, mem); err != nil {
+ 		b.db = nil // prevent batch reuse on error
++		b.applied.Store(true)
+ 		// NB: we are not doing <-p.commitQueueSem since the batch is still
+ 		// sitting in the pending queue. We should consider fixing this by also
+ 		// removing the batch from the pending queue.
+ 		return err
+ 	}
++	b.applyDuration = applyStartTime.Elapsed()
++	if b.applyDuration <= 0 {
++		b.applyDuration = time.Nanosecond
++	}
+ 
+ 	// Publish the batch sequence number.
+ 	p.publish(b)
+diff --git a/db.go b/db.go
+index d8b443ec..7f237929 100644
+--- a/db.go
++++ b/db.go
+@@ -301,6 +301,8 @@ type DB struct {
+ 
+ 	commit *commitPipeline
+ 
++	durabilityMgr *durabilityManager
++
+ 	// readState provides access to the state needed for reading without needing
+ 	// to acquire DB.mu.
+ 	readState struct {
+@@ -819,6 +821,19 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
+ 		}
+ 	}
+ 	batch.committing = true
++	if sync && !d.opts.DisableWAL && !batch.Empty() && d.durabilityMgr != nil {
++		batch.syncCommit = true
++		batch.commitJobID = d.durabilityMgr.newJobID()
++		if opts != nil {
++			batch.commitCorrelationID = opts.CommitCorrelationID
++		} else {
++			batch.commitCorrelationID = 0
++		}
++	} else {
++		batch.syncCommit = false
++		batch.commitJobID = 0
++		batch.commitCorrelationID = 0
++	}
+ 
+ 	if batch.db == nil {
+ 		if err := batch.refreshMemTableSize(); err != nil {
+@@ -890,6 +905,16 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
+ 	var size int64
+ 	repr := b.Repr()
+ 
++	var walSyncWG *sync.WaitGroup = syncWG
++	var walSyncErr *error = syncErr
++	var entry *durabilityEntry
++
++	if syncWG != nil && b.syncCommit && d.durabilityMgr != nil {
++		entry = d.durabilityMgr.createEntry(b, syncWG, syncErr)
++		walSyncWG = &entry.walWG
++		walSyncErr = &entry.walErr
++	}
++
+ 	if b.flushable != nil {
+ 		// We have a large batch. Such batches are special in that they don't get
+ 		// added to the memtable, and are instead inserted into the queue of
+@@ -903,10 +928,13 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
+ 		b.flushable.setSeqNum(b.SeqNum())
+ 		if !d.opts.DisableWAL {
+ 			var err error
+-			size, err = d.mu.log.writer.WriteRecord(repr, wal.SyncOptions{Done: syncWG, Err: syncErr}, b)
++			size, err = d.mu.log.writer.WriteRecord(repr, wal.SyncOptions{Done: walSyncWG, Err: walSyncErr}, b)
+ 			if err != nil {
+ 				panic(err)
+ 			}
++			if entry != nil {
++				d.durabilityMgr.enqueueEntry(entry)
++			}
+ 		}
+ 	}
+ 
+@@ -945,10 +973,13 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
+ 	d.logBytesIn.Add(uint64(len(repr)))
+ 
+ 	if b.flushable == nil {
+-		size, err = d.mu.log.writer.WriteRecord(repr, wal.SyncOptions{Done: syncWG, Err: syncErr}, b)
++		size, err = d.mu.log.writer.WriteRecord(repr, wal.SyncOptions{Done: walSyncWG, Err: walSyncErr}, b)
+ 		if err != nil {
+ 			panic(err)
+ 		}
++		if entry != nil {
++			d.durabilityMgr.enqueueEntry(entry)
++		}
+ 	}
+ 
+ 	d.logSize.Store(uint64(size))
+@@ -1598,6 +1629,10 @@ func (d *DB) Close() error {
+ 	}
+ 	err = firstError(err, d.mu.log.manager.Close())
+ 
++	if d.durabilityMgr != nil {
++		d.durabilityMgr.close()
++	}
++
+ 	// Note that versionSet.close() only closes the MANIFEST. The versions list
+ 	// is still valid for the checks below.
+ 	err = firstError(err, d.mu.versions.close())
+@@ -2082,6 +2117,11 @@ func (d *DB) Metrics() *Metrics {
+ 
+ 	metrics.manualMemory = manual.GetMetrics()
+ 
++	if d.durabilityMgr != nil {
++		metrics.DurableCommitCount = d.durabilityMgr.metricsCommitCount()
++		metrics.DurableCommitDuration = d.durabilityMgr.metricsCommitDuration()
++	}
++
+ 	return metrics
+ }
+ 
+diff --git a/durability.go b/durability.go
+new file mode 100644
+index 00000000..070882b2
+--- /dev/null
++++ b/durability.go
+@@ -0,0 +1,668 @@
++// Copyright 2024 The LevelDB-Go and Pebble Authors. All rights reserved. Use
++// of this source code is governed by a BSD-style license that can be found in
++// the LICENSE file.
++
++package pebble
++
++import (
++	"context"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/cockroachdb/crlib/crtime"
++	"github.com/cockroachdb/errors"
++	"github.com/cockroachdb/pebble/internal/base"
++)
++
++// ErrJobDurabilityExpired is returned by WaitForJobDurability when the job is outside
++// the bounded retention window.
++var ErrJobDurabilityExpired = errors.New("pebble: job durability expired")
++
++// ErrJobDurabilityUnknown is returned by WaitForJobDurability when the job ID has never been
++// seen or is invalid (e.g. zero or negative).
++var ErrJobDurabilityUnknown = errors.New("pebble: job durability unknown")
++
++// ErrDurabilitySubscriptionLimit is returned by DurabilityNotify when the limit on
++// outstanding durability subscriptions has been exceeded.
++var ErrDurabilitySubscriptionLimit = errors.New("pebble: durability subscription limit exceeded")
++
++const (
++	maxRetainedJobs             = 4096
++	maxDurabilitySubscriptions  = 4096
++	durabilityQueueCapacity     = 4096
++)
++
++// DurabilityStats provides a snapshot of WAL durability metrics and state.
++type DurabilityStats struct {
++	HighestDurableSeqNum   base.SeqNum
++	FirstErr               error
++	PendingWaiters         int64
++	TotalDurableCommits    uint64
++	TotalFailedCommits     uint64
++	CumulativeSyncDuration time.Duration
++	MaxSyncDuration        time.Duration
++}
++
++type durabilityJob struct {
++	id        int
++	completed bool
++	err       error
++	done      chan struct{}
++}
++
++type durabilityWaiter struct {
++	seqNum base.SeqNum
++	done   chan struct{}
++}
++
++type durabilitySubscription struct {
++	seqNum base.SeqNum
++	ch     chan error
++}
++
++type durabilityEntry struct {
++	jobID         int
++	seqNum        base.SeqNum
++	count         uint32
++	batchSize     int
++	correlationID uint64
++	b             *Batch
++	userWG        *sync.WaitGroup
++	userErr       *error
++	walWG         sync.WaitGroup
++	walErr        error
++	syncStart     crtime.Mono
++}
++
++type durabilityManager struct {
++	d *DB
++
++	mu sync.Mutex
++
++	highestDurableSeqNum   base.SeqNum
++	firstErr               error
++	closed                 bool
++	closedErr              error
++	pendingWaiters         atomic.Int64
++	totalDurableCommits    uint64
++	totalFailedCommits     uint64
++	cumulativeSyncDuration time.Duration
++	maxSyncDuration        time.Duration
++
++	batchDurableConfigured bool
++	durableCommitCount     atomic.Uint64
++	durableCommitDuration  atomic.Int64 // nanoseconds
++
++	nextJobID           int
++	oldestRetainedJobID int
++	retainedJobs        map[int]*durabilityJob
++	retainedJobOrder    []int
++
++	waiters       []*durabilityWaiter
++	subscriptions []*durabilitySubscription
++
++	queue    chan *durabilityEntry
++	workerWG sync.WaitGroup
++}
++
++func newDurabilityManager(d *DB) *durabilityManager {
++	batchDurableConfigured := d.opts.EventListener != nil && !isDefaultBatchDurable(d.opts.EventListener.BatchDurable)
++	return &durabilityManager{
++		d:                      d,
++		batchDurableConfigured: batchDurableConfigured,
++		nextJobID:              1,
++		oldestRetainedJobID:    1,
++		retainedJobs:           make(map[int]*durabilityJob),
++		queue:                  make(chan *durabilityEntry, durabilityQueueCapacity),
++	}
++}
++
++func (m *durabilityManager) start() {
++	m.workerWG.Add(1)
++	go m.worker()
++}
++
++func (m *durabilityManager) newJobID() int {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	id := m.nextJobID
++	m.nextJobID++
++
++	job := &durabilityJob{
++		id:   id,
++		done: make(chan struct{}),
++	}
++	m.retainedJobs[id] = job
++	m.retainedJobOrder = append(m.retainedJobOrder, id)
++
++	for len(m.retainedJobOrder) > maxRetainedJobs {
++		oldestID := m.retainedJobOrder[0]
++		oldestJob := m.retainedJobs[oldestID]
++		if oldestJob != nil && !oldestJob.completed {
++			break
++		}
++		m.retainedJobOrder = m.retainedJobOrder[1:]
++		delete(m.retainedJobs, oldestID)
++		m.oldestRetainedJobID = oldestID + 1
++	}
++
++	return id
++}
++
++func (m *durabilityManager) createEntry(b *Batch, userWG *sync.WaitGroup, userErr *error) *durabilityEntry {
++	entry := &durabilityEntry{
++		jobID:         b.commitJobID,
++		seqNum:        b.SeqNum(),
++		count:         b.Count(),
++		batchSize:     len(b.Repr()),
++		correlationID: b.commitCorrelationID,
++		b:             b,
++		userWG:        userWG,
++		userErr:       userErr,
++		syncStart:     crtime.NowMono(),
++	}
++	entry.walWG.Add(1)
++	return entry
++}
++
++func (m *durabilityManager) enqueueEntry(entry *durabilityEntry) {
++	m.queue <- entry
++}
++
++func (m *durabilityManager) worker() {
++	defer m.workerWG.Done()
++
++	for entry := range m.queue {
++		entry.walWG.Wait()
++
++		if entry.walErr == nil {
++			for !entry.b.applied.Load() {
++				runtime.Gosched()
++			}
++		}
++
++		m.processEntry(entry)
++
++		if entry.userWG != nil {
++			entry.userWG.Done()
++		}
++	}
++}
++
++func (m *durabilityManager) processEntry(entry *durabilityEntry) {
++	syncDuration := entry.syncStart.Elapsed()
++	if syncDuration <= 0 {
++		syncDuration = time.Nanosecond
++	}
++	applyDuration := entry.b.applyDuration
++	if applyDuration <= 0 {
++		applyDuration = time.Nanosecond
++	}
++
++	err := entry.walErr
++	if entry.userErr != nil {
++		*entry.userErr = err
++	}
++
++	m.mu.Lock()
++	if err != nil {
++		m.totalFailedCommits++
++		if m.firstErr == nil {
++			m.firstErr = err
++		}
++	} else {
++		m.totalDurableCommits++
++		m.cumulativeSyncDuration += syncDuration
++		if syncDuration > m.maxSyncDuration {
++			m.maxSyncDuration = syncDuration
++		}
++		if m.batchDurableConfigured {
++			m.durableCommitCount.Add(1)
++			m.durableCommitDuration.Add(int64(syncDuration))
++		}
++
++		batchLargestSeqNum := entry.seqNum
++		if entry.count > 0 {
++			batchLargestSeqNum = entry.seqNum + base.SeqNum(entry.count) - 1
++		}
++		if batchLargestSeqNum > m.highestDurableSeqNum {
++			m.highestDurableSeqNum = batchLargestSeqNum
++		}
++	}
++
++	if job, ok := m.retainedJobs[entry.jobID]; ok {
++		job.completed = true
++		job.err = err
++		close(job.done)
++	}
++
++	activeWaiters := m.waiters[:0]
++	for _, w := range m.waiters {
++		if m.firstErr != nil || (w.seqNum == 0 && m.totalDurableCommits > 0) || (w.seqNum > 0 && m.highestDurableSeqNum >= w.seqNum) {
++			close(w.done)
++		} else {
++			activeWaiters = append(activeWaiters, w)
++		}
++	}
++	m.waiters = activeWaiters
++
++	activeSubs := m.subscriptions[:0]
++	for _, sub := range m.subscriptions {
++		if m.firstErr != nil {
++			sub.ch <- m.firstErr
++		} else if (sub.seqNum == 0 && m.totalDurableCommits > 0) || (sub.seqNum > 0 && m.highestDurableSeqNum >= sub.seqNum) {
++			sub.ch <- nil
++		} else {
++			activeSubs = append(activeSubs, sub)
++		}
++	}
++	m.subscriptions = activeSubs
++	m.mu.Unlock()
++
++	info := BatchDurableInfo{
++		JobID:         entry.jobID,
++		SeqNum:        entry.seqNum,
++		Err:           err,
++		ApplyDuration: applyDuration,
++		SyncDuration:  syncDuration,
++		CorrelationID: entry.correlationID,
++		BatchSize:     entry.batchSize,
++		KeyCount:      entry.count,
++	}
++	m.d.opts.EventListener.BatchDurable(info)
++}
++
++func (m *durabilityManager) waitForDurability(ctx context.Context, seqNum base.SeqNum) error {
++	if m.d.opts.DisableWAL {
++		return nil
++	}
++
++	m.mu.Lock()
++	if m.firstErr != nil {
++		m.mu.Unlock()
++		return m.firstErr
++	}
++	if m.closed {
++		m.mu.Unlock()
++		return m.closedErr
++	}
++	if (seqNum == 0 && m.totalDurableCommits > 0) || (seqNum > 0 && m.highestDurableSeqNum >= seqNum) {
++		m.mu.Unlock()
++		return nil
++	}
++
++	if err := ctx.Err(); err != nil {
++		m.mu.Unlock()
++		return err
++	}
++
++	w := &durabilityWaiter{
++		seqNum: seqNum,
++		done:   make(chan struct{}),
++	}
++	m.waiters = append(m.waiters, w)
++	m.pendingWaiters.Add(1)
++	m.mu.Unlock()
++
++	defer m.pendingWaiters.Add(-1)
++
++	select {
++	case <-w.done:
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		if m.firstErr != nil {
++			return m.firstErr
++		}
++		if m.closed {
++			return m.closedErr
++		}
++		if (seqNum == 0 && m.totalDurableCommits > 0) || (seqNum > 0 && m.highestDurableSeqNum >= seqNum) {
++			return nil
++		}
++		return errors.New("pebble: waiter notified without durability or error")
++
++	case <-ctx.Done():
++		select {
++		case <-w.done:
++			m.mu.Lock()
++			defer m.mu.Unlock()
++			if m.firstErr != nil {
++				return m.firstErr
++			}
++			if m.closed {
++				return m.closedErr
++			}
++			if (seqNum == 0 && m.totalDurableCommits > 0) || (seqNum > 0 && m.highestDurableSeqNum >= seqNum) {
++				return nil
++			}
++		default:
++		}
++
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		for i, waiter := range m.waiters {
++			if waiter == w {
++				m.waiters = append(m.waiters[:i], m.waiters[i+1:]...)
++				break
++			}
++		}
++
++		if m.firstErr != nil {
++			return m.firstErr
++		}
++		if m.closed {
++			return m.closedErr
++		}
++		if (seqNum == 0 && m.totalDurableCommits > 0) || (seqNum > 0 && m.highestDurableSeqNum >= seqNum) {
++			return nil
++		}
++		return ctx.Err()
++	}
++}
++
++func (m *durabilityManager) waitForDurabilityBatch(ctx context.Context, seqNums []base.SeqNum) error {
++	if m.d.opts.DisableWAL || len(seqNums) == 0 {
++		return nil
++	}
++	var maxSeq base.SeqNum
++	for _, s := range seqNums {
++		if s > maxSeq {
++			maxSeq = s
++		}
++	}
++	return m.waitForDurability(ctx, maxSeq)
++}
++
++func (m *durabilityManager) waitForJobDurability(ctx context.Context, jobID int) error {
++	if m.d.opts.DisableWAL {
++		return nil
++	}
++	if jobID <= 0 {
++		return errors.Wrapf(ErrJobDurabilityUnknown, "job ID %d unknown", jobID)
++	}
++
++	m.mu.Lock()
++	if jobID >= m.nextJobID {
++		m.mu.Unlock()
++		return errors.Wrapf(ErrJobDurabilityUnknown, "job ID %d unknown", jobID)
++	}
++
++	if m.firstErr != nil {
++		m.mu.Unlock()
++		return m.firstErr
++	}
++	if m.closed {
++		m.mu.Unlock()
++		return m.closedErr
++	}
++
++	job, ok := m.retainedJobs[jobID]
++	if !ok {
++		if jobID < m.oldestRetainedJobID {
++			m.mu.Unlock()
++			return errors.Wrapf(ErrJobDurabilityExpired, "job ID %d expired", jobID)
++		}
++		m.mu.Unlock()
++		return errors.Wrapf(ErrJobDurabilityUnknown, "job ID %d unknown", jobID)
++	}
++
++	if job.completed {
++		err := job.err
++		m.mu.Unlock()
++		return err
++	}
++
++	if err := ctx.Err(); err != nil {
++		m.mu.Unlock()
++		return err
++	}
++
++	doneChan := job.done
++	m.pendingWaiters.Add(1)
++	m.mu.Unlock()
++
++	defer m.pendingWaiters.Add(-1)
++
++	select {
++	case <-doneChan:
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		if m.firstErr != nil {
++			return m.firstErr
++		}
++		if m.closed {
++			return m.closedErr
++		}
++		if j, ok := m.retainedJobs[jobID]; ok && j.completed {
++			return j.err
++		}
++		if jobID < m.oldestRetainedJobID {
++			return errors.Wrapf(ErrJobDurabilityExpired, "job ID %d expired", jobID)
++		}
++		return errors.Wrapf(ErrJobDurabilityUnknown, "job ID %d unknown", jobID)
++
++	case <-ctx.Done():
++		select {
++		case <-doneChan:
++			m.mu.Lock()
++			defer m.mu.Unlock()
++			if m.firstErr != nil {
++				return m.firstErr
++			}
++			if m.closed {
++				return m.closedErr
++			}
++			if j, ok := m.retainedJobs[jobID]; ok && j.completed {
++				return j.err
++			}
++			if jobID < m.oldestRetainedJobID {
++				return errors.Wrapf(ErrJobDurabilityExpired, "job ID %d expired", jobID)
++			}
++		default:
++		}
++
++		m.mu.Lock()
++		defer m.mu.Unlock()
++		if m.firstErr != nil {
++			return m.firstErr
++		}
++		if m.closed {
++			return m.closedErr
++		}
++		if j, ok := m.retainedJobs[jobID]; ok && j.completed {
++			return j.err
++		}
++		return ctx.Err()
++	}
++}
++
++func (m *durabilityManager) durabilityNotify(seqNum base.SeqNum) <-chan error {
++	ch := make(chan error, 1)
++
++	if m.d.opts.DisableWAL {
++		ch <- nil
++		return ch
++	}
++
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	if m.firstErr != nil {
++		ch <- m.firstErr
++		return ch
++	}
++	if m.closed {
++		ch <- m.closedErr
++		return ch
++	}
++	if (seqNum == 0 && m.totalDurableCommits > 0) || (seqNum > 0 && m.highestDurableSeqNum >= seqNum) {
++		ch <- nil
++		return ch
++	}
++
++	if len(m.subscriptions) >= maxDurabilitySubscriptions {
++		ch <- ErrDurabilitySubscriptionLimit
++		return ch
++	}
++
++	sub := &durabilitySubscription{
++		seqNum: seqNum,
++		ch:     ch,
++	}
++	m.subscriptions = append(m.subscriptions, sub)
++	return ch
++}
++
++func (m *durabilityManager) durableState() (base.SeqNum, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.highestDurableSeqNum, m.firstErr
++}
++
++func (m *durabilityManager) durabilityStats() DurabilityStats {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return DurabilityStats{
++		HighestDurableSeqNum:   m.highestDurableSeqNum,
++		FirstErr:               m.firstErr,
++		PendingWaiters:         m.pendingWaiters.Load(),
++		TotalDurableCommits:    m.totalDurableCommits,
++		TotalFailedCommits:     m.totalFailedCommits,
++		CumulativeSyncDuration: m.cumulativeSyncDuration,
++		MaxSyncDuration:        m.maxSyncDuration,
++	}
++}
++
++func (m *durabilityManager) metricsCommitCount() uint64 {
++	if !m.batchDurableConfigured {
++		return 0
++	}
++	return m.durableCommitCount.Load()
++}
++
++func (m *durabilityManager) metricsCommitDuration() time.Duration {
++	if !m.batchDurableConfigured {
++		return 0
++	}
++	return time.Duration(m.durableCommitDuration.Load())
++}
++
++func (m *durabilityManager) close() {
++	m.mu.Lock()
++	if m.closed {
++		m.mu.Unlock()
++		return
++	}
++	m.closed = true
++	if m.closedErr == nil {
++		m.closedErr = errors.WithStack(ErrClosed)
++	}
++	if m.firstErr == nil {
++		m.firstErr = m.closedErr
++	}
++
++	for _, w := range m.waiters {
++		close(w.done)
++	}
++	m.waiters = nil
++
++	for _, sub := range m.subscriptions {
++		sub.ch <- m.closedErr
++	}
++	m.subscriptions = nil
++
++	for _, job := range m.retainedJobs {
++		if !job.completed {
++			job.completed = true
++			job.err = m.closedErr
++			close(job.done)
++		}
++	}
++	m.mu.Unlock()
++
++	close(m.queue)
++	m.workerWG.Wait()
++}
++
++// WaitForDurability blocks until the given sequence number is durable.
++// Sequence number zero succeeds after any commit.
++func (d *DB) WaitForDurability(seqNum base.SeqNum) error {
++	return d.WaitForDurabilityContext(context.Background(), seqNum)
++}
++
++// WaitForDurabilityContext blocks until the given sequence number is durable or ctx is done.
++// Sequence number zero succeeds after any commit. Durability and close errors take precedence
++// over context cancellation.
++func (d *DB) WaitForDurabilityContext(ctx context.Context, seqNum base.SeqNum) error {
++	if d.durabilityMgr == nil {
++		return nil
++	}
++	return d.durabilityMgr.waitForDurability(ctx, seqNum)
++}
++
++// WaitForDurabilityBatch blocks until every sequence number in a slice is durable.
++// Nil or empty slice returns nil.
++func (d *DB) WaitForDurabilityBatch(seqNums []base.SeqNum) error {
++	return d.WaitForDurabilityBatchContext(context.Background(), seqNums)
++}
++
++// WaitForDurabilityBatchContext blocks until every sequence number in a slice is durable
++// or ctx is done. Nil or empty slice returns nil. Durability and close errors take precedence
++// over context cancellation.
++func (d *DB) WaitForDurabilityBatchContext(ctx context.Context, seqNums []base.SeqNum) error {
++	if d.durabilityMgr == nil {
++		return nil
++	}
++	return d.durabilityMgr.waitForDurabilityBatch(ctx, seqNums)
++}
++
++// WaitForJobDurability blocks until the callback job with the specified ID completes.
++// Jobs outside the retention window return an error containing "expired".
++// Never-seen and zero IDs return an error containing "unknown".
++func (d *DB) WaitForJobDurability(jobID int) error {
++	return d.WaitForJobDurabilityContext(context.Background(), jobID)
++}
++
++// WaitForJobDurabilityContext blocks until the callback job completes or ctx is done.
++// Jobs outside the retention window return an error containing "expired".
++// Never-seen and zero IDs return an error containing "unknown".
++// Durability and close errors take precedence over context cancellation.
++func (d *DB) WaitForJobDurabilityContext(ctx context.Context, jobID int) error {
++	if d.durabilityMgr == nil {
++		return nil
++	}
++	return d.durabilityMgr.waitForJobDurability(ctx, jobID)
++}
++
++// DurableState returns the highest durable sequence number and the first latched error.
++func (d *DB) DurableState() (base.SeqNum, error) {
++	if d.durabilityMgr == nil {
++		return 0, nil
++	}
++	return d.durabilityMgr.durableState()
++}
++
++// DurabilityNotify returns a pre-filled receive-only channel that delivers nil on success
++// or a non-nil error on WAL sync failure or DB close. Outstanding subscriptions are bounded;
++// excess callers receive a pre-filled channel with an immediate non-nil error.
++func (d *DB) DurabilityNotify(seqNum base.SeqNum) <-chan error {
++	if d.durabilityMgr == nil {
++		ch := make(chan error, 1)
++		ch <- nil
++		return ch
++	}
++	return d.durabilityMgr.durabilityNotify(seqNum)
++}
++
++// DurabilityStats returns a snapshot of WAL durability metrics and state.
++// All fields start at zero before any commits. PendingWaiters reflects the number
++// of goroutines currently blocked in wait APIs.
++func (d *DB) DurabilityStats() DurabilityStats {
++	if d.durabilityMgr == nil {
++		return DurabilityStats{}
++	}
++	return d.durabilityMgr.durabilityStats()
++}
+diff --git a/durability_test.go b/durability_test.go
+new file mode 100644
+index 00000000..a30da79c
+--- /dev/null
++++ b/durability_test.go
+@@ -0,0 +1,752 @@
++// Copyright 2024 The LevelDB-Go and Pebble Authors. All rights reserved. Use
++// of this source code is governed by a BSD-style license that can be found in
++// the LICENSE file.
++
++package pebble
++
++import (
++	"context"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/cockroachdb/errors"
++	"github.com/cockroachdb/pebble/internal/base"
++	"github.com/cockroachdb/pebble/vfs"
++	"github.com/stretchr/testify/require"
++)
++
++func TestBatchDurableCallback(t *testing.T) {
++	memFS := vfs.NewMem()
++	var durableEvents []BatchDurableInfo
++	var mu sync.Mutex
++
++	opts := &Options{
++		FS: memFS,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				defer mu.Unlock()
++				durableEvents = append(durableEvents, info)
++			},
++		},
++	}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Commit a sync batch with CommitCorrelationID.
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("key1"), []byte("val1"), nil))
++	require.NoError(t, b.Set([]byte("key2"), []byte("val2"), nil))
++	expectedKeyCount := b.Count()
++	expectedBatchSize := len(b.Repr())
++
++	wo := &WriteOptions{
++		Sync:                true,
++		CommitCorrelationID: 12345,
++	}
++	require.NoError(t, b.Commit(wo))
++	expectedSeqNum := b.SeqNum()
++
++	mu.Lock()
++	require.Len(t, durableEvents, 1)
++	event := durableEvents[0]
++	mu.Unlock()
++
++	require.Greater(t, event.JobID, 0)
++	require.Equal(t, expectedSeqNum, event.SeqNum)
++	require.NoError(t, event.Err)
++	require.Greater(t, event.ApplyDuration, time.Duration(0))
++	require.Greater(t, event.SyncDuration, time.Duration(0))
++	require.Equal(t, uint64(12345), event.CorrelationID)
++	require.Equal(t, expectedBatchSize, event.BatchSize)
++	require.Equal(t, expectedKeyCount, event.KeyCount)
++	require.NotEmpty(t, event.String())
++}
++
++func TestNonSyncAndDisableWALNeverTriggerBatchDurable(t *testing.T) {
++	memFS := vfs.NewMem()
++	var count atomic.Int32
++
++	opts := &Options{
++		FS: memFS,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				count.Add(1)
++			},
++		},
++	}
++
++	// 1. Non-sync commits
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++
++	for i := 0; i < 10; i++ {
++		require.NoError(t, d.Set([]byte("key"), []byte("val"), NoSync))
++	}
++	require.Equal(t, int32(0), count.Load())
++	require.NoError(t, d.Close())
++
++	// 2. DisableWAL commits
++	optsDisableWAL := &Options{
++		FS:         memFS,
++		DisableWAL: true,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				count.Add(1)
++			},
++		},
++	}
++
++	d2, err := Open("test2", optsDisableWAL)
++	require.NoError(t, err)
++
++	for i := 0; i < 10; i++ {
++		require.NoError(t, d2.Set([]byte("key"), []byte("val"), NoSync))
++	}
++	require.Equal(t, int32(0), count.Load())
++	require.NoError(t, d2.Close())
++}
++
++func TestWaitForDurability(t *testing.T) {
++	memFS := vfs.NewMem()
++	opts := &Options{FS: memFS}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Before any commits, WaitForDurability(0) must block.
++	zeroDone := make(chan error, 1)
++	go func() {
++		zeroDone <- d.WaitForDurability(0)
++	}()
++
++	// Wait briefly to verify it is blocked.
++	time.Sleep(20 * time.Millisecond)
++	select {
++	case <-zeroDone:
++		t.Fatal("WaitForDurability(0) should block before any commit")
++	default:
++	}
++	stats := d.DurabilityStats()
++	require.Equal(t, int64(1), stats.PendingWaiters)
++
++	// Commit a sync batch.
++	require.NoError(t, d.Set([]byte("a"), []byte("1"), Sync))
++
++	// Zero waiter should unblock with nil.
++	select {
++	case err := <-zeroDone:
++		require.NoError(t, err)
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for WaitForDurability(0) to unblock")
++	}
++
++	// Now WaitForDurability(0) should succeed immediately.
++	require.NoError(t, d.WaitForDurability(0))
++
++	// Write batch 2 and record seqnum.
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("b"), []byte("2"), nil))
++	require.NoError(t, b.Commit(Sync))
++	seq := b.SeqNum()
++
++	// Waiting on seq should succeed immediately.
++	require.NoError(t, d.WaitForDurability(seq))
++
++	// Waiting on a future seqnum should block.
++	futureSeq := seq + 10
++	futureDone := make(chan error, 1)
++	go func() {
++		futureDone <- d.WaitForDurability(futureSeq)
++	}()
++
++	time.Sleep(20 * time.Millisecond)
++	select {
++	case <-futureDone:
++		t.Fatal("future waiter should block")
++	default:
++	}
++
++	// Commit more batches up to futureSeq.
++	for {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("c"), []byte("3"), nil))
++		require.NoError(t, b.Commit(Sync))
++		currSeq := b.SeqNum()
++		if currSeq >= futureSeq {
++			break
++		}
++	}
++
++	select {
++	case err := <-futureDone:
++		require.NoError(t, err)
++	case <-time.After(2 * time.Second):
++		t.Fatal("future waiter timed out")
++	}
++}
++
++func TestWaitForDurabilityBatch(t *testing.T) {
++	memFS := vfs.NewMem()
++	d, err := Open("test", &Options{FS: memFS})
++	require.NoError(t, err)
++	defer d.Close()
++
++	// nil/empty returns nil immediately.
++	require.NoError(t, d.WaitForDurabilityBatch(nil))
++	require.NoError(t, d.WaitForDurabilityBatch([]base.SeqNum{}))
++	require.NoError(t, d.WaitForDurabilityBatchContext(context.Background(), nil))
++	require.NoError(t, d.WaitForDurabilityBatchContext(context.Background(), []base.SeqNum{}))
++
++	// Commit several batches.
++	var seqs []base.SeqNum
++	for i := 0; i < 5; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++		seqs = append(seqs, b.SeqNum())
++	}
++
++	// Every seqnum in slice should be durable.
++	require.NoError(t, d.WaitForDurabilityBatch(seqs))
++	require.NoError(t, d.WaitForDurabilityBatch([]base.SeqNum{0, seqs[len(seqs)-1]}))
++}
++
++func TestWaitForJobDurability(t *testing.T) {
++	memFS := vfs.NewMem()
++	var durableJobs []int
++	var mu sync.Mutex
++
++	opts := &Options{
++		FS: memFS,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				defer mu.Unlock()
++				durableJobs = append(durableJobs, info.JobID)
++			},
++		},
++	}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Zero and negative IDs get an unknown error.
++	err0 := d.WaitForJobDurability(0)
++	require.Error(t, err0)
++	require.True(t, strings.Contains(err0.Error(), "unknown"))
++	require.True(t, errors.Is(err0, ErrJobDurabilityUnknown))
++
++	errNeg := d.WaitForJobDurability(-10)
++	require.Error(t, errNeg)
++	require.True(t, strings.Contains(errNeg.Error(), "unknown"))
++	require.True(t, errors.Is(errNeg, ErrJobDurabilityUnknown))
++
++	// Never-seen future ID gets unknown error.
++	errFuture := d.WaitForJobDurability(999999)
++	require.Error(t, errFuture)
++	require.True(t, strings.Contains(errFuture.Error(), "unknown"))
++	require.True(t, errors.Is(errFuture, ErrJobDurabilityUnknown))
++
++	// Commit a sync batch.
++	require.NoError(t, d.Set([]byte("k"), []byte("v"), Sync))
++
++	mu.Lock()
++	require.Len(t, durableJobs, 1)
++	jobID := durableJobs[0]
++	mu.Unlock()
++
++	// Waiting for already-completed job succeeds immediately.
++	require.NoError(t, d.WaitForJobDurability(jobID))
++
++	// Test bounded retention window expiration:
++	// Commit maxRetainedJobs + 100 batches to force eviction of jobID.
++	for i := 0; i < maxRetainedJobs+100; i++ {
++		require.NoError(t, d.Set([]byte("k"), []byte("v"), Sync))
++	}
++
++	errExpired := d.WaitForJobDurability(jobID)
++	require.Error(t, errExpired)
++	require.True(t, strings.Contains(errExpired.Error(), "expired"))
++	require.True(t, errors.Is(errExpired, ErrJobDurabilityExpired))
++}
++
++func TestDurableStateAndStats(t *testing.T) {
++	memFS := vfs.NewMem()
++	d, err := Open("test", &Options{FS: memFS})
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Verify all stats fields start at zero before any commits.
++	stats := d.DurabilityStats()
++	require.Equal(t, base.SeqNum(0), stats.HighestDurableSeqNum)
++	require.NoError(t, stats.FirstErr)
++	require.Equal(t, int64(0), stats.PendingWaiters)
++	require.Equal(t, uint64(0), stats.TotalDurableCommits)
++	require.Equal(t, uint64(0), stats.TotalFailedCommits)
++	require.Equal(t, time.Duration(0), stats.CumulativeSyncDuration)
++	require.Equal(t, time.Duration(0), stats.MaxSyncDuration)
++
++	seq, err := d.DurableState()
++	require.Equal(t, base.SeqNum(0), seq)
++	require.NoError(t, err)
++
++	// Commit 3 sync batches.
++	var lastSeq base.SeqNum
++	for i := 0; i < 3; i++ {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++		lastSeq = b.SeqNum()
++	}
++
++	stats = d.DurabilityStats()
++	require.GreaterOrEqual(t, stats.HighestDurableSeqNum, lastSeq)
++	require.NoError(t, stats.FirstErr)
++	require.Equal(t, int64(0), stats.PendingWaiters)
++	require.Equal(t, uint64(3), stats.TotalDurableCommits)
++	require.Equal(t, uint64(0), stats.TotalFailedCommits)
++	require.Greater(t, stats.CumulativeSyncDuration, time.Duration(0))
++	require.Greater(t, stats.MaxSyncDuration, time.Duration(0))
++
++	seq, err = d.DurableState()
++	require.Equal(t, stats.HighestDurableSeqNum, seq)
++	require.NoError(t, err)
++}
++
++func TestDurabilityNotify(t *testing.T) {
++	memFS := vfs.NewMem()
++	d, err := Open("test", &Options{FS: memFS})
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Commit batch 1.
++	b1 := d.NewBatch()
++	require.NoError(t, b1.Set([]byte("k1"), []byte("v1"), nil))
++	require.NoError(t, b1.Commit(Sync))
++	seq1 := b1.SeqNum()
++
++	// Pre-filled channel for already-durable seqnum delivers nil.
++	ch1 := d.DurabilityNotify(seq1)
++	select {
++	case err := <-ch1:
++		require.NoError(t, err)
++	default:
++		t.Fatal("channel should be pre-filled with nil")
++	}
++
++	// Pre-filled channel for seqnum 0 after a commit delivers nil.
++	chZero := d.DurabilityNotify(0)
++	select {
++	case err := <-chZero:
++		require.NoError(t, err)
++	default:
++		t.Fatal("channel for 0 should be pre-filled with nil")
++	}
++
++	// Future seqnum subscription.
++	futureSeq := seq1 + 10
++	chFuture := d.DurabilityNotify(futureSeq)
++	select {
++	case <-chFuture:
++		t.Fatal("future channel should not be ready")
++	default:
++	}
++
++	// Commit up to futureSeq.
++	for {
++		b := d.NewBatch()
++		require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++		require.NoError(t, b.Commit(Sync))
++		s := b.SeqNum()
++		if s >= futureSeq {
++			break
++		}
++	}
++
++	select {
++	case err := <-chFuture:
++		require.NoError(t, err)
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for durability notification")
++	}
++
++	// Test subscription bound:
++	for i := 0; i < maxDurabilitySubscriptions; i++ {
++		d.DurabilityNotify(base.SeqNum(999999))
++	}
++	// Excess caller gets pre-filled channel with immediate non-nil error.
++	chExcess := d.DurabilityNotify(base.SeqNum(999999))
++	select {
++	case err := <-chExcess:
++		require.Error(t, err)
++		require.True(t, errors.Is(err, ErrDurabilitySubscriptionLimit))
++	default:
++		t.Fatal("excess channel should be pre-filled with error")
++	}
++}
++
++func TestCloseUnblocksWaiters(t *testing.T) {
++	memFS := vfs.NewMem()
++	d, err := Open("test", &Options{FS: memFS})
++	require.NoError(t, err)
++
++	futureSeq := base.SeqNum(1000)
++
++	var wg sync.WaitGroup
++	errs := make([]error, 6)
++
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		errs[0] = d.WaitForDurability(futureSeq)
++	}()
++
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		errs[1] = d.WaitForDurabilityContext(context.Background(), futureSeq)
++	}()
++
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		errs[2] = d.WaitForDurabilityBatch([]base.SeqNum{futureSeq})
++	}()
++
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		errs[3] = d.WaitForDurabilityBatchContext(context.Background(), []base.SeqNum{futureSeq})
++	}()
++
++	// Allocate a job ID and wait on it.
++	jobID := d.durabilityMgr.newJobID()
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		errs[4] = d.WaitForJobDurability(jobID)
++	}()
++
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		errs[5] = d.WaitForJobDurabilityContext(context.Background(), jobID)
++	}()
++
++	chNotify := d.DurabilityNotify(futureSeq)
++
++	// Wait for goroutines to block.
++	for {
++		stats := d.DurabilityStats()
++		if stats.PendingWaiters == 6 {
++			break
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++
++	// Close the DB.
++	require.NoError(t, d.Close())
++
++	// Wait for all waiters to unblock.
++	wg.Wait()
++
++	for i := 0; i < 6; i++ {
++		require.Error(t, errs[i], "waiter %d should unblock with error", i)
++	}
++
++	select {
++	case err := <-chNotify:
++		require.Error(t, err, "DurabilityNotify should deliver error on DB close")
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for DurabilityNotify channel on close")
++	}
++}
++
++func TestDisableWALReturnsNilImmediately(t *testing.T) {
++	memFS := vfs.NewMem()
++	opts := &Options{
++		FS:         memFS,
++		DisableWAL: true,
++	}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	require.NoError(t, d.WaitForDurability(100))
++	require.NoError(t, d.WaitForDurability(0))
++	require.NoError(t, d.WaitForDurabilityContext(context.Background(), 100))
++	require.NoError(t, d.WaitForDurabilityBatch([]base.SeqNum{100, 200}))
++	require.NoError(t, d.WaitForDurabilityBatchContext(context.Background(), []base.SeqNum{100}))
++	require.NoError(t, d.WaitForJobDurability(1))
++	require.NoError(t, d.WaitForJobDurability(0))
++	require.NoError(t, d.WaitForJobDurabilityContext(context.Background(), 1))
++
++	ch := d.DurabilityNotify(100)
++	select {
++	case err := <-ch:
++		require.NoError(t, err)
++	default:
++		t.Fatal("channel should be pre-filled with nil when DisableWAL is true")
++	}
++}
++
++func TestContextPrecedence(t *testing.T) {
++	memFS := vfs.NewMem()
++	d, err := Open("test", &Options{FS: memFS})
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Commit a sync batch.
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	require.NoError(t, b.Commit(Sync))
++	seq := b.SeqNum()
++
++	// Context is canceled before calling, but seq is already durable.
++	// Durability takes precedence over context cancellation.
++	ctxCanceled, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	require.NoError(t, d.WaitForDurabilityContext(ctxCanceled, seq))
++	require.NoError(t, d.WaitForDurabilityBatchContext(ctxCanceled, []base.SeqNum{seq}))
++
++	// For an existing durable job, durability takes precedence over context cancellation.
++	require.NoError(t, d.WaitForJobDurabilityContext(ctxCanceled, 1))
++
++	// For a future seqnum, canceled context should return ctx.Err().
++	futureSeq := seq + 1000
++	require.Equal(t, context.Canceled, d.WaitForDurabilityContext(ctxCanceled, futureSeq))
++	require.Equal(t, context.Canceled, d.WaitForDurabilityBatchContext(ctxCanceled, []base.SeqNum{futureSeq}))
++}
++
++func TestTeeEventListenerBatchDurable(t *testing.T) {
++	var aCalled, bCalled atomic.Bool
++
++	elA := EventListener{
++		BatchDurable: func(info BatchDurableInfo) {
++			aCalled.Store(true)
++		},
++	}
++	elB := EventListener{
++		BatchDurable: func(info BatchDurableInfo) {
++			bCalled.Store(true)
++		},
++	}
++
++	tee := TeeEventListener(elA, elB)
++
++	memFS := vfs.NewMem()
++	opts := &Options{
++		FS:            memFS,
++		EventListener: &tee,
++	}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	require.NoError(t, d.Set([]byte("k"), []byte("v"), Sync))
++
++	require.True(t, aCalled.Load())
++	require.True(t, bCalled.Load())
++}
++
++func TestMetricsDurableCommitAccumulation(t *testing.T) {
++	memFS := vfs.NewMem()
++
++	// 1. Without BatchDurable configured.
++	d1, err := Open("test1", &Options{FS: memFS})
++	require.NoError(t, err)
++
++	for i := 0; i < 5; i++ {
++		require.NoError(t, d1.Set([]byte("k"), []byte("v"), Sync))
++	}
++	m1 := d1.Metrics()
++	require.Equal(t, uint64(0), m1.DurableCommitCount)
++	require.Equal(t, time.Duration(0), m1.DurableCommitDuration)
++	require.NoError(t, d1.Close())
++
++	// 2. With BatchDurable configured.
++	var durableCount atomic.Int32
++	opts := &Options{
++		FS: memFS,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				durableCount.Add(1)
++			},
++		},
++	}
++	d2, err := Open("test2", opts)
++	require.NoError(t, err)
++
++	for i := 0; i < 5; i++ {
++		require.NoError(t, d2.Set([]byte("k"), []byte("v"), Sync))
++	}
++	require.Equal(t, int32(5), durableCount.Load())
++
++	m2 := d2.Metrics()
++	require.Equal(t, uint64(5), m2.DurableCommitCount)
++	require.Greater(t, m2.DurableCommitDuration, time.Duration(0))
++	require.NoError(t, d2.Close())
++}
++
++func TestApplyNoSyncWaitWithBatchDurable(t *testing.T) {
++	memFS := vfs.NewMem()
++	var durableInfo atomic.Pointer[BatchDurableInfo]
++
++	opts := &Options{
++		FS: memFS,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				durableInfo.Store(&info)
++			},
++		},
++	}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	b := d.NewBatch()
++	require.NoError(t, b.Set([]byte("k"), []byte("v"), nil))
++	wo := &WriteOptions{
++		Sync:                true,
++		CommitCorrelationID: 999,
++	}
++
++	require.NoError(t, d.ApplyNoSyncWait(b, wo))
++
++	// Wait for WAL sync via b.SyncWait().
++	require.NoError(t, b.SyncWait())
++
++	// Callback should have fired.
++	info := durableInfo.Load()
++	require.NotNil(t, info)
++	require.Equal(t, uint64(999), info.CorrelationID)
++	require.Greater(t, info.ApplyDuration, time.Duration(0))
++	require.Greater(t, info.SyncDuration, time.Duration(0))
++	require.NoError(t, info.Err)
++}
++
++type syncErrorFS struct {
++	vfs.FS
++	failSync atomic.Bool
++}
++
++func (fs *syncErrorFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
++	f, err := fs.FS.Create(name, category)
++	if err != nil {
++		return nil, err
++	}
++	return &syncErrorFile{File: f, fs: fs}, nil
++}
++
++type syncErrorFile struct {
++	vfs.File
++	fs *syncErrorFS
++}
++
++func (f *syncErrorFile) Sync() error {
++	if f.fs.failSync.Load() {
++		return errors.New("injected sync error")
++	}
++	return f.File.Sync()
++}
++
++func (f *syncErrorFile) SyncData() error {
++	if f.fs.failSync.Load() {
++		return errors.New("injected sync error")
++	}
++	return f.File.SyncData()
++}
++
++func (f *syncErrorFile) SyncTo(length int64) (fullSync bool, err error) {
++	if f.fs.failSync.Load() {
++		return false, errors.New("injected sync error")
++	}
++	return f.File.SyncTo(length)
++}
++
++func TestWALSyncFailure(t *testing.T) {
++	memFS := &syncErrorFS{FS: vfs.NewMem()}
++	var durableEvents []BatchDurableInfo
++	var mu sync.Mutex
++
++	opts := &Options{
++		FS: memFS,
++		EventListener: &EventListener{
++			BatchDurable: func(info BatchDurableInfo) {
++				mu.Lock()
++				defer mu.Unlock()
++				durableEvents = append(durableEvents, info)
++			},
++		},
++	}
++
++	d, err := Open("test", opts)
++	require.NoError(t, err)
++	defer d.Close()
++
++	// Commit 1 succeeds.
++	require.NoError(t, d.Set([]byte("k1"), []byte("v1"), Sync))
++	mu.Lock()
++	require.Len(t, durableEvents, 1)
++	require.NoError(t, durableEvents[0].Err)
++	mu.Unlock()
++
++	// Enable failure for WAL sync.
++	memFS.failSync.Store(true)
++
++	// Commit 2 fails during WAL sync using ApplyNoSyncWait.
++	b2 := d.NewBatch()
++	require.NoError(t, b2.Set([]byte("k2"), []byte("v2"), nil))
++	require.NoError(t, d.ApplyNoSyncWait(b2, Sync))
++
++	syncWaitErr := b2.SyncWait()
++	require.Error(t, syncWaitErr)
++
++	mu.Lock()
++	require.Len(t, durableEvents, 2)
++	failedEvent := durableEvents[1]
++	mu.Unlock()
++
++	require.Error(t, failedEvent.Err)
++	require.Contains(t, failedEvent.Err.Error(), "injected sync error")
++
++	// Verify stats latch the error and count failure.
++	stats := d.DurabilityStats()
++	require.Equal(t, uint64(1), stats.TotalDurableCommits)
++	require.Equal(t, uint64(1), stats.TotalFailedCommits)
++	require.Error(t, stats.FirstErr)
++	require.Contains(t, stats.FirstErr.Error(), "injected sync error")
++
++	// Verify DurableState latches the error.
++	_, stateErr := d.DurableState()
++	require.Error(t, stateErr)
++	require.Contains(t, stateErr.Error(), "injected sync error")
++
++	// Verify wait APIs return the latched error.
++	require.Error(t, d.WaitForDurability(1000))
++	require.Error(t, d.WaitForDurabilityBatch([]base.SeqNum{1000}))
++	require.Error(t, d.WaitForJobDurability(failedEvent.JobID))
++	require.Error(t, d.WaitForJobDurabilityContext(context.Background(), failedEvent.JobID))
++
++	// Verify DurabilityNotify returns the latched error.
++	ch := d.DurabilityNotify(1000)
++	select {
++	case err := <-ch:
++		require.Error(t, err)
++		require.Contains(t, err.Error(), "injected sync error")
++	default:
++		t.Fatal("DurabilityNotify should deliver latched error")
++	}
++}
+diff --git a/event.go b/event.go
+index 8400b94c..3bd6f9eb 100644
+--- a/event.go
++++ b/event.go
+@@ -6,6 +6,7 @@ package pebble
+ 
+ import (
+ 	"fmt"
++	"reflect"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -915,6 +916,36 @@ func (k APIMisuseKind) String() string {
+ 	}
+ }
+ 
++// BatchDurableInfo contains the info for a BatchDurable event.
++type BatchDurableInfo struct {
++	JobID         int
++	SeqNum        base.SeqNum
++	Err           error
++	ApplyDuration time.Duration
++	SyncDuration  time.Duration
++	CorrelationID uint64
++	BatchSize     int
++	KeyCount      uint32
++}
++
++func (i BatchDurableInfo) String() string {
++	return redact.StringWithoutMarkers(i)
++}
++
++func (i BatchDurableInfo) SafeFormat(w redact.SafePrinter, _ rune) {
++	if i.Err != nil {
++		w.Printf("[JOB %d] batch durable seq=%d err=%v", i.JobID, i.SeqNum, i.Err)
++		return
++	}
++	w.Printf("[JOB %d] batch durable seq=%d count=%d size=%d", i.JobID, i.SeqNum, i.KeyCount, i.BatchSize)
++}
++
++var defaultBatchDurable = func(BatchDurableInfo) {}
++
++func isDefaultBatchDurable(fn func(BatchDurableInfo)) bool {
++	return fn == nil || reflect.ValueOf(fn).Pointer() == reflect.ValueOf(defaultBatchDurable).Pointer()
++}
++
+ // EventListener contains a set of functions that will be invoked when various
+ // significant DB events occur. Note that the functions should not run for an
+ // excessive amount of time as they are invoked synchronously by the DB and may
+@@ -925,6 +956,11 @@ type EventListener struct {
+ 	// operation such as flush or compaction.
+ 	BackgroundError func(error)
+ 
++	// BatchDurable is invoked exactly once per Sync commit after the WAL sync
++	// completes, even on failure. Non-sync commits and DisableWAL must never
++	// trigger it.
++	BatchDurable func(BatchDurableInfo)
++
+ 	// BlobFileCreated is invoked after a blob file has been created.
+ 	BlobFileCreated func(BlobFileCreateInfo)
+ 
+@@ -1036,6 +1072,9 @@ func (l *EventListener) EnsureDefaults(logger Logger) {
+ 			l.BackgroundError = func(error) {}
+ 		}
+ 	}
++	if l.BatchDurable == nil {
++		l.BatchDurable = defaultBatchDurable
++	}
+ 	if l.BlobFileCreated == nil {
+ 		l.BlobFileCreated = func(info BlobFileCreateInfo) {}
+ 	}
+@@ -1133,6 +1172,7 @@ func MakeLoggingEventListener(logger Logger) EventListener {
+ 		BackgroundError: func(err error) {
+ 			logger.Errorf("background error: %s", err)
+ 		},
++		BatchDurable: defaultBatchDurable,
+ 		BlobFileCreated: func(info BlobFileCreateInfo) {
+ 			logger.Infof("%s", info)
+ 		},
+@@ -1218,11 +1258,23 @@ func MakeLoggingEventListener(logger Logger) EventListener {
+ func TeeEventListener(a, b EventListener) EventListener {
+ 	a.EnsureDefaults(nil)
+ 	b.EnsureDefaults(nil)
++	aConfigured := !isDefaultBatchDurable(a.BatchDurable)
++	bConfigured := !isDefaultBatchDurable(b.BatchDurable)
++	var batchDurable func(BatchDurableInfo)
++	if aConfigured || bConfigured {
++		batchDurable = func(info BatchDurableInfo) {
++			a.BatchDurable(info)
++			b.BatchDurable(info)
++		}
++	} else {
++		batchDurable = defaultBatchDurable
++	}
+ 	return EventListener{
+ 		BackgroundError: func(err error) {
+ 			a.BackgroundError(err)
+ 			b.BackgroundError(err)
+ 		},
++		BatchDurable: batchDurable,
+ 		BlobFileCreated: func(info BlobFileCreateInfo) {
+ 			a.BlobFileCreated(info)
+ 			b.BlobFileCreated(info)
+diff --git a/metrics.go b/metrics.go
+index a1ddcd65..961363a0 100644
+--- a/metrics.go
++++ b/metrics.go
+@@ -379,6 +379,13 @@ type Metrics struct {
+ 
+ 	SecondaryCacheMetrics SecondaryCacheMetrics
+ 
++	// DurableCommitCount is the cumulative number of durable commits.
++	// Accumulated only when EventListener.BatchDurable is configured.
++	DurableCommitCount uint64
++	// DurableCommitDuration is the cumulative WAL sync phase time for durable
++	// commits. Accumulated only when EventListener.BatchDurable is configured.
++	DurableCommitDuration time.Duration
++
+ 	private struct {
+ 		optionsFileSize  uint64
+ 		manifestFileSize uint64
+diff --git a/open.go b/open.go
+index 3edf11ed..22897bcf 100644
+--- a/open.go
++++ b/open.go
+@@ -227,6 +227,12 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
+ 		apply:         d.commitApply,
+ 		write:         d.commitWrite,
+ 	})
++	d.durabilityMgr = newDurabilityManager(d)
++	d.durabilityMgr.start()
++	defer maybeCleanUp(func() error {
++		d.durabilityMgr.close()
++		return nil
++	})
+ 	d.mu.nextJobID = 1
+ 	d.mu.mem.nextSize = min(opts.MemTableSize, initialMemTableSize)
+ 	d.mu.compact.cond.L = &d.mu.Mutex
+diff --git a/options.go b/options.go
+index 5733690f..b38700ce 100644
+--- a/options.go
++++ b/options.go
+@@ -405,6 +405,10 @@ type WriteOptions struct {
+ 	//
+ 	// The default value is true.
+ 	Sync bool
++
++	// CommitCorrelationID is an optional caller-supplied identifier that is
++	// passed through to EventListener.BatchDurable.
++	CommitCorrelationID uint64
+ }
+ 
+ // Sync specifies the default write options for writes which synchronize to

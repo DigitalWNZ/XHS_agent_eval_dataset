@@ -1,0 +1,536 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,243 @@
++#!/usr/bin/env python3
++import sys
++import re
++import html
++
++# ---------------------------------------------------------------------------
++# Known Event Handlers Set
++# ---------------------------------------------------------------------------
++EVENT_NAMES = {
++    'abort', 'afterprint', 'animationend', 'animationiteration', 'animationstart',
++    'auxclick', 'beforecopy', 'beforecut', 'beforeinput', 'beforepaste',
++    'beforeprint', 'beforeunload', 'beforetoggle', 'blur', 'cancel', 'canplay',
++    'canplaythrough', 'change', 'click', 'close', 'contextlost', 'contextmenu',
++    'contextrestored', 'copy', 'cuechange', 'cut', 'dblclick', 'drag', 'dragend',
++    'dragenter', 'dragleave', 'dragover', 'dragstart', 'drop', 'durationchange',
++    'emptied', 'ended', 'error', 'focus', 'focusin', 'focusout', 'formdata',
++    'gotpointercapture', 'hashchange', 'input', 'invalid', 'keydown', 'keypress',
++    'keyup', 'languagechange', 'load', 'loadeddata', 'loadedmetadata', 'loadstart',
++    'lostpointercapture', 'message', 'messageerror', 'mousedown', 'mouseenter',
++    'mouseleave', 'mousemove', 'mouseout', 'mouseover', 'mouseup', 'mousewheel',
++    'offline', 'online', 'pagehide', 'pageshow', 'paste', 'pause', 'play',
++    'playing', 'pointercancel', 'pointerdown', 'pointerenter', 'pointerleave',
++    'pointermove', 'pointerout', 'pointerover', 'pointerrawupdate', 'pointerup',
++    'popstate', 'progress', 'ratechange', 'reset', 'resize', 'scroll', 'scrollend',
++    'search', 'securitypolicyviolation', 'seeked', 'seeking', 'select',
++    'selectionchange', 'selectstart', 'slotchange', 'stalled', 'storage',
++    'submit', 'suspend', 'timeupdate', 'toggle', 'touchcancel', 'touchend',
++    'touchmove', 'touchstart', 'transitioncancel', 'transitionend',
++    'transitionrun', 'transitionstart', 'unload', 'volumechange', 'waiting',
++    'wheel', 'webkitanimationend', 'webkitanimationiteration',
++    'webkitanimationstart', 'webkittransitionend'
++}
++
++# ---------------------------------------------------------------------------
++# Regex Patterns
++# ---------------------------------------------------------------------------
++
++# 1. Match <script ...> ... </script> or <script ... /> or unclosed <script ...>
++SCRIPT_RE = re.compile(
++    r'<script\b[^>]*>(?:[\s\S]*?<\/script\s*>|[\s\S]*$)|<script\b[^>]*\/>',
++    re.IGNORECASE
++)
++
++# 2. Match HTML tags
++TAG_RE = re.compile(r'''(?x)
++    <
++    (?P<slash>/)?
++    (?P<name>[a-zA-Z0-9_:-]+)
++    (?P<attrs>(?:[\s/]+[a-zA-Z0-9_:-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)*)
++    (?P<trail>[\s/]*)
++    >
++''')
++
++# 3. Match individual attributes within tag attribute string
++ATTR_RE = re.compile(r'''(?x)
++    (?P<spacing>[\s/]+)
++    (?P<name>[a-zA-Z0-9_:-]+)
++    (?:\s*=\s*(?P<val>"[^"]*"|'[^']*'|[^\s>]+))?
++''')
++
++def decode_fully(val: str) -> str:
++    """Repeatedly unescape HTML entities in val up to 5 times."""
++    curr = val
++    for _ in range(5):
++        next_val = html.unescape(curr)
++        if next_val == curr:
++            break
++        curr = next_val
++    return curr
++
++def clean_css_content(css_text: str) -> str:
++    """Clean JS references inside CSS / <style> tags / style attributes."""
++    # 1. Remove properties with javascript: in url(...)
++    css_text = re.sub(
++        r'[a-zA-Z0-9_-]+\s*:\s*[^;}]*url\s*\(\s*(?:"[^"]*javascript:[^"]*"|\'[^\']*javascript:[^\']*\x27|[^\)]*javascript:[^\)]*)\s*\)\s*;?',
++        '',
++        css_text,
++        flags=re.IGNORECASE
++    )
++    # 2. Remove properties with expression(...)
++    css_text = re.sub(
++        r'[a-zA-Z0-9_-]+\s*:\s*expression\s*\((?:[^()]*|\([^()]*\))*\)\s*;?',
++        '',
++        css_text,
++        flags=re.IGNORECASE
++    )
++    # 3. Remove -moz-binding and behavior
++    css_text = re.sub(
++        r'(?:-moz-binding|behavior)\s*:[^;}"\']+\s*;?',
++        '',
++        css_text,
++        flags=re.IGNORECASE
++    )
++    # Clean up double semicolons & internal double spaces
++    css_text = re.sub(r';\s*;', ';', css_text)
++    css_text = re.sub(r'(?<=\S) +', ' ', css_text)
++    return css_text
++
++def is_dangerous_attr_value(val: str, attr_name: str) -> bool:
++    if not val:
++        return False
++
++    # Unwrap quotes if present
++    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
++        inner_val = val[1:-1]
++    else:
++        inner_val = val
++
++    decoded = decode_fully(inner_val)
++    # Strip whitespace & control characters (\x00-\x20, \x7f-\x9f)
++    cleaned = re.sub(r'[\x00-\x20\x7f-\x9f]+', '', decoded).lower()
++
++    # Check for dangerous scheme / protocol prefixes
++    dangerous_prefixes = (
++        'javascript:',
++        'vbscript:',
++        'data:text/html',
++        'data:image/svg+xml',
++    )
++    if cleaned.startswith(dangerous_prefixes):
++        return True
++
++    # Check if 'javascript:' or 'javascript&colon;' is anywhere in cleaned/decoded scheme
++    if 'javascript:' in cleaned or 'javascript&colon;' in decoded.lower():
++        return True
++
++    return False
++
++def is_event_handler_attr(name: str) -> bool:
++    name_lower = name.lower()
++    if not name_lower.startswith('on'):
++        return False
++    event_part = name_lower[2:]
++    if event_part in EVENT_NAMES:
++        return True
++    return False
++
++def clean_tag_attrs(attrs_str: str) -> str:
++    if not attrs_str or not attrs_str.strip():
++        return attrs_str
++
++    out = []
++    for m in ATTR_RE.finditer(attrs_str):
++        spacing = m.group('spacing')
++        attr_name = m.group('name')
++        attr_val = m.group('val')
++
++        # 1. Check if event handler (onload, onclick, etc.)
++        if is_event_handler_attr(attr_name):
++            continue
++
++        # 2. Check if style attribute
++        if attr_name.lower() == 'style' and attr_val:
++            quote = ''
++            if (attr_val.startswith('"') and attr_val.endswith('"')) or (attr_val.startswith("'") and attr_val.endswith("'")):
++                quote = attr_val[0]
++                val_content = attr_val[1:-1]
++            else:
++                val_content = attr_val
++
++            cleaned_val = clean_css_content(val_content).strip()
++            if cleaned_val:
++                out.append(f"{spacing}{attr_name}={quote}{cleaned_val}{quote}")
++            continue
++
++        # 3. Check for dangerous attribute value (javascript: URLs)
++        if attr_val and is_dangerous_attr_value(attr_val, attr_name):
++            continue
++
++        # Safe attribute
++        out.append(m.group(0))
++
++    return ''.join(out)
++
++def clean_tag_match(m: re.Match) -> str:
++    slash = m.group('slash') or ''
++    tag_name = m.group('name')
++    attrs_str = m.group('attrs') or ''
++    trail = m.group('trail') or ''
++
++    # If tag_name itself is script (case-insensitive), remove completely
++    if tag_name.lower() == 'script':
++        return ''
++
++    cleaned_attrs = clean_tag_attrs(attrs_str)
++
++    if trail and '/' in trail and not cleaned_attrs:
++        trail_str = '/'
++    else:
++        trail_str = trail
++
++    return f"<{slash}{tag_name}{cleaned_attrs}{trail_str}>"
++
++def clean_style_tags(html_content: str) -> str:
++    def replace_style(m: re.Match) -> str:
++        open_tag = m.group(1)
++        css_body = m.group(2)
++        close_tag = m.group(3)
++        cleaned_body = clean_css_content(css_body)
++        return f"{open_tag}{cleaned_body}{close_tag}"
++
++    style_re = re.compile(
++        r'(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)',
++        re.IGNORECASE
++    )
++    return style_re.sub(replace_style, html_content)
++
++def filter_html(html_content: str) -> str:
++    # Step 1: Remove all <script>...</script> tags
++    content = SCRIPT_RE.sub('', html_content)
++
++    # Step 2: Clean <style> tag contents
++    content = clean_style_tags(content)
++
++    # Step 3: Clean all HTML tags and their attributes
++    content = TAG_RE.sub(clean_tag_match, content)
++
++    return content
++
++def main():
++    if len(sys.argv) < 2:
++        sys.exit(1)
++
++    filepath = sys.argv[1]
++
++    try:
++        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
++            content = f.read()
++    except Exception as e:
++        sys.stderr.write(f"Error reading file {filepath}: {e}\n")
++        sys.exit(1)
++
++    filtered_content = filter_html(content)
++
++    try:
++        with open(filepath, 'w', encoding='utf-8') as f:
++            f.write(filtered_content)
++    except Exception as e:
++        sys.stderr.write(f"Error writing file {filepath}: {e}\n")
++        sys.exit(1)
++
++if __name__ == '__main__':
++    main()
+diff --git a/scratch/test_css.py b/scratch/test_css.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_css.py
+@@ -0,0 +1,35 @@
++import re
++
++def clean_css_content(css_text: str) -> str:
++    # 1. Remove properties with javascript: in url(...)
++    css_text = re.sub(
++        r'[a-zA-Z0-9_-]+\s*:\s*[^;}]*url\s*\(\s*(?:"[^"]*javascript:[^"]*"|\'[^\']*javascript:[^\']*\x27|[^\)]*javascript:[^\)]*)\s*\)\s*;?',
++        '',
++        css_text,
++        flags=re.IGNORECASE
++    )
++    # 2. Remove properties with expression(...)
++    css_text = re.sub(
++        r'[a-zA-Z0-9_-]+\s*:\s*expression\s*\((?:[^()]*|\([^()]*\))*\)\s*;?',
++        '',
++        css_text,
++        flags=re.IGNORECASE
++    )
++    # 3. Remove -moz-binding and behavior
++    css_text = re.sub(
++        r'(?:-moz-binding|behavior)\s*:[^;}"\']+\s*;?',
++        '',
++        css_text,
++        flags=re.IGNORECASE
++    )
++    # Clean up double semicolons or spacing
++    css_text = re.sub(r';\s*;', ';', css_text)
++    return css_text.strip()
++
++sample1 = "color: red; background: url('javascript:alert(1)'); margin: 10px;"
++sample2 = "body { background: url(\"javascript:alert(1)\"); font-size: 14px; }"
++sample3 = "p { width: expression(alert(1)); }"
++
++print("Sample 1:", repr(clean_css_content(sample1)))
++print("Sample 2:", repr(clean_css_content(sample2)))
++print("Sample 3:", repr(clean_css_content(sample3)))
+diff --git a/scratch/test_edge_cases.py b/scratch/test_edge_cases.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_edge_cases.py
+@@ -0,0 +1,84 @@
++import subprocess
++import sys
++import tempfile
++
++EDGE_CASES = [
++    {
++        "name": "Multi-line attributes",
++        "input": '<a\n  href="javascript:alert(1)"\n  class="link">Link</a>',
++        "expected": '<a\n  \n  class="link">Link</a>'
++    },
++    {
++        "name": "Namespaced & hyphenated attributes",
++        "input": '<a xml:lang="en" data-test-id="123" aria-label="btn" xlink:href="javascript:alert(1)">Link</a>',
++        "expected": '<a xml:lang="en" data-test-id="123" aria-label="btn">Link</a>'
++    },
++    {
++        "name": "Slash separator tag <script/src=...>",
++        "input": '<script/src="http://example.com/a.js"></script><p>Text</p>',
++        "expected": '<p>Text</p>'
++    },
++    {
++        "name": "Script with comments inside",
++        "input": '<script><!-- alert(1); --></script><p>Text</p>',
++        "expected": '<p>Text</p>'
++    },
++    {
++        "name": "Script with line breaks inside opening tag",
++        "input": '<script\ntype="text/javascript"\n>alert(1)</script><p>Text</p>',
++        "expected": '<p>Text</p>'
++    },
++    {
++        "name": "Mixed case script tag <ScRiPt>",
++        "input": '<ScRiPt>alert(1)</sCrIpT><p>Text</p>',
++        "expected": '<p>Text</p>'
++    },
++    {
++        "name": "Dangerous URIs in img/iframe/form/object/embed",
++        "input": '<img src="javascript:alert(1)" />\n<iframe src="javascript:alert(2)"></iframe>\n<form action="javascript:alert(3)"></form>\n<object data="javascript:alert(4)"></object>\n<embed src="javascript:alert(5)" />',
++        "expected": '<img />\n<iframe></iframe>\n<form></form>\n<object></object>\n<embed />'
++    },
++    {
++        "name": "Unclosed script at EOF",
++        "input": '<div><script>alert(1);',
++        "expected": '<div>'
++    }
++]
++
++def run_edge_tests():
++    passed = 0
++    failed = 0
++
++    for i, tc in enumerate(EDGE_CASES, 1):
++        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.html') as f:
++            f.write(tc["input"])
++            tmp_path = f.name
++
++        try:
++            res = subprocess.run([sys.executable, "/app/filter.py", tmp_path], capture_output=True, text=True)
++            if res.returncode != 0:
++                print(f"FAILED [{i}] {tc['name']} - Non-zero exit {res.returncode}")
++                print(res.stderr)
++                failed += 1
++                continue
++
++            with open(tmp_path, 'r', encoding='utf-8') as f:
++                output = f.read()
++
++            if output == tc["expected"]:
++                print(f"PASSED [{i}] {tc['name']}")
++                passed += 1
++            else:
++                print(f"FAILED [{i}] {tc['name']}")
++                print("--- EXPECTED ---")
++                print(repr(tc["expected"]))
++                print("--- ACTUAL ---")
++                print(repr(output))
++                failed += 1
++        finally:
++            pass
++
++    print(f"\nTotal: {len(EDGE_CASES)} | Passed: {passed} | Failed: {failed}")
++
++if __name__ == "__main__":
++    run_edge_tests()
+diff --git a/scratch/test_suite.py b/scratch/test_suite.py
+new file mode 100644
+--- /dev/null
++++ b/scratch/test_suite.py
+@@ -0,0 +1,154 @@
++import os
++import subprocess
++import tempfile
++import sys
++
++TEST_CASES = [
++    {
++        "name": "Basic Script Removal & Formatting Preservation",
++        "input": """<!DOCTYPE html>
++<html>
++  <head>
++    <title>Test Page</title>
++    <script type="text/javascript">
++      alert('xss');
++    </script>
++  </head>
++  <body class="main-body" id="b1">
++    <h1 class="header">Hello World</h1>
++    <p>This is a test paragraph.</p>
++  </body>
++</html>""",
++        "expected": """<!DOCTYPE html>
++<html>
++  <head>
++    <title>Test Page</title>
++    
++  </head>
++  <body class="main-body" id="b1">
++    <h1 class="header">Hello World</h1>
++    <p>This is a test paragraph.</p>
++  </body>
++</html>"""
++    },
++    {
++        "name": "Event Handler Removal",
++        "input": """<button class="btn" onclick="alert(1)" id="btn1">Click me</button>
++<img src="pic.jpg" onerror='alert(2)' alt="Picture" />
++<body onload=alert(3) onmouseover="hover()"></body>""",
++        "expected": """<button class="btn" id="btn1">Click me</button>
++<img src="pic.jpg" alt="Picture" />
++<body></body>"""
++    },
++    {
++        "name": "Javascript Protocol Removal",
++        "input": """<a href="javascript:alert(1)" class="link">Link 1</a>
++<a href="  javascript:alert(2)  " id="l2">Link 2</a>
++<a href="java&#x0A;script:alert(3)">Link 3</a>
++<a href="javascript&colon;alert(4)">Link 4</a>
++<a href="https://example.com" class="safe">Safe Link</a>""",
++        "expected": """<a class="link">Link 1</a>
++<a id="l2">Link 2</a>
++<a>Link 3</a>
++<a>Link 4</a>
++<a href="https://example.com" class="safe">Safe Link</a>"""
++    },
++    {
++        "name": "Table and Structure Preservation",
++        "input": """<table class="table-striped" border="1" cellpadding="5">
++  <thead>
++    <tr>
++      <th scope="col">ID</th>
++      <th scope="col">Name</th>
++    </tr>
++  </thead>
++  <tbody>
++    <tr id="row-1">
++      <td>1</td>
++      <td>Alice <script>alert('a')</script></td>
++    </tr>
++    <tr id="row-2" onclick="selectRow(2)">
++      <td>2</td>
++      <td>Bob</td>
++    </tr>
++  </tbody>
++</table>""",
++        "expected": """<table class="table-striped" border="1" cellpadding="5">
++  <thead>
++    <tr>
++      <th scope="col">ID</th>
++      <th scope="col">Name</th>
++    </tr>
++  </thead>
++  <tbody>
++    <tr id="row-1">
++      <td>1</td>
++      <td>Alice </td>
++    </tr>
++    <tr id="row-2">
++      <td>2</td>
++      <td>Bob</td>
++    </tr>
++  </tbody>
++</table>"""
++    },
++    {
++        "name": "CSS / Style Injection Removal",
++        "input": """<div style="color: red; background: url('javascript:alert(1)'); margin: 10px;">Box</div>
++<style>
++  body { background: url("javascript:alert(1)"); font-size: 14px; }
++  p { width: expression(alert(1)); }
++</style>""",
++        "expected": """<div style="color: red; margin: 10px;">Box</div>
++<style>
++  body { font-size: 14px; }
++  p { }
++</style>"""
++    },
++    {
++        "name": "Non-event 'on' Attributes (e.g., 'one', 'only')",
++        "input": """<div one="value1" only="value2" onclick="alert(1)">Test</div>""",
++        "expected": """<div one="value1" only="value2">Test</div>"""
++    }
++]
++
++def run_tests():
++    passed = 0
++    failed = 0
++
++    for i, tc in enumerate(TEST_CASES, 1):
++        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.html') as f:
++            f.write(tc["input"])
++            tmp_path = f.name
++
++        try:
++            res = subprocess.run([sys.executable, "/app/filter.py", tmp_path], capture_output=True, text=True)
++            if res.returncode != 0:
++                print(f"FAILED [{i}] {tc['name']} - Process returned non-zero code {res.returncode}")
++                print(res.stderr)
++                failed += 1
++                continue
++
++            with open(tmp_path, 'r', encoding='utf-8') as f:
++                output = f.read()
++
++            if output == tc["expected"]:
++                print(f"PASSED [{i}] {tc['name']}")
++                passed += 1
++            else:
++                print(f"FAILED [{i}] {tc['name']}")
++                print("--- EXPECTED ---")
++                print(repr(tc["expected"]))
++                print("--- ACTUAL ---")
++                print(repr(output))
++                failed += 1
++        finally:
++            if os.path.exists(tmp_path):
++                os.remove(tmp_path)
++
++    print(f"\nTotal: {len(TEST_CASES)} | Passed: {passed} | Failed: {failed}")
++    if failed > 0:
++        sys.exit(1)
++
++if __name__ == "__main__":
++    run_tests()

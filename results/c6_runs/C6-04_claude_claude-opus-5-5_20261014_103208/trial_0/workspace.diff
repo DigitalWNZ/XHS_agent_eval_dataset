@@ -1,0 +1,169 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++"""Detect hurdle jump takeoff and landing frames in an MP4 video.
++
++Usage: python3 jump_analyzer.py [video.mp4] [output.toml]
++
++Approach: the camera is static and the first frame is empty, so the athlete
++is segmented by background subtraction. For every frame we find the lowest
++foreground point of the athlete (the feet). Frames whose lowest point is near
++the ground level are ground contacts. The jump is the airborne interval
++(no ground contact) during which the athlete crosses the hurdle.
++"""
++import sys
++
++import cv2
++import numpy as np
++import toml
++
++HURDLE_X = 495          # hurdle position (pixels, at 960 px width)
++SKY_CUTOFF = 100        # ignore rows above this (moving clouds)
++DIFF_THRESH = 40
++MIN_COMPONENT = 60
++MIN_ATHLETE_AREA = 1500
++CONTACT_TOL = 12        # px above ground level still counted as contact
++
++
++def read_frames(path):
++    cap = cv2.VideoCapture(path)
++    frames = []
++    while True:
++        ok, f = cap.read()
++        if not ok:
++            break
++        frames.append(f)
++    cap.release()
++    return frames
++
++
++def analyze_frame(frame, bg, scale):
++    f = cv2.GaussianBlur(frame, (5, 5), 0).astype(np.int16)
++    d = np.abs(f - bg).max(axis=2)
++    mask = (d > DIFF_THRESH).astype(np.uint8)
++    mask[: int(SKY_CUTOFF * scale)] = 0
++    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
++    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
++    n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
++    if n <= 1:
++        return None
++    comps = [s for s in stats[1:] if s[4] >= MIN_COMPONENT * scale * scale]
++    if not comps:
++        return None
++    main = max(comps, key=lambda s: s[4])
++    margin = 80 * scale
++    x0, x1 = main[0] - margin, main[0] + main[2] + margin
++    sel = [s for s in comps if s[0] + s[2] >= x0 and s[0] <= x1]
++    area = sum(s[4] for s in sel)
++    if area < MIN_ATHLETE_AREA * scale * scale:
++        return None
++    left = min(s[0] for s in sel)
++    right = max(s[0] + s[2] for s in sel)
++    bottom = max(s[1] + s[3] for s in sel) - 2  # undo dilation
++    # x of the lowest point region (the foot on/near the ground)
++    low = [s for s in sel if s[1] + s[3] - 2 >= bottom - 3]
++    foot_x = np.mean([s[0] + s[2] / 2.0 for s in low])
++    return dict(left=left, right=right, cx=(left + right) / 2.0,
++                bottom=bottom, foot_x=foot_x, area=area)
++
++
++def runs(flags):
++    """Return list of (start, end) inclusive runs where flags is True."""
++    out, start = [], None
++    for i, v in enumerate(flags):
++        if v and start is None:
++            start = i
++        elif not v and start is not None:
++            out.append((start, i - 1))
++            start = None
++    if start is not None:
++        out.append((start, len(flags) - 1))
++    return out
++
++
++def detect(path):
++    frames = read_frames(path)
++    if not frames:
++        raise RuntimeError("could not read video")
++    h, w = frames[0].shape[:2]
++    scale = w / 960.0
++    hurdle_x = HURDLE_X * scale
++    bg = cv2.GaussianBlur(frames[0], (5, 5), 0).astype(np.int16)
++    info = [analyze_frame(f, bg, scale) for f in frames]
++
++    present = [i for i, r in enumerate(info) if r is not None]
++    if not present:
++        return 0, 0
++    # Keep only the main pass of the athlete (contiguous detections, small
++    # gaps allowed) with the largest total foreground; drops sporadic noise.
++    groups, cur = [], [present[0]]
++    for i in present[1:]:
++        if i - cur[-1] <= 3:
++            cur.append(i)
++        else:
++            groups.append(cur)
++            cur = [i]
++    groups.append(cur)
++    present = max(groups, key=lambda g: sum(info[i]["area"] for i in g))
++    keep = set(present)
++    info = [r if i in keep else None for i, r in enumerate(info)]
++    bottoms = np.array([info[i]["bottom"] for i in present], dtype=float)
++    ground = np.percentile(bottoms, 90)
++    tol = CONTACT_TOL * scale
++
++    contact = [r is not None and r["bottom"] >= ground - tol for r in info]
++    first, last = present[0], present[-1]
++
++    # Frame where the athlete crosses the hurdle line.
++    cross = None
++    for a, b in zip(present, present[1:]):
++        ca, cb = info[a]["cx"], info[b]["cx"]
++        if (ca - hurdle_x) * (cb - hurdle_x) <= 0:
++            cross = a if abs(ca - hurdle_x) < abs(cb - hurdle_x) else b
++            break
++    if cross is None:
++        cross = min(present, key=lambda i: abs(info[i]["cx"] - hurdle_x))
++
++    # Airborne runs within the athlete's visible span.
++    air = [(a, b) for a, b in runs([not c for c in contact])
++           if a > first and b < last]
++    best = None
++    for a, b in air:
++        if a <= cross <= b:
++            best = (a, b)
++            break
++    if best is None and air:
++        # closest long airborne run to the crossing
++        best = min(air, key=lambda r: (min(abs(r[0] - cross), abs(r[1] - cross))
++                                       - 0.5 * (r[1] - r[0])))
++    if best is None:
++        return max(cross - 4, 0), cross + 4
++
++    a, b = best
++    takeoff = a - 1   # last frame with the takeoff foot on the ground
++    land = b + 1      # first frame with the landing foot on the ground
++    return int(takeoff), int(land)
++
++
++def main():
++    video = sys.argv[1] if len(sys.argv) > 1 else "/app/example_video.mp4"
++    out = sys.argv[2] if len(sys.argv) > 2 else "/app/output.toml"
++    takeoff, land = detect(video)
++    with open(out, "w") as fh:
++        toml.dump({"jump_takeoff_frame_number": takeoff,
++                   "jump_land_frame_number": land}, fh)
++    print(f"takeoff={takeoff} land={land}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

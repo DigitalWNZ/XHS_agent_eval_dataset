@@ -1,0 +1,198 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python3
++import argparse
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description="Analyze MP4 videos of hurdle jumpers.")
++    parser.add_argument("video_file", nargs="?", default="/app/example_video.mp4", help="Path to input MP4 video file")
++    parser.add_argument("--video", type=str, default=None, help="Path to input MP4 video file")
++    parser.add_argument("--output", type=str, default="/app/output.toml", help="Path to output TOML file")
++    args = parser.parse_args()
++
++    video_path = args.video if args.video else args.video_file
++    return video_path, args.output
++
++
++def analyze_video(video_path):
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Cannot open video file: {video_path}")
++
++    # Read initial frame as clean background reference
++    ret, bg = cap.read()
++    if not ret or bg is None:
++        raise ValueError(f"Failed to read first frame from {video_path}")
++
++    bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
++    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
++
++    # Reset video pointer to frame 0
++    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
++
++    prev_gray = bg_gray.copy()
++    all_blobs_by_frame = []
++
++    for idx in range(total_frames):
++        ret, frame = cap.read()
++        if not ret:
++            break
++
++        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++
++        # Difference against background and adjacent frame
++        diff_bg = cv2.absdiff(gray, bg_gray)
++        diff_prev = cv2.absdiff(gray, prev_gray)
++
++        # Binary motion/foreground mask
++        mask = (((diff_bg > 20) | (diff_prev > 12)) * 255).astype(np.uint8)
++
++        # Mask out sky/top structure and bottom border
++        h_img, w_img = mask.shape
++        mask[: int(h_img * 0.05), :] = 0
++        mask[int(h_img * 0.88) :, :] = 0
++        mask[:, : int(w_img * 0.01)] = 0
++        mask[:, int(w_img * 0.99) :] = 0
++
++        # Morphological filtering to connect runner body
++        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
++
++        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
++
++        frame_blobs = []
++        for i in range(1, num):
++            area = stats[i, cv2.CC_STAT_AREA]
++            h = stats[i, cv2.CC_STAT_HEIGHT]
++
++            if area > 800 and h > 40:
++                ys, xs = np.where(labels == i)
++                p98_y = np.percentile(ys, 98)
++                p2_y = np.percentile(ys, 2)
++                mean_x = np.mean(xs)
++
++                frame_blobs.append({
++                    "frame": idx,
++                    "center_x": mean_x,
++                    "foot_y": p98_y,
++                    "head_y": p2_y,
++                    "area": area,
++                })
++
++        all_blobs_by_frame.append(frame_blobs)
++        prev_gray = gray
++
++    cap.release()
++
++    # Track runner trajectory across frames
++    tracked_trajectory = []
++    tracking_active = False
++    finished = False
++    last_x = None
++
++    for idx, blobs in enumerate(all_blobs_by_frame):
++        if finished:
++            break
++
++        if not tracking_active:
++            entry_candidates = [b for b in blobs if b["center_x"] > w_img * 0.55]
++            if entry_candidates:
++                entry_candidates.sort(key=lambda b: b["area"], reverse=True)
++                best = entry_candidates[0]
++                tracked_trajectory.append(best)
++                tracking_active = True
++                last_x = best["center_x"]
++        else:
++            if not blobs:
++                continue
++
++            valid = [b for b in blobs if (last_x - 120) <= b["center_x"] <= (last_x + 30)]
++            if valid:
++                valid.sort(key=lambda b: b["area"], reverse=True)
++                best = valid[0]
++                tracked_trajectory.append(best)
++                last_x = best["center_x"]
++
++                if last_x < w_img * 0.08:
++                    finished = True
++
++    if not tracked_trajectory:
++        raise ValueError("Could not detect runner in video")
++
++    # Find apogee (peak height / min foot_y near hurdle region)
++    hurdle_zone = [t for t in tracked_trajectory if w_img * 0.35 <= t["center_x"] <= w_img * 0.68]
++    if not hurdle_zone:
++        hurdle_zone = tracked_trajectory
++
++    apogee_item = min(hurdle_zone, key=lambda t: t["foot_y"])
++    apogee_frame = apogee_item["frame"]
++
++    # Ground baseline estimation
++    all_foot_y = [t["foot_y"] for t in tracked_trajectory]
++    ground_y = np.percentile(all_foot_y, 85)
++
++    # Search backward from apogee for takeoff (last ground contact before launch)
++    ground_before = [
++        t for t in tracked_trajectory if t["frame"] < apogee_frame and t["foot_y"] >= ground_y - 20
++    ]
++    if ground_before:
++        takeoff_item = max(ground_before, key=lambda t: t["frame"])
++        takeoff_frame = int(takeoff_item["frame"])
++    else:
++        takeoff_frame = int(max(0, apogee_frame - 5))
++
++    # Search forward from apogee for landing (first ground contact after flight)
++    ground_after = [
++        t for t in tracked_trajectory if t["frame"] > apogee_frame and t["foot_y"] >= ground_y - 20
++    ]
++    if ground_after:
++        land_item = min(ground_after, key=lambda t: t["frame"])
++        land_frame = int(land_item["frame"])
++    else:
++        land_frame = int(min(total_frames - 1, apogee_frame + 5))
++
++    return takeoff_frame, land_frame
++
++
++def main():
++    video_path, output_path = parse_args()
++    takeoff_frame, land_frame = analyze_video(video_path)
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    # Write TOML file
++    os_dir = os.path.dirname(output_path)
++    if os_dir:
++        os.makedirs(os_dir, exist_ok=True)
++
++    with open(output_path, "w") as f:
++        toml.dump(result, f)
++
++    print(f"Analysis complete. Output written to {output_path}")
++    print(f"jump_takeoff_frame_number = {takeoff_frame}")
++    print(f"jump_land_frame_number = {land_frame}")
++
++
++if __name__ == "__main__":
++    import os
++
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 54
++jump_land_frame_number = 62

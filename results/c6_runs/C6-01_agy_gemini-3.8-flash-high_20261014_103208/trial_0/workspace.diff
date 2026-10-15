@@ -1,0 +1,183 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,178 @@
++#!/usr/bin/env python3
++"""HTML JavaScript / XSS Filter.
++
++Removes JavaScript from HTML files while preserving formatting and structure.
++"""
++
++import base64
++import html
++import os
++import re
++import sys
++
++
++def is_dangerous_attribute(name, val):
++    name_lower = name.lower()
++    name_clean = re.sub(r'[\s\x00-\x1f\x7f-\x9f]', '', name_lower)
++
++    # Any event handler starting with 'on' followed by a letter (e.g. onclick, onload)
++    if name_clean.startswith('on') and len(name_clean) > 2 and name_clean[2].isalpha():
++        return True
++
++    if val is None:
++        return False
++
++    # Decode HTML entities repeatedly to prevent double/nested entity evasion
++    decoded = html.unescape(val)
++    while True:
++        next_dec = html.unescape(decoded)
++        if next_dec == decoded:
++            break
++        decoded = next_dec
++
++    # Strip whitespace, control characters, and null bytes for scheme checking
++    cleaned_compact = re.sub(r'[\s\x00-\x1f\x7f-\x9f]+', '', decoded).lower()
++
++    # Disallowed executable protocols
++    if cleaned_compact.startswith(('javascript:', 'vbscript:')):
++        return True
++
++    # Dangerous data: MIME types that execute script
++    if cleaned_compact.startswith(('data:text/html', 'data:text/javascript', 'data:application/javascript')):
++        return True
++
++    # Check for SVG data URI containing scripts
++    if cleaned_compact.startswith('data:image/svg+xml'):
++        if re.search(r'<\s*script|on[a-z]+\s*=|javascript\s*:', decoded, re.IGNORECASE):
++            return True
++        if 'base64,' in decoded:
++            try:
++                b64_content = decoded.split('base64,', 1)[1]
++                decoded_b64 = base64.b64decode(b64_content).decode('utf-8', errors='ignore')
++                if re.search(r'<\s*script|on[a-z]+\s*=|javascript\s*:', decoded_b64, re.IGNORECASE):
++                    return True
++            except Exception:
++                pass
++
++    # Meta refresh URL pointing to javascript:
++    if name_clean == 'content' and re.search(r'url\s*=\s*[\'"]?\s*javascript\s*:', decoded, re.IGNORECASE):
++        return True
++
++    # CSS expressions or javascript: in style or background attributes
++    if name_clean in ('style', 'background') or re.search(r'javascript\s*:', decoded, re.IGNORECASE):
++        if re.search(r'expression\s*\(|javascript\s*:', decoded, re.IGNORECASE):
++            return True
++
++    # srcdoc containing script tags or event handlers
++    if name_clean == 'srcdoc':
++        if re.search(r'<\s*script|javascript\s*:|on[a-z]+\s*=', decoded, re.IGNORECASE):
++            return True
++
++    return False
++
++
++ATTR_RE = re.compile(
++    r'([\s/]*)([^\s/=>"\']+)((?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)',
++    re.DOTALL
++)
++
++
++def clean_tag_attributes(tag_name, attrs_str, closing):
++    if not attrs_str.strip() and not attrs_str.startswith('/'):
++        return f"<{tag_name}{attrs_str}{closing}"
++
++    has_dangerous = False
++    cleaned_tokens = []
++
++    for am in ATTR_RE.finditer(attrs_str):
++        prefix = am.group(1)
++        attr_name = am.group(2)
++        eq_and_val = am.group(3)
++        token = am.group(0)
++
++        attr_val = None
++        if eq_and_val:
++            val_part = re.sub(r'^\s*=\s*', '', eq_and_val)
++            if (val_part.startswith('"') and val_part.endswith('"')) or \
++               (val_part.startswith("'") and val_part.endswith("'")):
++                attr_val = val_part[1:-1]
++            else:
++                attr_val = val_part
++
++        if is_dangerous_attribute(attr_name, attr_val):
++            has_dangerous = True
++        else:
++            cleaned_tokens.append(token)
++
++    if not has_dangerous:
++        return f"<{tag_name}{attrs_str}{closing}"
++
++    if not cleaned_tokens:
++        c = closing.lstrip()
++        if c.startswith('/>'):
++            return f"<{tag_name} />" if ' ' in closing else f"<{tag_name}/>"
++        return f"<{tag_name}>"
++
++    # Ensure there is a separator before the first attribute if needed
++    if not cleaned_tokens[0].startswith((' ', '\t', '\n', '\r', '/')):
++        cleaned_tokens[0] = ' ' + cleaned_tokens[0]
++
++    return f"<{tag_name}{''.join(cleaned_tokens)}{closing}"
++
++
++HTML_TOKEN_RE = re.compile(
++    r'(<!--.*?-->)'  # 1: Comment (preserve intact)
++    r'|(<script(?:\s*(?:"[^"]*"|\'[^\']*\'|[^"\'/>]+))*\s*(?:>.*?</script\s*>|/>|>(?!.*?</script\s*).*$|>))'  # 2: Script (remove)
++    r'|(<![^>]*>)'  # 3: Doctype / declaration (preserve intact)
++    r'|(</[a-zA-Z][a-zA-Z0-9:-]*\s*>)'  # 4: End tag (preserve intact)
++    r'|(<([a-zA-Z][a-zA-Z0-9:-]*)((?:(?:\s|/(?!>))*(?:"[^"]*"|\'[^\']*\'|[^"\'\s/>]+))*?)((?:\s*/)?\s*>))',  # 5: Start/self-closing tag
++    re.IGNORECASE | re.DOTALL
++)
++
++
++def _replace_token(m):
++    if m.group(1):  # comment
++        return m.group(1)
++    if m.group(2):  # script
++        return ""
++    if m.group(3):  # decl / doctype
++        return m.group(3)
++    if m.group(4):  # end tag
++        return m.group(4)
++    # start / self-closing tag
++    tag_name = m.group(6)
++    attrs = m.group(7)
++    closing = m.group(8)
++    return clean_tag_attributes(tag_name, attrs, closing)
++
++
++def filter_html(content):
++    while True:
++        new_content = HTML_TOKEN_RE.sub(_replace_token, content)
++        if new_content == content:
++            break
++        content = new_content
++    return content
++
++
++def main():
++    if len(sys.argv) < 2:
++        print(f"Usage: {sys.argv[0]} <path-to-html-file>", file=sys.stderr)
++        sys.exit(1)
++
++    filepath = sys.argv[1]
++    if not os.path.isfile(filepath):
++        print(f"Error: file not found: {filepath}", file=sys.stderr)
++        sys.exit(1)
++
++    with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as f:
++        content = f.read()
++
++    filtered = filter_html(content)
++
++    with open(filepath, "w", encoding="utf-8", errors="surrogateescape") as f:
++        f.write(filtered)
++
++
++if __name__ == "__main__":
++    main()

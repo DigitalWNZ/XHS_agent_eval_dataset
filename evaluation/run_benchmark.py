@@ -151,8 +151,9 @@ def validate_judge_scores(parsed_scores: dict, category: str) -> dict:
 def invoke_agent(
     agent: str, model: str, prompt: str, work_dir: Path,
     timeout_minutes: int = 30, need_file_writes: bool = False,
-    trajectory_file: Path | None = None,
+    trajectory_file: Path | None = None, cmd_prefix: list[str] | None = None,
 ) -> dict:
+    """cmd_prefix: optional wrapper (e.g. the bwrap isolation from env_runner) prepended to the CLI."""
     timeout_secs = timeout_minutes * 60
 
     if agent == "agy":
@@ -177,14 +178,23 @@ def invoke_agent(
     else:
         raise ValueError(f"Unknown agent: {agent}. Supported: agy, claude")
 
-    print(f"  Invoking {agent} (model={model})...")
+    cmd = list(cmd_prefix or []) + cmd
+    print(f"  Invoking {agent} (model={model}){' [isolated]' if cmd_prefix else ''}...")
     start = time.time()
 
-    result = subprocess.run(
-        cmd, cwd=work_dir, capture_output=True, text=True,
-        input=prompt, timeout=timeout_secs,
-        env={**os.environ, "AGY_ADC_AUTH": "true"},
-    )
+    try:
+        result = subprocess.run(
+            cmd, cwd=work_dir, capture_output=True, text=True,
+            input=prompt, timeout=timeout_secs,
+            env={**os.environ, "AGY_ADC_AUTH": "true"},
+        )
+    except subprocess.TimeoutExpired as e:
+        # Keep the partial stream (NDJSON) so a timed-out trial still shows what the agent did.
+        if trajectory_file is not None and e.stdout:
+            out = e.stdout if isinstance(e.stdout, str) else e.stdout.decode("utf-8", "replace")
+            trajectory_file.parent.mkdir(parents=True, exist_ok=True)
+            trajectory_file.write_text(out)
+        raise
 
     elapsed = time.time() - start
 
@@ -1558,8 +1568,15 @@ def main():
     parser.add_argument("--trials", type=int, default=5, help="C6: trials per entry")
     parser.add_argument("--sandbox", default="docker", choices=["docker", "udocker", "bwrap"],
                         help="C6: environment backend (udocker = rootless, exact image; bwrap = host toolchain)")
+    parser.add_argument("--quality", default="machine", choices=["off", "machine", "full"],
+                        help="C6/C7: coding-quality grading after each trial (full = with LLM judges)")
+    parser.add_argument("--judge", default="claude:claude-opus-5-5",
+                        help="C6/C7 --quality full: judge model, kind:model")
+    parser.add_argument("--no-isolate", action="store_true",
+                        help="C6/C7: don't run host CLI agents in bwrap (dataset/results stay visible)")
     args = parser.parse_args()
-    env_runner.CONFIG.update(trials=args.trials, sandbox=args.sandbox)
+    env_runner.CONFIG.update(trials=args.trials, sandbox=args.sandbox, quality=args.quality,
+                             judge=args.judge, isolate_agent=not args.no_isolate)
     if args.category not in ("c6", "c7") and args.agent in ("loop", "gold", "empty"):
         parser.error("--agent loop/gold/empty is only supported for --category c6/c7")
 

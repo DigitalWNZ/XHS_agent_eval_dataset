@@ -1,0 +1,250 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,245 @@
++#!/usr/bin/env python3
++import sys
++import html
++import urllib.parse
++import re
++
++def is_dangerous_url(val):
++    if not val:
++        return False
++    # Decode HTML entities
++    s = html.unescape(val)
++    # Decode URL encoding
++    s = urllib.parse.unquote(s)
++    # Strip all whitespace and control chars to detect schemes like j a v a s c r i p t :
++    s_no_ws = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", "", s).lower()
++    dangerous_schemes = (
++        "javascript:",
++        "vbscript:",
++        "data:text/html",
++        "data:text/javascript",
++        "data:application/javascript",
++        "data:application/x-javascript"
++    )
++    return any(s_no_ws.startswith(scheme) for scheme in dangerous_schemes)
++
++def is_dangerous_style(val):
++    if not val:
++        return False
++    s = html.unescape(val)
++    s = urllib.parse.unquote(s)
++    s_no_ws = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", "", s).lower()
++    return any(k in s_no_ws for k in ("javascript:", "vbscript:", "expression(", "moz-binding", "behavior:"))
++
++def clean_tag_attributes(tag_str):
++    if not tag_str.startswith("<") or not tag_str.endswith(">"):
++        return tag_str
++    
++    if tag_str.startswith("</"):
++        return tag_str
++    
++    m_name = re.match(r"^<([a-zA-Z0-9_\-:]+)", tag_str)
++    if not m_name:
++        return tag_str
++    
++    pos = len(m_name.group(0))
++    tag_len = len(tag_str)
++    
++    end_boundary = tag_len - 1
++    if tag_str.endswith("/>"):
++        end_boundary = tag_len - 2
++    
++    new_tag = tag_str[:pos]
++    
++    idx = pos
++    while idx < end_boundary:
++        ws_match = re.match(r"^\s+", tag_str[idx:end_boundary])
++        ws = ws_match.group(0) if ws_match else ""
++        idx += len(ws)
++        
++        if idx >= end_boundary:
++            new_tag += ws
++            break
++            
++        attr_name_match = re.match(r"^[^\s=/><]+", tag_str[idx:end_boundary])
++        if not attr_name_match:
++            new_tag += ws + tag_str[idx]
++            idx += 1
++            continue
++            
++        attr_name = attr_name_match.group(0)
++        idx += len(attr_name)
++        
++        equals_ws_match = re.match(r"^\s*=\s*", tag_str[idx:end_boundary])
++        attr_val = None
++        val_raw = ""
++        quote_ch = ""
++        
++        if equals_ws_match:
++            equals_str = equals_ws_match.group(0)
++            idx += len(equals_str)
++            
++            if idx < end_boundary:
++                ch = tag_str[idx]
++                if ch in ('"', "'"):
++                    quote_ch = ch
++                    val_start = idx
++                    idx += 1
++                    while idx < end_boundary and tag_str[idx] != quote_ch:
++                        idx += 1
++                    if idx < end_boundary:
++                        idx += 1
++                    val_raw = tag_str[val_start:idx]
++                    attr_val = val_raw[1:-1] if len(val_raw) >= 2 and val_raw.endswith(quote_ch) else val_raw[1:]
++                else: # Unquoted
++                    val_start = idx
++                    while idx < end_boundary and not tag_str[idx].isspace() and tag_str[idx] not in (">",):
++                        idx += 1
++                    val_raw = tag_str[val_start:idx]
++                    attr_val = val_raw
++        else:
++            equals_str = ""
++        
++        is_harmful = False
++        attr_lower = attr_name.lower()
++        
++        if attr_lower.startswith("on"):
++            is_harmful = True
++        elif attr_lower == "style" and attr_val and is_dangerous_style(attr_val):
++            is_harmful = True
++        elif attr_val and is_dangerous_url(attr_val):
++            is_harmful = True
++            
++        if not is_harmful:
++            if attr_lower == "srcdoc" and attr_val:
++                filtered_srcdoc = filter_html(attr_val)
++                if filtered_srcdoc != attr_val:
++                    if quote_ch == '"':
++                        esc = filtered_srcdoc.replace('"', '&quot;')
++                        val_raw = f'"{esc}"'
++                    elif quote_ch == "'":
++                        esc = filtered_srcdoc.replace("'", '&apos;')
++                        val_raw = f"'{esc}'"
++                    else:
++                        val_raw = filtered_srcdoc
++            new_tag += ws + attr_name
++            if equals_ws_match:
++                new_tag += equals_str + val_raw
++                
++    new_tag += tag_str[end_boundary:]
++    return new_tag
++
++def find_tag_end(html_text, start_pos):
++    pos = start_pos + 1
++    n = len(html_text)
++    while pos < n:
++        ch = html_text[pos]
++        if ch in ('"', "'"):
++            quote_ch = ch
++            pos += 1
++            while pos < n and html_text[pos] != quote_ch:
++                pos += 1
++            if pos < n:
++                pos += 1
++        elif ch == '>':
++            pos += 1
++            return pos
++        else:
++            pos += 1
++    return pos
++
++def filter_html(html_text):
++    result = []
++    idx = 0
++    n = len(html_text)
++    
++    while idx < n:
++        pos = html_text.find('<', idx)
++        if pos == -1:
++            result.append(html_text[idx:])
++            break
++            
++        result.append(html_text[idx:pos])
++        idx = pos
++        
++        sub = html_text[idx:]
++        
++        if sub.startswith('<!--'):
++            end_comment = html_text.find('-->', idx + 4)
++            if end_comment != -1:
++                end_pos = end_comment + 3
++            else:
++                end_pos = n
++            result.append(html_text[idx:end_pos])
++            idx = end_pos
++            continue
++            
++        if sub.startswith('<![CDATA['):
++            end_cdata = html_text.find(']]>', idx + 9)
++            if end_cdata != -1:
++                end_pos = end_cdata + 3
++            else:
++                end_pos = n
++            result.append(html_text[idx:end_pos])
++            idx = end_pos
++            continue
++            
++        if sub.startswith('<!') or sub.startswith('<?'):
++            tag_end = find_tag_end(html_text, idx)
++            result.append(html_text[idx:tag_end])
++            idx = tag_end
++            continue
++            
++        if sub.startswith('</'):
++            tag_end = find_tag_end(html_text, idx)
++            result.append(html_text[idx:tag_end])
++            idx = tag_end
++            continue
++            
++        m_script = re.match(r'^<\s*script[\s/>]', sub, re.IGNORECASE)
++        if m_script:
++            tag_end = find_tag_end(html_text, idx)
++            start_tag_str = html_text[idx:tag_end]
++            if start_tag_str.endswith('/>'):
++                idx = tag_end
++            else:
++                m_end = re.search(r'</\s*script\s*>', html_text[tag_end:], re.IGNORECASE)
++                if m_end:
++                    idx = tag_end + m_end.end()
++                else:
++                    idx = n
++            continue
++            
++        tag_end = find_tag_end(html_text, idx)
++        start_tag_str = html_text[idx:tag_end]
++        cleaned = clean_tag_attributes(start_tag_str)
++        result.append(cleaned)
++        idx = tag_end
++        
++    return "".join(result)
++
++def main():
++    if len(sys.argv) < 2:
++        print("Usage: python filter.py <path_to_html_file>")
++        sys.exit(1)
++        
++    filepath = sys.argv[1]
++    
++    try:
++        with open(filepath, 'r', encoding='utf-8', errors='replace', newline='') as f:
++            content = f.read()
++    except Exception as e:
++        print(f"Error reading file {filepath}: {e}")
++        sys.exit(1)
++        
++    filtered = filter_html(content)
++    
++    try:
++        with open(filepath, 'w', encoding='utf-8', newline='') as f:
++            f.write(filtered)
++    except Exception as e:
++        print(f"Error writing file {filepath}: {e}")
++        sys.exit(1)
++
++if __name__ == '__main__':
++    main()
