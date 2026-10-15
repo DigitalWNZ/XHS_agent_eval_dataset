@@ -8,7 +8,7 @@ import pathlib
 
 import pandas as pd
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[4]  # <workspace>/sources/xhs/archive/dataset_build -> workspace root
 XHS = ROOT / "sources/xhs"
 CASE = ROOT / "deliverables/cases/terminal_bench_2.0/polyglot-c-py"
 ENV = "dataset/c6/envs/C6-01"

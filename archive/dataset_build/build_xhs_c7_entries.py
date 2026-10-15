@@ -25,7 +25,7 @@ import shutil
 import pandas as pd
 from swebench.harness.test_spec.test_spec import make_test_spec
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[4]  # <workspace>/sources/xhs/archive/dataset_build -> workspace root
 XHS = ROOT / "sources/xhs"
 SWEBENCH_VERSION = "4.1.0"
 

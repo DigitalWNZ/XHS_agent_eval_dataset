@@ -19,7 +19,7 @@ import pathlib
 import shutil
 import tomllib
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[4]  # <workspace>/sources/xhs/archive/dataset_build -> workspace root
 XHS = ROOT / "sources/xhs"
 SRC = ROOT / "sources/deepswe/tasks"
 DEEPSWE_COMMIT = "0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea"

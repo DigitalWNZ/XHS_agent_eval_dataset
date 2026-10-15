@@ -17,7 +17,7 @@ import tomllib
 
 import pandas as pd
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[4]  # <workspace>/sources/xhs/archive/dataset_build -> workspace root
 XHS = ROOT / "sources/xhs"
 TB2 = ROOT / "sources/tb2"
 TB2_COMMIT = "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c"

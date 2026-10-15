@@ -29,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).parent.parent.parent  # archive/deprecated -> repo root
 DATASET_DIR = BASE_DIR / "dataset" / "c3"
 REPO_DIR = BASE_DIR / "xhs-campaign-service"
 RESULTS_DIR = BASE_DIR / "results"

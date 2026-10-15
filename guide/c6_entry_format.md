@@ -185,7 +185,7 @@ Supporting files live in `dataset/<c6|c7|c8>/envs/<ID>/`:
 | `gold.patch` | The upstream fix from SWE-bench, kept for reference. |
 | `gold.sh` | Applies `gold.patch` in `/testbed`. Used only for validation (`--agent gold`). |
 
-The build script is `archive/dataset_build/build_xhs_c7_entries.py` (it writes the pre-restructure IDs; run `archive/migrations/restructure_c6_c7.py` afterwards). It must run with
+The build script is `archive/dataset_build/build_xhs_c7_entries.py` (it writes the pre-restructure IDs; run `archive/migrations/restructure_c6_c7.py`, then `archive/migrations/restructure_v2.py` afterwards). It must run with
 the grader venv (`~/.cache/xhs_c6/swebench-venv`, swebench==4.1.0).
 
 ## Top-level fields

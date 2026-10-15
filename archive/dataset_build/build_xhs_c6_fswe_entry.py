@@ -20,7 +20,7 @@ import tomllib
 
 import pandas as pd
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[4]  # <workspace>/sources/xhs/archive/dataset_build -> workspace root
 XHS = ROOT / "sources/xhs"
 CASE = ROOT / "deliverables/cases/frontierswe_v2/ffmpeg-swscale-rewrite"
 SRC = CASE / "task"

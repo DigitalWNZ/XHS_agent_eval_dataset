@@ -17,7 +17,7 @@ import json
 import pathlib
 import shutil
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # archive/migrations -> repo root
 DS = ROOT / "dataset"
 RUNS_BEFORE = "20261014_070000"
 

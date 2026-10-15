@@ -19,7 +19,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).parent.parent.parent  # archive/deprecated -> repo root
 DATASET_DIR = BASE_DIR / "dataset"
 REPO_DIR = BASE_DIR / "xhs-campaign-service"
 RUBRICS_DIR = BASE_DIR / "evaluation" / "rubrics"

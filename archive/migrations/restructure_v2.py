@@ -21,7 +21,7 @@ import pathlib
 import re
 import shutil
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # archive/migrations -> repo root
 DS = ROOT / "dataset"
 TASKS = ROOT / "evaluation" / "rubrics" / "tasks"
 RUNS_BEFORE = "20261015_072400"   # runs recorded before this use the 2026-10-14 IDs
