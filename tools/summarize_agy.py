@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize agent (agy / claude) results per entry/model (P/F per trial) for C6/C7 run dirs -> markdown.
+"""Summarize agent (agy / claude) results per entry/model (P/F per trial) for C6/C7/C8 run dirs -> markdown.
 
 Pre-restructure runs (old C6/C7/C8 IDs) are mapped to the current IDs via results/id_mapping.json.
 Usage: summarize_agy.py [SINCE_TS]   (e.g. 20261013_13 to only count newer runs)
@@ -27,7 +27,7 @@ for f in sorted(glob.glob(f"{XHS}/results/c[678]_runs/*_*_*/trial_*/verdict.json
     entry = current_id(rec_entry, run)
     v = json.load(open(f))
     if entry not in THRESH:  # continuous-score entries (e.g. C6-07) pass at pass_threshold
-        ef = glob.glob(f"{XHS}/dataset/c[67]/{entry}_*.json")
+        ef = glob.glob(f"{XHS}/dataset/c[678]/{entry}_*.json")
         THRESH[entry] = float(json.load(open(ef[0]))["verification"].get("pass_threshold", 1.0)) if ef else 1.0
     score = float(v.get("reward", 0) or 0)
     ok = score >= THRESH[entry]

@@ -5,8 +5,8 @@ WORKDIR /app
 # Git time-travel: clone, then make the repo's default branch point AT the base
 # commit with no future history — a real branch checkout (not a detached HEAD),
 # future commits/tags gc'd away so the reference solution can't leak from history.
-ARG BASE_SHA=e8e6edfef5ca69c6188d320388ad440265911057
-RUN git clone https://github.com/drizzle-team/drizzle-orm . \
+ARG BASE_SHA=1454d2bc0f378d7f34766afafee68a77e7b85995
+RUN git clone https://github.com/cockroachdb/pebble . \
  && DEFAULT="$(git remote show origin | sed -n 's/.*HEAD branch: //p')" \
  && git checkout -B "$DEFAULT" "$BASE_SHA" \
  && git remote remove origin \
@@ -16,18 +16,12 @@ RUN git clone https://github.com/drizzle-team/drizzle-orm . \
  && git gc --prune=now \
  && (git submodule update --init --recursive || true)
 
-RUN pnpm install --frozen-lockfile
+RUN go mod download
 
-# v1.1 node-id scoring (CTRF route): vitest's built-in JUnit reporter is used
-# at verify time (`--reporter=junit --outputFile=...`) and the XML is converted
-# to CTRF JSON with the official ctrf-io converter. Pinned global npm install —
-# lands out-of-tree under /usr/lib/node_modules, never touches /app's pnpm
-# manifest or lockfile. The `--version` smoke check fails the build loudly if
-# the node runtime is too old for the converter (engines node>=20).
-RUN npm install -g junit-to-ctrf@0.0.14 && junit-to-ctrf --version
+# v1.1 CTRF: official ctrf-io reporter for `go test -json` (pinned tag; resolved
+# via proxy.golang.org + checksum db at BUILD time)
+RUN go install github.com/ctrf-io/go-ctrf-json-reporter/cmd/go-ctrf-json-reporter@v0.1.0
+# binary lands in $(go env GOPATH)/bin (/root/go/bin in these images)
+ENV PATH="/root/go/bin:${PATH}"
 
-# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.
-# Broken hook environments otherwise block the agent's (and oracle's) commits.
-RUN cd /app && git config core.hooksPath /dev/null
-
-CMD ["/bin/bash"]
+CMD ["bash"]

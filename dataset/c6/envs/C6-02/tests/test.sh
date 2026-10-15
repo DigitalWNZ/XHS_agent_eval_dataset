@@ -20,48 +20,34 @@ export RUN_LOG=/logs/verifier/run.log
 run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"; return "${PIPESTATUS[0]}"; }
 
 # >>> RUN TESTS (task-specific) <<<
+export PATH="$(go env GOPATH 2>/dev/null)/bin:$PATH"
+# NOTE: TestDBCompactionCrash/k=<N> subtests carry RANDOMIZED names (crash-point
+# injection); only the stable parent TestDBCompactionCrash is whitelisted.
 # (scan-config rationale:)
-# Cheating signal (recorded only): package manifests/lockfiles, pnpm workspace config,
-# vitest/vite runner config, or vendored node_modules. The golden never touches
-# these. Out-of-scope signal (recorded only): paths outside the task's expected fix scope
-# (drizzle-orm/src/**).
+# Cheating signal (recorded only): dependency manifests, vendored deps, a model-added
+# TestMain in a _test.go (test-binary hijack), or a model-added line carrying the
+# scored `batch_durable` build tag (the scored suite is gated behind
+# `go test -tags batch_durable`; only tests/test.patch may carry that tag).
+# The golden never touches any of these.
+# Out-of-scope signal (recorded only): paths outside the task's expected fix scope (the golden edits
+# only root-package files: batch.go, commit.go, db.go, durable.go, event.go,
+# metrics.go, open.go, options.go).
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing $1; PATH=$PATH"; exit 127; }; }
-require_cmd pnpm; require_cmd node; require_cmd junit-to-ctrf
+require_cmd go; require_cmd go-ctrf-json-reporter
 
-# --- Run base/new with reporter (mode_command_adapter: the inner /app/test.sh
-# hardcodes its pnpm commands without arg passthrough, so we run the same
-# commands verbatim with vitest's built-in junit reporter appended; the
-# original modes have no fail-fast flags to strip). The inner script's third
-# "typecheck" mode was never invoked by the original verifier (reward was
-# base && new only), so it stays un-run — no exit-code gate is needed. ---
+# --- Run base/new with the official CTRF reporter (mode_command_adapter: inner
+#     /app/test.sh hardcodes plain `go test`; copy each mode's invocation, add
+#     -json, and pipe to go-ctrf-json-reporter). The `grep -v '"Action":"build-'`
+#     pre-filter is MANDATORY: v0.1.0 breaks on build-fail events (common in nop
+#     new-mode, where f2p tests reference unsolved symbols) and writes a 0-byte
+#     invalid report dropping every test after it. The reporter exits 1 whenever
+#     any test fails, so never gate on its rc; a missing/0-byte/invalid CTRF is
+#     graded as all-of-that-mode's-ids-missing (=failed), never a crash. ---
+export GOCACHE="${GOCACHE:-/app/.gocache}"
 set +e
-pnpm --filter drizzle-orm exec vitest run --exclude "**/olympus/**" \
-    --reporter=junit --outputFile=/logs/verifier/base.xml > /logs/verifier/base_run.log 2>&1
-log "base mode rc=$?"
-pnpm --filter drizzle-orm exec vitest run "tests/olympus/window.test.ts" \
-    --reporter=junit --outputFile=/logs/verifier/new.xml > /logs/verifier/new_run.log 2>&1
-log "new mode rc=$?"
-
-# --- Convert each mode's JUnit XML to CTRF JSON with the official ctrf-io
-# converter (pinned junit-to-ctrf@0.0.14). --use-suite-name is load-bearing:
-# it keeps the file-path prefix in results.tests[].name and prevents
-# cross-suite name collisions. junit-to-ctrf exits 0 even on errors, so each
-# output is verified to exist and be valid JSON; a missing/invalid CTRF makes
-# that mode's whitelisted ids count as failed in the grader (never a crash). ---
-ctrf_convert() { # $1=xml glob (quoted), $2=ctrf json out, $3=label
-  junit-to-ctrf "$1" -o "$2" -t vitest --use-suite-name \
-      >> /logs/verifier/ctrf_convert.log 2>&1
-  log "$3 junit-to-ctrf rc=$?"
-  if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$2" 2>/dev/null; then
-    log "$3 CTRF OK: $2"
-  else
-    log "ERROR: $3 CTRF missing/invalid ($2) — all $3-mode whitelisted ids will count as failed"
-    rm -f "$2"
-  fi
-}
-ctrf_convert '/logs/verifier/base*.xml' /logs/verifier/base-ctrf.json base
-ctrf_convert '/logs/verifier/new*.xml'  /logs/verifier/new-ctrf.json  new
+go test -json -count=1 -run "^(TestBatch|TestCommitPipeline|TestDB)" -skip "^TestBatchCommitStats$" . -timeout 300s 2>>"$RUN_LOG" | grep -v '"Action":"build-' | tee -a "$RUN_LOG" | go-ctrf-json-reporter -quiet -output /logs/verifier/base-ctrf.json
+go test -json -count=1 -tags batch_durable -run "^TestBatchDurab" . -timeout 300s 2>>"$RUN_LOG" | grep -v '"Action":"build-' | tee -a "$RUN_LOG" | go-ctrf-json-reporter -quiet -output /logs/verifier/new-ctrf.json
 set -e
 # >>> END RUN TESTS <<<
 

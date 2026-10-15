@@ -1,42 +1,48 @@
-# C6 / C7 entry format (field reference)
+# C6 / C7 / C8 entry format (field reference)
 
-C6 and C7 are both containerized categories. They share the harness (`evaluation/env_runner.py`)
-and the entry layout; they differ in purpose:
+C6, C7 and C8 are the containerized categories. They share the harness (`evaluation/env_runner.py`)
+and the entry layout; they differ in purpose (layout of 2026-10-15, chosen from the 2026-10-14 campaign:
+claude-opus-5-5, gemini-3.6-flash-high, gemini-3.8-flash-high, gemini-4-argon-high, 3 trials each):
 
 | Category | Name | Entries | Purpose | Rubric |
 |---|---|---|---|---|
-| C6 | 区分度任务 Discriminative | C6-01..07 | Tasks whose pass rates differed sharply across gemini-3.6-flash, gemini-3.8-flash and claude-opus-5-5 in our runs. Use C6 to rank models. | `evaluation/rubrics/c6_discriminative.json` |
-| C7 | 日常工作任务 Daily work | C7-01..14 | Representative routine engineering (bug fixes, feature work, environment/ops tasks). Not chosen for discrimination. | `evaluation/rubrics/c7_daily.json` |
+| C6 | 区分度任务 Discriminative | C6-01..07 | Pass rates differ across the setups but no single setup dominates (campaign: Claude 62%, gemini-3.8 57%, Argon 57%, gemini-3.6 29%). Use C6 to rank models. | `evaluation/rubrics/c6_discriminative.json` |
+| C7 | 日常工作任务 Daily work | C7-01..11 | Routine engineering most setups solve (campaign pass rates 85–100%); code quality (D2) does most of the separating. | `evaluation/rubrics/c7_daily.json` |
+| C8 | 高难任务 Hard | C8-01..03 | Only the strongest setup solved them reliably, or most setups ran out of time (campaign: Claude 8/9, gemini-3.6 3/9, Argon 1/9, gemini-3.8 0/9). | `evaluation/rubrics/c8_hard.json` |
 
-Both categories mix four source types. An entry's fields depend on its source type, not on its
-category:
+All categories mix source types. An entry's fields depend on its source type, not on its category:
 
-| Source type | Verifier `type` | C6 | C7 | Described in |
-|---|---|---|---|---|
-| Terminal-Bench 2.0 | `tb2_pytest` | C6-01, C6-04, C6-06 | C7-01..04 | Part 1 |
-| FrontierSWE v2 | `harbor_separate` (continuous score) | C6-07 | — | Part 1 |
-| SWE-bench Verified | `swebench` | C6-05 | C7-05..10 | Part 2 |
-| DeepSWE v1.1 | `deepswe` | C6-02, C6-03 | C7-11..14 | Part 3 |
+| Source type | Verifier `type` | C6 | C7 | C8 | Described in |
+|---|---|---|---|---|---|
+| Terminal-Bench 2.0 | `tb2_pytest` | C6-01, C6-03..06 | C7-02 | C8-03 | Part 1 |
+| FrontierSWE v2 | `harbor_separate` (continuous score) | — | — | C8-02 | Part 1 |
+| SWE-bench Verified | `swebench` | — | C7-03..08 | C8-01 | Part 2 |
+| DeepSWE v1.1 | `deepswe` | C6-02, C6-07 | C7-01, C7-09..11 | — | Part 3 |
 
-**Restructure and `former_id`.** Before 2026-10-14 the entries were split by source: C6 =
-Terminal-Bench / FrontierSWE (8), C7 = SWE-bench (7), C8 = DeepSWE (6). `tools/restructure_c6_c7.py`
-then regrouped them into C6/C7. Each entry keeps its old ID in `former_id`. Raw run folders recorded
-before the restructure (`results/c{6,7,8}_runs/<old id>_...`) keep the old IDs.
-`results/id_mapping.json` maps them, and the report scripts (`tools/summarize_agy.py`,
-`tools/detailed_report.py`) apply the mapping.
+**Restructures, `former_id` and `id_history`.** Before 2026-10-14 the entries were split by source
+(C6 = Terminal-Bench / FrontierSWE, C7 = SWE-bench, C8 = DeepSWE). `tools/restructure_c6_c7.py` regrouped
+them into C6 (7) / C7 (14) on 2026-10-14, and `tools/restructure_v2.py` regrouped those into C6 (7) /
+C7 (11) / C8 (3) on 2026-10-15. Each entry keeps the previous ID in `former_id` and every ID it had in
+`id_history`. Raw run folders (`results/c{6,7,8}_runs/<recorded id>_...`) keep the ID used when they ran;
+`results/id_mapping.json` has one epoch per restructure, and the report scripts and the quality grader map
+recorded IDs through every later epoch (`tools/idmap.py`).
 
-| New | Former | | New | Former | | New | Former |
-|---|---|---|---|---|---|---|---|
-| C6-01 | C6-06 | | C7-01 | C6-01 | | C7-08 | C7-05 |
-| C6-02 | C8-03 | | C7-02 | C6-03 | | C7-09 | C7-06 |
-| C6-03 | C8-02 | | C7-03 | C6-05 | | C7-10 | C7-07 |
-| C6-04 | C6-04 | | C7-04 | C6-07 | | C7-11 | C8-01 |
-| C6-05 | C7-01 | | C7-05 | C7-02 | | C7-12 | C8-04 |
-| C6-06 | C6-02 | | C7-06 | C7-03 | | C7-13 | C8-05 |
-| C6-07 | C6-08 | | C7-07 | C7-04 | | C7-14 | C8-06 |
+| Current | 2026-10-14 | 2026-10-13 | | Current | 2026-10-14 | 2026-10-13 |
+|---|---|---|---|---|---|---|
+| C6-01 | C6-01 | C6-06 | | C7-05 | C7-07 | C7-04 |
+| C6-02 | C6-03 | C8-02 | | C7-06 | C7-08 | C7-05 |
+| C6-03 | C6-04 | C6-04 | | C7-07 | C7-09 | C7-06 |
+| C6-04 | C6-06 | C6-02 | | C7-08 | C7-10 | C7-07 |
+| C6-05 | C7-01 | C6-01 | | C7-09 | C7-11 | C8-01 |
+| C6-06 | C7-03 | C6-05 | | C7-10 | C7-13 | C8-05 |
+| C6-07 | C7-12 | C8-04 | | C7-11 | C7-14 | C8-06 |
+| C7-01 | C6-02 | C8-03 | | C8-01 | C6-05 | C7-01 |
+| C7-02 | C7-04 | C6-07 | | C8-02 | C6-07 | C6-08 |
+| C7-03 | C7-05 | C7-02 | | C8-03 | C7-02 | C6-03 |
+| C7-04 | C7-06 | C7-03 | |  |  |  |
 
-Each entry is one JSON file in `dataset/<c6|c7>/` (e.g. `dataset/c7/C7-01_polyglot_c_py.json`).
-Supporting files live in `dataset/<c6|c7>/envs/<ID>/`. An entry describes one task:
+Each entry is one JSON file in `dataset/<c6|c7|c8>/` (e.g. `dataset/c6/C6-05_polyglot_c_py.json`).
+Supporting files live in `dataset/<c6|c7|c8>/envs/<ID>/`. An entry describes one task:
 - what the agent is asked to do
 - the container it works in
 - how the result is checked (hidden from the agent)
@@ -47,7 +53,8 @@ Fields common to all source types:
 | Field | Meaning |
 |---|---|
 | `instance_id` | Current entry ID. Used with `--category c6\|c7 --entry <ID>` and in result directory names (`results/<c6\|c7>_runs/<ID>_<agent>_<model>_<ts>`). |
-| `former_id` | The pre-restructure ID (see above). |
+| `former_id` | The ID before the latest restructure (see above). |
+| `id_history` | Every ID the entry has had, by restructure date (see above). |
 | `category` / `category_name` | `C6` / 区分度任务（容器化，模型区分）, or `C7` / 日常工作任务（容器化，贴近日常）. The harness uses `category` to pick the rubric and the results directory. |
 | `evaluation_rubric` | `evaluation/rubrics/c6_discriminative.json` or `c7_daily.json`: D1 = pass rate over trials (`--trials`, CLI default 5; our runs use 3), D2 = code quality (LLM judge; see `guide/coding_rubric.md`). Reported side by side, not combined. |
 | `task_rubric` | Path to the case's code-quality rubric, `evaluation/rubrics/tasks/<ID>.json` (1–2 case-specific LLM-judge items; see `guide/coding_rubric.md`). |
@@ -55,9 +62,9 @@ Fields common to all source types:
 
 # Part 1: Terminal-Bench 2.0 and FrontierSWE v2 entries
 
-The Terminal-Bench entries (C6-01, C6-04, C6-06, C7-01..04) are graded by their original pytest
-suites. C7-01 (former C6-01) was built first and originally used a custom verifier; it now uses
-the original suite like the others. C6-07 (former C6-08) is a FrontierSWE v2 task with a separate
+The Terminal-Bench entries (C6-01, C6-03..06, C7-02, C8-03) are graded by their original pytest
+suites. C6-05 (originally C6-01) was built first and originally used a custom verifier; it now uses
+the original suite like the others. C8-02 (originally C6-08) is a FrontierSWE v2 task with a separate
 verifier container and a continuous score. Fields that apply only to some entries are marked.
 
 ## Top-level fields
@@ -66,7 +73,7 @@ verifier container and a continuous score. Fields that apply only to some entrie
 |---|---|
 | `task_type` | `terminal_task`: the agent works in a shell inside a container, not in the xhs-campaign-service worktree used by C3/C5. |
 | `maps_to_journey` | Provenance label, e.g. `External: Terminal-Bench 2.0 / polyglot-c-py`. |
-| `rednote_relevance` | Why the task fits Rednote's business or routine work (all except C7-01). |
+| `rednote_relevance` | Why the task fits Rednote's business or routine work (all except C6-05). |
 | `problem_statement` | The task prompt sent to the agent, copied verbatim from the source benchmark. For host CLI agents (agy/claude), the harness adds an "Environment notes" footer explaining the container and the `task-exec` helper. |
 
 ## `environment`: the container the agent works in
@@ -75,17 +82,17 @@ verifier container and a continuous score. Fields that apply only to some entrie
 |---|---|
 | `type` | `docker`: the task runs in its own image. |
 | `dockerfile` | The original Dockerfile and build context (`envs/<ID>/...`), kept for provenance and rebuilds. |
-| `prebuilt_image` | The image actually run: the source benchmark's published image, so the environment matches the source exactly. C6-07 pins it by digest. |
+| `prebuilt_image` | The image actually run: the source benchmark's published image, so the environment matches the source exactly. C8-02 pins it by digest. |
 | `workdir` | Task directory (`/app`). For agy/claude it is backed by a host directory, so the agent can edit files directly. |
 | `cpus` / `memory` | Resource limits from the source task. Enforced under `--sandbox docker`, not under udocker. |
 | `network` | Whether the task needs network access. |
 | `agent_timeout_sec` | The agent's time budget (900 s = Terminal-Bench's default). The harness uses `min(--timeout minutes, agent_timeout_sec)`. |
 | `initial_state` | What the agent starts with, e.g. an empty `/app`. |
-| `udocker_image` | *(C6-07)* Local alias for the digest-pinned image. udocker cannot pull `repo@sha256:...`, so the image is loaded with `tools/fetch_oci_digest.py`. |
-| `udocker_execmode` | *(C6-07)* udocker engine for this entry (`P1` = proot). The default R1 engine maps only uid 0, which breaks the task's `runuser`. |
-| `per_trial_paths` | *(C6-07)* Extra fresh, empty directories mounted per trial. For example, `/root` hides root-only verifier assets, because the agent runs as fake root under udocker. |
-| `container_env` | *(C6-07)* Environment variables set in the container, e.g. `TASK_BUDGET_SECS` for the agent-visible `sandbox-timer`. |
-| `init_cmd` | *(C6-07)* Command run once at the start of each trial, e.g. `sandbox-timer start`. |
+| `udocker_image` | *(C8-02)* Local alias for the digest-pinned image. udocker cannot pull `repo@sha256:...`, so the image is loaded with `tools/fetch_oci_digest.py`. |
+| `udocker_execmode` | *(C8-02)* udocker engine for this entry (`P1` = proot). The default R1 engine maps only uid 0, which breaks the task's `runuser`. |
+| `per_trial_paths` | *(C8-02)* Extra fresh, empty directories mounted per trial. For example, `/root` hides root-only verifier assets, because the agent runs as fake root under udocker. |
+| `container_env` | *(C8-02)* Environment variables set in the container, e.g. `TASK_BUDGET_SECS` for the agent-visible `sandbox-timer`. |
+| `init_cmd` | *(C8-02)* Command run once at the start of each trial, e.g. `sandbox-timer start`. |
 
 ## `verification`: how pass/fail is decided
 
@@ -93,18 +100,18 @@ The tests are never shown to the agent. They run in the container only after the
 
 | Field | Meaning |
 |---|---|
-| `type` | Grader kind:<br>• `tb2_pytest`: the original Terminal-Bench pytest suite (C6-01, C6-04, C6-06, C7-01..04)<br>• `harbor_separate`: FrontierSWE's verifier in its own container (C6-07)<br>• `script`: custom verifier (still supported by the harness; no current entry uses it) |
+| `type` | Grader kind:<br>• `tb2_pytest`: the original Terminal-Bench pytest suite (C6-01, C6-03..06, C7-02, C8-03)<br>• `harbor_separate`: FrontierSWE's verifier in its own container (C8-02)<br>• `script`: custom verifier (still supported by the harness; no current entry uses it) |
 | `script`, `container_path`, `command` | *(script)* The verifier is copied to `container_path` (e.g. `/tmp/verify.py`) and run with `command` (e.g. `--root /app`). Its last stdout line is a JSON verdict: `{"reward": 0 or 1, "reason": ..., "checks": [...]}`. |
-| `checks_in_order` | *(C7-01)* What the tests check, in order:<br>• only `main.py.c` is left in `/app/polyglot`<br>• gcc compiles it<br>• both the Python and C programs print the right Fibonacci numbers for n = 42, 10, 0 |
+| `checks_in_order` | *(C6-05)* What the tests check, in order:<br>• only `main.py.c` is left in `/app/polyglot`<br>• gcc compiles it<br>• both the Python and C programs print the right Fibonacci numbers for n = 42, 10, 0 |
 | `tests_dir`, `command` | *(tb2_pytest)* The original tests are copied to `/tests` and `bash /tests/grader.sh` is run. |
 | `grader_derivation` | *(tb2_pytest)* `grader.sh` is the original `tests/test.sh` with exactly four setup lines removed: `apt-get update`, `apt-get install -y curl`, the uv installer and `source $HOME/.local/bin/env`. The harness provides uv/uvx at `/opt/xhs`. |
 | `reward` | Plain-language scoring rule. For tb2_pytest, the trial passes iff the original script writes `1` to `/logs/verifier/reward.txt`. Per-test results come from the CTRF report. |
 | `hidden_from_agent` | `true`: the tests are copied into the container only at grading time. |
 | `tests` | *(tb2_pytest)* Names of the hidden tests, for reference. |
 | `timeout_sec` | Time limit for the grader. |
-| `verifier_image`, `udocker_verifier_image` | *(C6-07)* The separate verifier image (digest-pinned) and its local udocker alias. |
-| `artifact_excludes` | *(C6-07)* Files left out when copying `/app` into the verifier container (build caches, built `.so` files). Taken from the task's `[[artifacts]]`. |
-| `pass_threshold` | *(C6-07)* The score is continuous (0–1); a trial counts as passed at ≥ this value (0.1). D1 is the pass rate; the mean raw score over trials is also recorded (`scores.mean_score`). Binary graders default to 1.0. |
+| `verifier_image`, `udocker_verifier_image` | *(C8-02)* The separate verifier image (digest-pinned) and its local udocker alias. |
+| `artifact_excludes` | *(C8-02)* Files left out when copying `/app` into the verifier container (build caches, built `.so` files). Taken from the task's `[[artifacts]]`. |
+| `pass_threshold` | *(C8-02)* The score is continuous (0–1); a trial counts as passed at ≥ this value (0.1). D1 is the pass rate; the mean raw score over trials is also recorded (`scores.mean_score`). Binary graders default to 1.0. |
 
 ## `gold_solution`: the reference solution
 
@@ -112,8 +119,8 @@ The tests are never shown to the agent. They run in the container only after the
 |---|---|
 | `script` | The source benchmark's own `solve.sh`. |
 | `run_in` | Directory it runs in (`/app`). |
-| `dir`, `timeout_sec` | *(C6-07)* The solution ships as a directory (script plus sources). It is copied to `/solution` and run with `HARBOR_ORACLE_FLAG` set, as in Harbor's oracle stage. |
-| `expected_reward`, `note` | *(C6-07)* FrontierSWE ships a placeholder oracle that scores 0.0 by design. Validation checks the verifier's evidence fields (build, provenance, correctness, measurement) instead of the score. |
+| `dir`, `timeout_sec` | *(C8-02)* The solution ships as a directory (script plus sources). It is copied to `/solution` and run with `HARBOR_ORACLE_FLAG` set, as in Harbor's oracle stage. |
+| `expected_reward`, `note` | *(C8-02)* FrontierSWE ships a placeholder oracle that scores 0.0 by design. Validation checks the verifier's evidence fields (build, provenance, correctness, measurement) instead of the score. |
 
 The gold solution is used only to validate the task: `--agent gold` should pass and
 `--agent empty` should fail.
@@ -130,9 +137,9 @@ D1 = pass rate over trials (snapped to the rubric's tiers); D2 = code quality fr
 |---|---|
 | `benchmark`, `repo`, `commit`, `path` | Exact origin, e.g. the Terminal-Bench 2.0 repo at commit `69671fb`, task directory `polyglot-c-py`. |
 | `author`, `difficulty`, `category`, `expert_time_estimate_min` | Metadata from the source task's `task.toml`. |
-| `task_page` | *(C6-07)* Public task page. |
+| `task_page` | *(C8-02)* Public task page. |
 | `original_scoring` | How the source benchmark scores the task. |
-| `conversion_changes` | Every change made when converting the task to this format. Examples: "copied verbatim"; "grader drops only the curl/uv install lines"; *(C6-07)* "2 h agent budget instead of 20 h". |
+| `conversion_changes` | Every change made when converting the task to this format. Examples: "copied verbatim"; "grader drops only the curl/uv install lines"; *(C8-02)* "2 h agent budget instead of 20 h". |
 
 ## `discrimination`: why the task was chosen
 
@@ -141,15 +148,15 @@ Except for `observed_xhs_runs`, these values are computed from public per-model 
 
 | Field | Meaning |
 |---|---|
-| `what_it_measures` | The skill the task actually tests. C7-01, for example, mostly tests workspace hygiene: 79% of leaderboard failures were leftover files such as `cmain`, not wrong code. |
+| `what_it_measures` | The skill the task actually tests. C6-05, for example, mostly tests workspace hygiene: 79% of leaderboard failures were leftover files such as `cmain`, not wrong code. |
 | `n_models` | Number of leaderboard systems with results on this task. |
 | `mean_pass_rate` / `mean_score` | Average result across those systems (difficulty). |
 | `std` | Spread of results across systems. |
 | `disc_r` | Item-rest correlation: Pearson r between a system's result on this task and its mean on all other tasks. High means the task consistently separates strong systems from weak ones. |
 | `frontier_std`, `frontier_disc_r`, `frontier_mean` | The same metrics computed on the top half of systems only, i.e. whether the task separates strong systems *from each other*. |
 | `tier` | `frontier (separates top models)` or `broad (strong vs weak)`, per the selection thresholds:<br>• broad: std ≥ 0.30, disc_r ≥ 0.50, 0.15 ≤ mean ≤ 0.85<br>• frontier: frontier_std ≥ 0.25, frontier_disc_r ≥ 0.30, 0.1 ≤ frontier_mean ≤ 0.9 |
-| `leaderboard_failure_modes` | *(C7-01)* Leaderboard trials grouped by failure cause. |
-| `caveat` | *(C6-07)* Why the reference scores are not directly comparable (20 h budget vs 2 h here). |
+| `leaderboard_failure_modes` | *(C6-05)* Leaderboard trials grouped by failure cause. |
+| `caveat` | *(C8-02)* Why the reference scores are not directly comparable (20 h budget vs 2 h here). |
 
 ## `reference_scores`
 
@@ -162,13 +169,13 @@ leaderboard. Each row has:
 
 # Part 2: SWE-bench Verified entries
 
-These entries (C6-05 and C7-05..10; former C7-01..07) each wrap one SWE-bench Verified issue (e.g.
-`dataset/c6/C6-05_django__django-15957.json`): the agent fixes a real bug in a real repository,
+These entries (C7-03..08, C8-01; originally C7-01..07) each wrap one SWE-bench Verified issue (e.g.
+`dataset/c8/C8-01_django__django-15957.json`): the agent fixes a real bug in a real repository,
 and hidden tests decide whether it is resolved. They were selected for closeness to Rednote backend
-daily work (Django ORM, MySQL, JSONField, i18n, HTTP proxies). C6-05 moved to C6 because it
-separated the models in our runs.
+daily work (Django ORM, MySQL, JSONField, i18n, HTTP proxies). C8-01 is in C8 because only Claude solved it
+in the 2026-10-14 campaign.
 
-Supporting files live in `dataset/<c6|c7>/envs/<ID>/`:
+Supporting files live in `dataset/<c6|c7|c8>/envs/<ID>/`:
 
 | File | Meaning |
 |---|---|
@@ -266,9 +273,9 @@ GPT (up to 30 rows). Each row has:
 
 # Part 3: DeepSWE v1.1 entries
 
-These entries (C6-02, C6-03, C7-11..14; former C8-01..06) are DeepSWE v1.1 (Datacurve) feature
+These entries (C6-02, C6-07, C7-01, C7-09..11; originally C8-01..06) are DeepSWE v1.1 (Datacurve) feature
 requests: the agent implements a feature in a real repository (TypeScript, Go, Python ...), and a
-hidden test patch decides the result. Supporting files in `dataset/<c6|c7>/envs/<ID>/`:
+hidden test patch decides the result. Supporting files in `dataset/<c6|c7|c8>/envs/<ID>/`:
 
 | Path | Meaning |
 |---|---|
@@ -292,5 +299,5 @@ Fields that differ from Parts 1–2:
 | `source` | Benchmark repo/commit/path, `task_id`, `ext_id`, upstream repo and `base_commit`, language, category, `original_scoring`, `conversion_changes`. |
 | `discrimination` | `selected_for`, the externally reported observation that motivated the pick, and `observed_xhs_runs`. |
 
-The build script is `tools/build/build_xhs_c8_deepswe_entries.py` (it writes the pre-restructure C8
-IDs; run `tools/restructure_c6_c7.py` afterwards).
+The build script is `tools/build/build_xhs_c8_deepswe_entries.py` (it writes the original C8
+IDs; run `tools/restructure_c6_c7.py`, then `tools/restructure_v2.py` afterwards).

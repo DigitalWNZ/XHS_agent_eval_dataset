@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Campaign report: D1 (pass rate) and D2 (LLM-judge code quality) for ONE campaign, i.e. only the run folders
-whose timestamp is >= --since (older runs of the same cases are ignored).
+whose timestamp is >= --since (older runs of the same cases are ignored). Entries are reported under their
+current IDs/categories (recorded IDs are mapped via results/id_mapping.json, see tools/idmap.py).
 
   tools/campaign_report.py --category c6 --since 20261014_1032 --out results/campaign_c6_20261014.md
+  (the 2026-10-14 campaign: C6 cases ran from 10:32, C7 cases from 15:54; use --since 20261014_1032 for any category)
 
 D1 and D2 are reported side by side and never combined (category rubrics: "No combined score").
 D1 per cell = passes / trials, snapped to the 100/67/33/0 tier; D2 = mean quality over trials the judge could grade
@@ -15,9 +17,11 @@ import json
 import os
 import re
 
+import sys
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-XHS = next(os.path.abspath(p) for p in (os.path.join(HERE, ".."), os.path.join(HERE, "..", "sources", "xhs"))
-           if os.path.isdir(os.path.join(p, "dataset", "c6")))
+sys.path.insert(0, HERE)
+from idmap import XHS, current_id  # noqa: E402  (maps the ID recorded by a run to the current ID)
 FW = json.load(open(os.path.join(XHS, "evaluation/rubrics/coding_quality.json")))
 SC = {k: v["score"] for k, v in FW["levels"].items()}
 COMMON = [c["id"] for c in FW["common_items"]]
@@ -35,8 +39,9 @@ def f0(x):
 
 
 def load(category, since):
+    """Trials of the current category `category` (runs of any results/c*_runs dir, IDs mapped to current)."""
     rows = []
-    for d in sorted(glob.glob(f"{XHS}/results/{category}_runs/*")):
+    for d in sorted(glob.glob(f"{XHS}/results/c[678]_runs/*")):
         m = re.search(r"_(\d{8}_\d{6})$", d)
         if not m or m.group(1) < since or not re.search(r"_(agy|claude)_", os.path.basename(d)):
             continue
@@ -45,6 +50,10 @@ def load(category, since):
                 q = json.load(open(t + "/quality.json"))
                 v = json.load(open(t + "/verdict.json"))
             except (OSError, ValueError):
+                continue
+            q["recorded_entry"] = q["entry"]
+            q["entry"] = current_id(q["entry"], os.path.basename(d))
+            if q["entry"][:2].lower() != category:
                 continue
             tr = json.load(open(t + "/transcript.json")) if os.path.exists(t + "/transcript.json") else []
             diff = os.path.getsize(t + "/workspace.diff") if os.path.exists(t + "/workspace.diff") else None
@@ -59,7 +68,7 @@ def load(category, since):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--category", required=True, choices=["c6", "c7"])
+    ap.add_argument("--category", required=True, choices=["c6", "c7", "c8"])
     ap.add_argument("--since", required=True, help="campaign start, YYYYMMDD_HHMM[SS]")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -81,7 +90,7 @@ def main():
          "Readability, Maintainability, Robustness + 1–2 case items, perfect 1 / accept 0.6 / bad 0, quality = 100 × mean. "
          "D1 and D2 are not combined. Trials with no code change cannot be judged (na) and are excluded from D2.\n",
          "## Per case (passes/trials · D2 quality)\n",
-         "| Case | Task | " + " | ".join(models) + " |", "|---|---|" + "---|" * len(models)]
+         "| Case | Former ID | Task | " + " | ".join(models) + " |", "|---|---|---|" + "---|" * len(models)]
     for eid in sorted(ents):
         row = []
         for m in models:
@@ -94,7 +103,7 @@ def main():
                             f" ∅{sum(t['no_code'] for t in ts)}" if any(t["no_code"] for t in ts) else ""])
             row.append(f"{p}/{len(ts)} · {f0(mean([t['quality_score'] for t in ts]))}{flag}")
         task = ents[eid].get("maps_to_journey", "").replace("External: ", "")
-        o.append(f"| {eid} | {task[:60]} | " + " | ".join(row) + " |")
+        o.append(f"| {eid} | {ents[eid].get('former_id', '')} | {task[:60]} | " + " | ".join(row) + " |")
     o.append("\n∅n = n trials ended with no code change (all were agent timeouts); ⚠n = invalid (validity audit).\n")
 
     o.append("## Per model\n")

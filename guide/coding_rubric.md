@@ -1,4 +1,4 @@
-# C6 / C7 evaluation
+# C6 / C7 / C8 evaluation
 
 C6 (7 discriminative cases) and C7 (14 daily-work cases) report two results per trial.
 
@@ -7,12 +7,12 @@ C6 (7 discriminative cases) and C7 (14 daily-work cases) report two results per 
 The source benchmark's own hidden tests run in the task container after the agent finishes. The
 agent never sees them.
 
-| Source | Cases | Hidden tests (copied verbatim, `dataset/<c6|c7>/envs/<ID>/`) |
+| Source | Cases | Hidden tests (copied verbatim, `dataset/<c6|c7|c8>/envs/<ID>/`) |
 |---|---|---|
-| Terminal-Bench 2.0 | C6-01, C6-04, C6-06, C7-01..04 | `original_tests/` from laude-institute/terminal-bench-2 @ 69671fb |
-| SWE-bench Verified | C6-05, C7-05..10 | `eval.sh` + FAIL_TO_PASS / PASS_TO_PASS, graded by swebench 4.1.0 |
-| DeepSWE v1.1 | C6-02, C6-03, C7-11..14 | `tests/` from datacurve-ai/deep-swe @ 0b9fabb |
-| FrontierSWE v2 | C6-07 | the published verifier image; continuous score, pass at ≥ 0.1 |
+| Terminal-Bench 2.0 | C6-01, C6-03..06, C7-02, C8-03 | `original_tests/` from laude-institute/terminal-bench-2 @ 69671fb |
+| SWE-bench Verified | C7-03..08, C8-01 | `eval.sh` + FAIL_TO_PASS / PASS_TO_PASS, graded by swebench 4.1.0 |
+| DeepSWE v1.1 | C6-02, C6-07, C7-01, C7-09..11 | `tests/` from datacurve-ai/deep-swe @ 0b9fabb |
+| FrontierSWE v2 | C8-02 | the published verifier image; continuous score, pass at ≥ 0.1 |
 
 A trial passes if the verifier passes. Per case and model the result is the **pass rate** over
 the trials (D1 in `evaluation/rubrics/c6_discriminative.json` / `c7_daily.json`).
@@ -31,7 +31,7 @@ One judge call per trial (Claude Opus 5.5) grades:
     swallowed errors.
 - **1–2 case-specific items** per case, defined in `evaluation/rubrics/tasks/<ID>.json`. These are
   task-specific questions the tests don't fully answer, e.g. C6-01 "obfuscated XSS vectors
-  neutralised" or C7-08 "deprecated OPTIONS keys still supported".
+  neutralised" or C7-06 "deprecated OPTIONS keys still supported".
 
 Each item has a question and concrete **perfect / accept / bad** criteria. Scores: perfect = 1.0,
 accept = 0.6, bad = 0. **Quality = 100 × mean item score.** The judge sees the task, the reference

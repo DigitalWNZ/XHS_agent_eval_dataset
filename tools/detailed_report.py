@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detailed per-case report (every entry x model x trial) for the C6/C7 agent runs -> markdown.
+"""Detailed per-case report (every entry x model x trial) for the C6/C7/C8 agent runs -> markdown.
 
 Reads the run summaries (results/c{6,7,8}_<agent>_<model>_<ts>.json), keeping only trials whose
 run_dir still exists under results/c*_runs/ (invalidated runs were moved to *_runs_invalid/ and
@@ -16,13 +16,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from idmap import XHS, current_id  # noqa: E402
 
 AGENTS = {"agy": "Antigravity", "claude": "Claude Code"}
-MODEL_ORDER = ["gemini-3.6-flash-high", "gemini-3.8-flash-high", "claude-opus-5-5"]
-CATS = ("C6", "C7")
+MODEL_ORDER = ["claude-opus-5-5", "gemini-3.6-flash-high", "gemini-3.8-flash-high", "gemini-4-argon-high"]
+CATS = ("C6", "C7", "C8")
 CAT_NAMES = {"C6": "C6 区分度任务 — Discriminative (model-differentiating)",
-             "C7": "C7 日常工作任务 — Daily work (routine engineering)"}
+             "C7": "C7 日常工作任务 — Daily work (routine engineering)",
+             "C8": "C8 高难任务 — Hard (frontier-separating)"}
 
 entries = {}
-for f in glob.glob(f"{XHS}/dataset/c[67]/C*.json"):
+for f in glob.glob(f"{XHS}/dataset/c[678]/C*.json"):
     e = json.load(open(f))
     entries[e["instance_id"]] = e
 
@@ -64,12 +65,15 @@ def source(e):
 
 out = []
 models = [m for m in MODEL_ORDER if any(k[1] == m for k in trials)]
-out.append("# Detailed results: C6 (discriminative) / C7 (daily work) agent runs\n")
-out.append("Agents: Antigravity (agy) with gemini-3.6-flash-high / gemini-3.8-flash-high; "
-           "Claude Code with claude-opus-5-5 (Vertex). Independent trials per entry (3; C7-01 "
-           "Gemini 5). P = pass, F = fail. C6-07 has a continuous score in [0, 1] and passes at "
-           ">= 0.1. Runs invalidated by harness bugs are excluded (see results/*_runs_invalid/).\n")
-out.append("Entry IDs follow the C6/C7 restructure; *Former ID* is the ID used when the runs were "
+out.append("# Detailed results: C6 (discriminative) / C7 (daily work) / C8 (hard) agent runs (all runs)\n")
+out.append("Agents: Antigravity (agy) with gemini-3.6-flash-high / gemini-3.8-flash-high / gemini-4-argon-high; "
+           "Claude Code with claude-opus-5-5 (Vertex). All recorded runs are pooled (several campaigns, so trial "
+           "counts differ; for one campaign use tools/campaign_report.py). P = pass, F = fail. C8-02 has a "
+           "continuous score in [0, 1] and passes at >= 0.1. Runs invalidated by harness bugs are excluded (see "
+           "results/*_runs_invalid/); trials that later failed the validity audit are NOT excluded here "
+           "(see results/README_quality.md).\n")
+out.append("Entry IDs follow the current (2026-10-15) layout; *Former ID* is the ID before that restructure; runs are "
+           "mapped from the ID they "
            "recorded (raw run folders keep it; mapping in results/id_mapping.json).\n")
 out.append("Columns: *Details* = grader verdict (F2P/P2P = fail-to-pass / pass-to-pass tests passed); "
            "*Agent time* = agent wall time (budget-capped); *Tokens* = input+output incl. cache; "

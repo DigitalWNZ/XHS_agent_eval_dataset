@@ -18,8 +18,7 @@ fi
 uvx \
   -p 3.13 \
   -w pytest==8.4.1 \
-  -w toml==0.10.2 \
-  -w opencv-contrib-python==4.11.0.86 \
+  -w mteb==1.36.8 \
   -w pytest-json-ctrf==0.3.5 \
   pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
 

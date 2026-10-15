@@ -1,52 +1,33 @@
-FROM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive PAGER=cat GIT_PAGER=cat GIT_TERMINAL_PROMPT=0 LANG=C.UTF-8
+FROM public.ecr.aws/x8v8d7g8/mars-base:latest
 
-# Pinned toolchains: Zig for @Vector, and
-# the FFmpeg release whose scalar swscale is the reference implementation.
-ARG ZIG_VERSION=0.14.0
-ARG FFMPEG_TAG=n7.1
-ENV ZIG_VERSION=${ZIG_VERSION} FFMPEG_TAG=${FFMPEG_TAG}
-
-COPY setup/ /opt/setup/
-RUN chmod +x /opt/setup/*.sh
-RUN mkdir -p /root/assets /root/tests /app
-RUN sh /opt/setup/install_packages.sh   # baseline apt toolset (setup/packages.txt) + valgrind
-RUN sh /opt/setup/setup_user.sh         # git identity + non-root agent user
-RUN sh /opt/setup/install_zig.sh        # pinned Zig, symlinked onto a bare PATH
-RUN sh /opt/setup/build_ffmpeg.sh       # pinned clone, --disable-asm build, scalar sources -> /reference
-
-COPY baseline_wrapper.c /opt/setup/baseline_wrapper.c
-RUN sh /opt/setup/build_baseline.sh     # the reference .so, root-only and agent-readable copies
-COPY driver.c /opt/setup/driver.c
-RUN sh /opt/setup/build_driver.sh       # -march=x86-64-v3: the simulator cannot execute AVX-512
-
-# --- Verifier assets ---
-COPY tests/ /root/tests/
-COPY performance/ /root/tests/performance/
-COPY workloads.py /root/tests/workloads.py
-
-# Verifier-only driver with the real-content source mode (cc0 gate)
-RUN gcc -O2 -march=x86-64-v3 -o /root/tests/driver-src /root/tests/verifier_driver.c -ldl \
-    && chmod 0700 /root/tests/driver-src
-
-RUN python3 -B /root/tests/bake_baseline.py public /app/baseline-work.json
-RUN python3 -B /root/tests/bake_baseline.py hidden /root/tests/baseline-work.json
-
-# --- Agent workspace ---
 WORKDIR /app
-COPY workspace/ /app
-COPY performance/ /app/performance/
-COPY workloads.py /app/workloads.py
-RUN mkdir -p /app/swscale-impl
-RUN chmod +x /app/perf-check
-RUN chown -R agent:agent /app
 
-# setup/ is build-time only — drop it from the final image.
-RUN rm -rf /opt/setup
+# Git time-travel: clone, then make the repo's default branch point AT the base
+# commit with no future history — a real branch checkout (not a detached HEAD),
+# future commits/tags gc'd away so the reference solution can't leak from history.
+ARG BASE_SHA=1047cdc393fac7c98822c993d70c28f58833c63d
+RUN git clone https://github.com/TanStack/query . \
+ && DEFAULT="$(git remote show origin | sed -n 's/.*HEAD branch: //p')" \
+ && git checkout -B "$DEFAULT" "$BASE_SHA" \
+ && git remote remove origin \
+ && for b in $(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx "$DEFAULT"); do git branch -D "$b" || true; done \
+ && for t in $(git tag); do git merge-base --is-ancestor "$t" HEAD 2>/dev/null || git tag -d "$t"; done \
+ && git reflog expire --expire=now --all \
+ && git gc --prune=now \
+ && (git submodule update --init --recursive || true)
 
-# --- Sandbox bootstrapping + oracle permission wiring (managed) ---
-RUN mkdir -p /logs/agent /sandbox-timer
-COPY sandbox_timer.sh /usr/local/bin/sandbox-timer
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/sandbox-timer && chmod 0700 /usr/local/bin/entrypoint.sh
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+RUN corepack enable
+RUN corepack pnpm install --frozen-lockfile
+
+# v1.1 CTRF scoring: vitest's built-in JUnit reporter (`--reporter=junit
+# --outputFile=...`) feeds the OFFICIAL ctrf-io converter. junit-to-ctrf is
+# installed out-of-tree via npm -g (lands under /usr/lib/node_modules; never
+# touches /app's package.json or pnpm-lock.yaml — repo stays porcelain-clean).
+# The trailing --version call is a build-time smoke check (engines node>=20).
+RUN npm install -g junit-to-ctrf@0.0.14 && junit-to-ctrf --version
+
+# Disable git commit hooks (husky etc.): dev-workflow tooling, not task content.
+# Broken hook environments otherwise block the agent's (and oracle's) commits.
+RUN cd /app && git config core.hooksPath /dev/null
+
+CMD ["/bin/bash"]

@@ -1,881 +1,853 @@
-diff --git a/drizzle-orm/src/gel-core/dialect.ts b/drizzle-orm/src/gel-core/dialect.ts
-index 6c15412..234aa55 100644
---- a/drizzle-orm/src/gel-core/dialect.ts
-+++ b/drizzle-orm/src/gel-core/dialect.ts
-@@ -26,6 +26,7 @@ import {
- 	type TablesRelationalConfig,
- } from '~/relations.ts';
- import { and, eq, View } from '~/sql/index.ts';
-+import { buildWindowSpecSQL } from '~/sql/functions/window.ts';
- import {
- 	type DriverValueEncoder,
- 	type Name,
-@@ -344,6 +345,7 @@ export class GelDialect {
- 			joins,
- 			orderBy,
- 			groupBy,
-+			windows,
- 			limit,
- 			offset,
- 			lockingClause,
-@@ -396,6 +398,14 @@ export class GelDialect {
+diff --git a/batch.go b/batch.go
+index f439133a..416d870d 100644
+--- a/batch.go
++++ b/batch.go
+@@ -371,6 +371,23 @@ type batchInternal struct {
  
- 		const havingSql = having ? sql` having ${having}` : undefined;
+ 	commitErr error
  
-+		let windowsSql: SQL | undefined;
-+		if (windows && windows.length > 0) {
-+			const winChunks = windows.map(({ name, spec }) =>
-+				sql`${sql.identifier(name)} as (${buildWindowSpecSQL(spec)})`
-+			);
-+			windowsSql = sql` window ${sql.join(winChunks, sql`, `)}`;
-+		}
++	// commitStartTime is recorded at the start of commitPipeline.Commit and
++	// used to compute ApplyDuration and SyncDuration in BatchDurableInfo.
++	commitStartTime crtime.Mono
 +
- 		let orderBySql;
- 		if (orderBy && orderBy.length > 0) {
- 			orderBySql = sql` order by ${sql.join(orderBy, sql`, `)}`;
-@@ -433,7 +443,7 @@ export class GelDialect {
- 			lockingClauseSql.append(clauseSql);
- 		}
- 		const finalQuery =
--			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
-+			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowsSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
++	// applyTime is recorded in commitPipeline.publish, before t.commit.Done(),
++	// establishing the happens-before edge that makes it visible in onBatchDurable.
++	applyTime crtime.Mono
++
++	// syncEndTime is recorded just before the onDurable callback is invoked,
++	// after both memtable visibility and WAL sync have completed. Used to
++	// compute SyncDuration = syncEndTime - applyTime (the sync-only phase).
++	syncEndTime crtime.Mono
++
++	// correlationID is the value from WriteOptions.CommitCorrelationID,
++	// propagated to BatchDurableInfo.CorrelationID.
++	correlationID uint64
++
+ 	// Position bools together to reduce the sizeof the struct.
  
- 		if (setOperators.length > 0) {
- 			return this.buildSetOperations(finalQuery, setOperators);
-diff --git a/drizzle-orm/src/gel-core/query-builders/select.ts b/drizzle-orm/src/gel-core/query-builders/select.ts
-index 2e1f067..d78727b 100644
---- a/drizzle-orm/src/gel-core/query-builders/select.ts
-+++ b/drizzle-orm/src/gel-core/query-builders/select.ts
-@@ -35,6 +35,7 @@ import {
- } from '~/utils.ts';
- import { orderSelectedFields } from '~/utils.ts';
- import { ViewBaseConfig } from '~/view-common.ts';
-+import { assertValidWindowName, type WindowSpec, type WindowDefinition } from '~/sql/functions/window.ts';
- import { extractUsedTable } from '../utils.ts';
- import type {
- 	AnyGelSelect,
-@@ -849,6 +850,15 @@ export abstract class GelSelectQueryBuilderBase<
- 		return this as any;
+ 	// ingestedSSTBatch indicates that the batch contains one or more key kinds
+diff --git a/commit.go b/commit.go
+index c86e378b..f00af7f1 100644
+--- a/commit.go
++++ b/commit.go
+@@ -140,6 +140,11 @@ type commitEnv struct {
+ 	// the memtable the batch should be applied to. Serial execution enforced by
+ 	// commitPipeline.mu.
+ 	write func(b *Batch, wg *sync.WaitGroup, err *error) (*memTable, error)
++
++	// onDurable, if non-nil, is called after a Sync batch has been durably
++	// persisted (syncWAL=true, noSyncWait=false). It is invoked on the
++	// committing goroutine after publish returns. Must not block.
++	onDurable func(b *Batch)
+ }
+ 
+ // A commitPipeline manages the stages of committing a set of mutations
+@@ -301,6 +306,7 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
  	}
-
-+	window(name: string, spec: WindowSpec) {
-+		assertValidWindowName(name);
-+		if (!this.config.windows) {
-+			this.config.windows = [];
-+		}
-+		this.config.windows.push({ name, spec });
-+		return this as any;
+ 
+ 	commitStartTime := crtime.NowMono()
++	b.commitStartTime = commitStartTime
+ 	// Acquire semaphores.
+ 	p.commitQueueSem <- struct{}{}
+ 	if syncWAL {
+@@ -332,9 +338,21 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
+ 		return err
+ 	}
+ 
+-	// Publish the batch sequence number.
++	// Publish the batch sequence number. For syncWAL=true, noSyncWait=false
++	// batches, publish also waits for the WAL sync to complete before
++	// returning.
+ 	p.publish(b)
+ 
++	// For synchronous sync-write commits (noSyncWait=false), notify the
++	// durability callback now that both memtable visibility and WAL sync have
++	// completed. Async sync-write commits (noSyncWait=true) are excluded
++	// because the WAL sync has not yet completed at this point; those callers
++	// manage their own fsync observability via batch.fsyncWait.
++	if syncWAL && !noSyncWait && p.env.onDurable != nil {
++		b.syncEndTime = crtime.NowMono()
++		p.env.onDurable(b)
 +	}
 +
- 	/**
- 	 * Adds an `order by` clause to the query.
- 	 *
-diff --git a/drizzle-orm/src/gel-core/query-builders/select.types.ts b/drizzle-orm/src/gel-core/query-builders/select.types.ts
-index d8b85b3..2c32920 100644
---- a/drizzle-orm/src/gel-core/query-builders/select.types.ts
-+++ b/drizzle-orm/src/gel-core/query-builders/select.types.ts
-@@ -1,4 +1,5 @@
- import type { GelColumn } from '~/gel-core/columns/index.ts';
-+import type { WindowSpec, WindowDefinition } from '~/sql/functions/window.ts';
- import type { GelTable, GelTableWithColumns } from '~/gel-core/table.ts';
- import type { GelViewBase } from '~/gel-core/view-base.ts';
- import type { GelViewWithSelection } from '~/gel-core/view.ts';
-@@ -62,6 +63,7 @@ export interface GelSelectConfig {
- 	joins?: GelSelectJoinConfig[];
- 	orderBy?: (GelColumn | SQL | SQL.Aliased)[];
- 	groupBy?: (GelColumn | SQL | SQL.Aliased)[];
-+	windows?: WindowDefinition[];
- 	lockingClause?: {
- 		strength: LockStrength;
- 		config: LockConfig;
-diff --git a/drizzle-orm/src/mysql-core/dialect.ts b/drizzle-orm/src/mysql-core/dialect.ts
-index 053ddc0..53d4f9d 100644
---- a/drizzle-orm/src/mysql-core/dialect.ts
-+++ b/drizzle-orm/src/mysql-core/dialect.ts
-@@ -23,6 +23,7 @@ import { Subquery } from '~/subquery.ts';
- import { getTableName, getTableUniqueName, Table } from '~/table.ts';
- import { type Casing, orderSelectedFields, type UpdateSet } from '~/utils.ts';
- import { ViewBaseConfig } from '~/view-common.ts';
-+import { buildWindowSpecSQL } from '~/sql/functions/window.ts';
- import { MySqlColumn } from './columns/common.ts';
- import type { MySqlDeleteConfig } from './query-builders/delete.ts';
- import type { MySqlInsertConfig } from './query-builders/insert.ts';
-@@ -285,6 +286,7 @@ export class MySqlDialect {
- 			joins,
- 			orderBy,
- 			groupBy,
-+			windows,
- 			limit,
- 			offset,
- 			lockingClause,
-@@ -392,6 +394,14 @@ export class MySqlDialect {
+ 	<-p.commitQueueSem
  
- 		const havingSql = having ? sql` having ${having}` : undefined;
- 
-+		let windowsSql: SQL | undefined;
-+		if (windows && windows.length > 0) {
-+			const winChunks = windows.map(({ name, spec }) =>
-+				sql`${sql.identifier(name)} as (${buildWindowSpecSQL(spec)})`
-+			);
-+			windowsSql = sql` window ${sql.join(winChunks, sql`, `)}`;
-+		}
-+
- 		const orderBySql = this.buildOrderBy(orderBy);
- 
- 		const groupBySql = groupBy && groupBy.length > 0 ? sql` group by ${sql.join(groupBy, sql`, `)}` : undefined;
-@@ -418,7 +428,7 @@ export class MySqlDialect {
+ 	if !noSyncWait {
+@@ -514,6 +532,10 @@ func (p *commitPipeline) publish(b *Batch) {
+ 			}
  		}
  
- 		const finalQuery =
--			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${useIndexSql}${forceIndexSql}${ignoreIndexSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
-+			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${useIndexSql}${forceIndexSql}${ignoreIndexSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowsSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
- 
- 		if (setOperators.length > 0) {
- 			return this.buildSetOperations(finalQuery, setOperators);
-diff --git a/drizzle-orm/src/mysql-core/query-builders/select.ts b/drizzle-orm/src/mysql-core/query-builders/select.ts
-index 374f36b..69b617b 100644
---- a/drizzle-orm/src/mysql-core/query-builders/select.ts
-+++ b/drizzle-orm/src/mysql-core/query-builders/select.ts
-@@ -24,6 +24,7 @@ import { Table } from '~/table.ts';
- import type { ValueOrArray } from '~/utils.ts';
- import { applyMixins, getTableColumns, getTableLikeName, haveSameKeys, orderSelectedFields } from '~/utils.ts';
- import { ViewBaseConfig } from '~/view-common.ts';
-+import { assertValidWindowName, type WindowSpec, type WindowDefinition } from '~/sql/functions/window.ts';
- import type { IndexBuilder } from '../indexes.ts';
- import { convertIndexToString, extractUsedTable, toArray } from '../utils.ts';
- import { MySqlViewBase } from '../view-base.ts';
-@@ -903,6 +904,15 @@ export abstract class MySqlSelectQueryBuilderBase<
- 		return this as any;
++		// Record memtable visibility time before signaling the committing
++		// goroutine. The Done() call below establishes the happens-before edge
++		// that makes this write visible when the committer reads applyTime.
++		t.applyTime = crtime.NowMono()
+ 		t.commit.Done()
  	}
-
-+	window(name: string, spec: WindowSpec) {
-+		assertValidWindowName(name);
-+		if (!this.config.windows) {
-+			this.config.windows = [];
-+		}
-+		this.config.windows.push({ name, spec });
-+		return this as any;
-+	}
-+
- 	/**
- 	 * Adds an `order by` clause to the query.
- 	 *
-diff --git a/drizzle-orm/src/mysql-core/query-builders/select.types.ts b/drizzle-orm/src/mysql-core/query-builders/select.types.ts
-index b86d1d9..24d8631 100644
---- a/drizzle-orm/src/mysql-core/query-builders/select.types.ts
-+++ b/drizzle-orm/src/mysql-core/query-builders/select.types.ts
-@@ -1,5 +1,6 @@
- import type { MySqlColumn } from '~/mysql-core/columns/index.ts';
- import type { MySqlTable, MySqlTableWithColumns } from '~/mysql-core/table.ts';
-+import type { WindowSpec, WindowDefinition } from '~/sql/functions/window.ts';
- import type {
- 	SelectedFields as SelectedFieldsBase,
- 	SelectedFieldsFlat as SelectedFieldsFlatBase,
-@@ -66,6 +67,7 @@ export interface MySqlSelectConfig {
- 	joins?: MySqlSelectJoinConfig[];
- 	orderBy?: (MySqlColumn | SQL | SQL.Aliased)[];
- 	groupBy?: (MySqlColumn | SQL | SQL.Aliased)[];
-+	windows?: WindowDefinition[];
- 	lockingClause?: {
- 		strength: LockStrength;
- 		config: LockConfig;
-diff --git a/drizzle-orm/src/pg-core/dialect.ts b/drizzle-orm/src/pg-core/dialect.ts
-index be5ecdb..127e1b5 100644
---- a/drizzle-orm/src/pg-core/dialect.ts
-+++ b/drizzle-orm/src/pg-core/dialect.ts
-@@ -24,6 +24,7 @@ import type {
- 	PgUpdateConfig,
- } from '~/pg-core/query-builders/index.ts';
- import type { PgSelectConfig, SelectedFieldsOrdered } from '~/pg-core/query-builders/select.types.ts';
-+import { buildWindowSpecSQL } from '~/sql/functions/window.ts';
- import { PgTable } from '~/pg-core/table.ts';
- import {
- 	type BuildRelationalQueryResult,
-@@ -349,6 +350,7 @@ export class PgDialect {
- 			joins,
- 			orderBy,
- 			groupBy,
-+			windows,
- 			limit,
- 			offset,
- 			lockingClause,
-@@ -401,6 +403,14 @@ export class PgDialect {
+ }
+diff --git a/db.go b/db.go
+index d8b443ec..38bd697d 100644
+--- a/db.go
++++ b/db.go
+@@ -301,6 +301,44 @@ type DB struct {
  
- 		const havingSql = having ? sql` having ${having}` : undefined;
+ 	commit *commitPipeline
  
-+		let windowsSql: SQL | undefined;
-+		if (windows && windows.length > 0) {
-+			const winChunks = windows.map(({ name, spec }) =>
-+				sql`${sql.identifier(name)} as (${buildWindowSpecSQL(spec)})`
-+			);
-+			windowsSql = sql` window ${sql.join(winChunks, sql`, `)}`;
-+		}
++	// durabilityTracker is notified each time a Sync batch is durably persisted
++	// and used to implement WaitForDurability.
++	durabilityTracker *durabilityTracker
 +
- 		let orderBySql;
- 		if (orderBy && orderBy.length > 0) {
- 			orderBySql = sql` order by ${sql.join(orderBy, sql`, `)}`;
-@@ -438,7 +448,7 @@ export class PgDialect {
- 			lockingClauseSql.append(clauseSql);
++	// batchDurableConfigured is true when the user supplied a non-nil
++	// EventListener.BatchDurable at Open time. Used to gate metric accounting.
++	batchDurableConfigured bool
++
++	// durableJobSeq is an atomic counter that assigns unique JobIDs to
++	// BatchDurableInfo events.
++	durableJobSeq atomic.Int64
++
++	// durableCommitCount and durableCommitDuration accumulate the count and
++	// total SyncDuration of successfully durable Sync commits. Only updated
++	// when batchDurableConfigured is true.
++	durableCommitCount    atomic.Uint64
++	durableCommitDuration atomic.Uint64 // cumulative nanoseconds
++
++	// durableFailedCount tracks the number of Sync commits that failed
++	// durability (WAL sync error). Only updated when batchDurableConfigured
++	// is true.
++	durableFailedCount atomic.Uint64
++
++	// durableMaxSyncNanos tracks the maximum SyncDuration observed across
++	// all successful durable commits, in nanoseconds. Updated atomically
++	// via CAS loop to avoid races under concurrent commits.
++	durableMaxSyncNanos atomic.Uint64
++
++	// durableJobs maps BatchDurableInfo.JobID to the last sequence number in
++	// that batch. Used to implement WaitForJobDurability.
++	durableJobsMu sync.Mutex
++	durableJobs   map[int]uint64
++	// durableJobsMinKept and durableJobsMaxSeen bound the range of JobIDs kept
++	// in durableJobs. This bounded window is used to distinguish expired from
++	// never-seen JobIDs while keeping memory use under control.
++	durableJobsMinKept int
++	durableJobsMaxSeen int
++
+ 	// readState provides access to the state needed for reading without needing
+ 	// to acquire DB.mu.
+ 	readState struct {
+@@ -819,6 +857,9 @@ func (d *DB) applyInternal(batch *Batch, opts *WriteOptions, noSyncWait bool) er
  		}
- 		const finalQuery =
--			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
-+			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowsSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
- 
- 		if (setOperators.length > 0) {
- 			return this.buildSetOperations(finalQuery, setOperators);
-diff --git a/drizzle-orm/src/pg-core/query-builders/select.ts b/drizzle-orm/src/pg-core/query-builders/select.ts
-index dafdb96..bb80fb9 100644
---- a/drizzle-orm/src/pg-core/query-builders/select.ts
-+++ b/drizzle-orm/src/pg-core/query-builders/select.ts
-@@ -36,6 +36,7 @@ import {
- } from '~/utils.ts';
- import { orderSelectedFields } from '~/utils.ts';
- import { ViewBaseConfig } from '~/view-common.ts';
-+import { assertValidWindowName, type WindowSpec, type WindowDefinition } from '~/sql/functions/window.ts';
- import { extractUsedTable } from '../utils.ts';
- import type {
- 	AnyPgSelect,
-@@ -856,6 +857,15 @@ export abstract class PgSelectQueryBuilderBase<
- 		return this as any;
  	}
-
-+	window(name: string, spec: WindowSpec) {
-+		assertValidWindowName(name);
-+		if (!this.config.windows) {
-+			this.config.windows = [];
-+		}
-+		this.config.windows.push({ name, spec });
-+		return this as any;
+ 	batch.committing = true
++	if opts != nil {
++		batch.correlationID = opts.CommitCorrelationID
 +	}
-+
- 	/**
- 	 * Adds an `order by` clause to the query.
- 	 *
-diff --git a/drizzle-orm/src/pg-core/query-builders/select.types.ts b/drizzle-orm/src/pg-core/query-builders/select.types.ts
-index 6a12030..abadfc9 100644
---- a/drizzle-orm/src/pg-core/query-builders/select.types.ts
-+++ b/drizzle-orm/src/pg-core/query-builders/select.types.ts
-@@ -3,6 +3,7 @@ import type {
- 	SelectedFieldsFlat as SelectedFieldsFlatBase,
- 	SelectedFieldsOrdered as SelectedFieldsOrderedBase,
- } from '~/operations.ts';
-+import type { WindowSpec, WindowDefinition } from '~/sql/functions/window.ts';
- import type { PgColumn } from '~/pg-core/columns/index.ts';
- import type { PgTable, PgTableWithColumns } from '~/pg-core/table.ts';
- import type { PgViewBase } from '~/pg-core/view-base.ts';
-@@ -62,6 +63,7 @@ export interface PgSelectConfig {
- 	joins?: PgSelectJoinConfig[];
- 	orderBy?: (PgColumn | SQL | SQL.Aliased)[];
- 	groupBy?: (PgColumn | SQL | SQL.Aliased)[];
-+	windows?: WindowDefinition[];
- 	lockingClause?: {
- 		strength: LockStrength;
- 		config: LockConfig;
-diff --git a/drizzle-orm/src/singlestore-core/dialect.ts b/drizzle-orm/src/singlestore-core/dialect.ts
-index b0791c3..19214f4 100644
---- a/drizzle-orm/src/singlestore-core/dialect.ts
-+++ b/drizzle-orm/src/singlestore-core/dialect.ts
-@@ -17,6 +17,7 @@ import {
- 	type TablesRelationalConfig,
- } from '~/relations.ts';
- import { and, eq } from '~/sql/expressions/index.ts';
-+import { buildWindowSpecSQL } from '~/sql/functions/window.ts';
- import type { Name, Placeholder, QueryWithTypings, SQLChunk } from '~/sql/sql.ts';
- import { Param, SQL, sql, View } from '~/sql/sql.ts';
- import { Subquery } from '~/subquery.ts';
-@@ -272,6 +273,7 @@ export class SingleStoreDialect {
- 			joins,
- 			orderBy,
- 			groupBy,
-+			windows,
- 			limit,
- 			offset,
- 			lockingClause,
-@@ -371,6 +373,14 @@ export class SingleStoreDialect {
  
- 		const havingSql = having ? sql` having ${having}` : undefined;
+ 	if batch.db == nil {
+ 		if err := batch.refreshMemTableSize(); err != nil {
+@@ -1570,6 +1611,7 @@ func (d *DB) Close() error {
+ 	d.closed.Store(errors.WithStack(ErrClosed))
+ 	close(d.closedCh)
+ 	d.bgCtxCancel()
++	d.durabilityTracker.close(ErrClosed)
  
-+		let windowsSql: SQL | undefined;
-+		if (windows && windows.length > 0) {
-+			const winChunks = windows.map(({ name, spec }) =>
-+				sql`${sql.identifier(name)} as (${buildWindowSpecSQL(spec)})`
-+			);
-+			windowsSql = sql` window ${sql.join(winChunks, sql`, `)}`;
-+		}
-+
- 		const orderBySql = this.buildOrderBy(orderBy);
+ 	defer d.cacheHandle.Close()
  
- 		const groupBySql = groupBy && groupBy.length > 0 ? sql` group by ${sql.join(groupBy, sql`, `)}` : undefined;
-@@ -391,7 +401,7 @@ export class SingleStoreDialect {
- 		}
+@@ -1927,6 +1969,212 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
+ 	return flushed, nil
+ }
  
- 		const finalQuery =
--			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
-+			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowsSql}${orderBySql}${limitSql}${offsetSql}${lockingClausesSql}`;
- 
- 		if (setOperators.length > 0) {
- 			return this.buildSetOperations(finalQuery, setOperators);
-diff --git a/drizzle-orm/src/singlestore-core/query-builders/select.ts b/drizzle-orm/src/singlestore-core/query-builders/select.ts
-index 5b0fb39..d38c20d 100644
---- a/drizzle-orm/src/singlestore-core/query-builders/select.ts
-+++ b/drizzle-orm/src/singlestore-core/query-builders/select.ts
-@@ -34,6 +34,7 @@ import {
- 	orderSelectedFields,
- 	type ValueOrArray,
- } from '~/utils.ts';
-+import { assertValidWindowName, type WindowSpec, type WindowDefinition } from '~/sql/functions/window.ts';
- import { extractUsedTable } from '../utils.ts';
- import type {
- 	AnySingleStoreSelect,
-@@ -776,6 +777,15 @@ export abstract class SingleStoreSelectQueryBuilderBase<
- 		return this as any;
- 	}
-
-+	window(name: string, spec: WindowSpec) {
-+		assertValidWindowName(name);
-+		if (!this.config.windows) {
-+			this.config.windows = [];
-+		}
-+		this.config.windows.push({ name, spec });
-+		return this as any;
++// WaitForDurability blocks until the batch whose sequence number equals
++// seqNum, or any later batch, has been durably persisted to the WAL. It
++// returns nil when the target seqnum is durable, ErrClosed if the DB closes
++// before durability is achieved, or a sync error if the WAL sync failed.
++//
++// When DisableWAL is true, WaitForDurability returns nil immediately because
++// all committed writes are applied directly without a WAL sync requirement.
++//
++// It is safe to call WaitForDurability from multiple goroutines concurrently.
++func (d *DB) WaitForDurability(seqNum base.SeqNum) error {
++	if d.opts.DisableWAL {
++		return nil
 +	}
++	return d.durabilityTracker.waitFor(uint64(seqNum))
++}
 +
- 	/**
- 	 * Adds an `order by` clause to the query.
- 	 *
-diff --git a/drizzle-orm/src/singlestore-core/query-builders/select.types.ts b/drizzle-orm/src/singlestore-core/query-builders/select.types.ts
-index 0108eda..cea16f3 100644
---- a/drizzle-orm/src/singlestore-core/query-builders/select.types.ts
-+++ b/drizzle-orm/src/singlestore-core/query-builders/select.types.ts
-@@ -3,6 +3,7 @@ import type {
- 	SelectedFieldsFlat as SelectedFieldsFlatBase,
- 	SelectedFieldsOrdered as SelectedFieldsOrderedBase,
- } from '~/operations.ts';
-+import type { WindowSpec, WindowDefinition } from '~/sql/functions/window.ts';
- import type { TypedQueryBuilder } from '~/query-builders/query-builder.ts';
- import type {
- 	AppendToNullabilityMap,
-@@ -61,6 +62,7 @@ export interface SingleStoreSelectConfig {
- 	joins?: SingleStoreSelectJoinConfig[];
- 	orderBy?: (SingleStoreColumn | SQL | SQL.Aliased)[];
- 	groupBy?: (SingleStoreColumn | SQL | SQL.Aliased)[];
-+	windows?: WindowDefinition[];
- 	lockingClause?: {
- 		strength: LockStrength;
- 		config: LockConfig;
-diff --git a/drizzle-orm/src/sql/functions/index.ts b/drizzle-orm/src/sql/functions/index.ts
-index 5db174a..88152b7 100644
---- a/drizzle-orm/src/sql/functions/index.ts
-+++ b/drizzle-orm/src/sql/functions/index.ts
-@@ -1,2 +1,3 @@
- export * from './aggregate.ts';
- export * from './vector.ts';
-+export * from './window.ts';
-diff --git a/drizzle-orm/src/sql/functions/window.ts b/drizzle-orm/src/sql/functions/window.ts
++// WaitForDurabilityContext provides the same durability guarantee as
++// WaitForDurability but also honors context cancellation and deadlines. It
++// returns nil when the target sequence number (or any later batch) becomes
++// durably persisted before the context is done, returns a non-nil error if the
++// DB closes or a WAL sync failure makes durability impossible first, and
++// returns ctx.Err() if the context is canceled or its deadline expires while
++// durability is still pending.
++func (d *DB) WaitForDurabilityContext(ctx context.Context, seqNum base.SeqNum) error {
++	if d.opts.DisableWAL {
++		return nil
++	}
++	return d.durabilityTracker.waitForContext(ctx, uint64(seqNum))
++}
++
++// DurableState returns the highest sequence number known to be durably
++// persisted, along with the first non-nil durability error if any has
++// occurred. The sequence number is monotonic across calls.
++func (d *DB) DurableState() (base.SeqNum, error) {
++	if d.opts.DisableWAL {
++		return 0, nil
++	}
++	seq, err := d.durabilityTracker.state()
++	return base.SeqNum(seq), err
++}
++
++// DurabilityStats returns a snapshot of detailed durability tracking
++// statistics. It is safe to call from multiple goroutines concurrently.
++func (d *DB) DurabilityStats() DurabilityStats {
++	seq, err := d.durabilityTracker.state()
++	return DurabilityStats{
++		HighestDurableSeqNum:   base.SeqNum(seq),
++		PendingWaiters:         d.durabilityTracker.pendingWaiters.Load(),
++		TotalDurableCommits:    d.durableCommitCount.Load(),
++		TotalFailedCommits:     d.durableFailedCount.Load(),
++		CumulativeSyncDuration: time.Duration(d.durableCommitDuration.Load()),
++		MaxSyncDuration:        time.Duration(d.durableMaxSyncNanos.Load()),
++		FirstErr:               err,
++	}
++}
++
++// DurabilityNotify returns a channel that will receive exactly one value
++// when the given sequence number (or any later batch) becomes durably
++// persisted. The channel receives nil on success or a non-nil error on
++// failure (WAL sync error, DB close). If the sequence number is already
++// durable at call time, the channel is pre-filled.
++//
++// When DisableWAL is true, the returned channel is pre-filled with nil.
++//
++// This is the non-blocking, channel-based alternative to WaitForDurability,
++// suitable for use in select statements.
++func (d *DB) DurabilityNotify(seqNum base.SeqNum) <-chan error {
++	if d.opts.DisableWAL {
++		ch := make(chan error, 1)
++		ch <- nil
++		return ch
++	}
++	return d.durabilityTracker.subscribe(uint64(seqNum))
++}
++
++// WaitForDurabilityBatch blocks until every sequence number in seqNums is
++// durably persisted. It returns the first durability error encountered (sync
++// failure, DB close) or nil when all targets are satisfied.
++//
++// An empty or nil slice returns nil immediately. Duplicate and zero-valued
++// entries are accepted; zero is treated the same as in WaitForDurability
++// (satisfied after any durable commit).
++//
++// When DisableWAL is true, all entries are considered immediately durable.
++func (d *DB) WaitForDurabilityBatch(seqNums []base.SeqNum) error {
++	if len(seqNums) == 0 {
++		return nil
++	}
++	if d.opts.DisableWAL {
++		return nil
++	}
++	var maxSeq base.SeqNum
++	for _, s := range seqNums {
++		if s > maxSeq {
++			maxSeq = s
++		}
++	}
++	return d.durabilityTracker.waitFor(uint64(maxSeq))
++}
++
++// WaitForDurabilityBatchContext is like WaitForDurabilityBatch but respects
++// the provided context. Durability errors (sync failure, DB close) take
++// precedence over context cancellation, matching WaitForDurabilityContext
++// semantics.
++//
++// An empty or nil slice returns nil immediately.
++func (d *DB) WaitForDurabilityBatchContext(ctx context.Context, seqNums []base.SeqNum) error {
++	if len(seqNums) == 0 {
++		return nil
++	}
++	if d.opts.DisableWAL {
++		return nil
++	}
++	var maxSeq base.SeqNum
++	for _, s := range seqNums {
++		if s > maxSeq {
++			maxSeq = s
++		}
++	}
++	return d.durabilityTracker.waitForContext(ctx, uint64(maxSeq))
++}
++
++// onBatchDurable is called after a batch has been durably persisted. It
++// updates the durability tracker and, when the BatchDurable listener is
++// configured, records the job, updates metrics, and fires the callback.
++func (d *DB) onBatchDurable(b *Batch) {
++	seqNum := b.SeqNum()
++	var lastSeqNum uint64
++	if c := b.Count(); c > 0 {
++		lastSeqNum = uint64(seqNum) + uint64(c) - 1
++	} else {
++		lastSeqNum = uint64(seqNum)
++	}
++	syncErr := b.commitErr
++
++	d.durabilityTracker.notify(lastSeqNum, syncErr)
++
++	if d.batchDurableConfigured {
++		d.reportBatchDurable(b, seqNum, lastSeqNum, syncErr)
++	}
++}
++
++// reportBatchDurable handles job tracking, metrics accounting, and the
++// BatchDurable event listener callback. Only called when batchDurableConfigured
++// is true.
++func (d *DB) reportBatchDurable(b *Batch, seqNum base.SeqNum, lastSeqNum uint64, syncErr error) {
++	applyDuration := b.applyTime.Sub(b.commitStartTime)
++	syncDuration := b.syncEndTime.Sub(b.applyTime)
++
++	jobID := int(d.durableJobSeq.Add(1))
++	d.durableJobsMu.Lock()
++	d.durableJobs[jobID] = lastSeqNum
++	if d.durableJobsMinKept == 0 {
++		d.durableJobsMinKept = jobID
++	}
++	if jobID > d.durableJobsMaxSeen {
++		d.durableJobsMaxSeen = jobID
++	}
++	d.evictOldDurableJobsLocked()
++	d.durableJobsMu.Unlock()
++
++	info := BatchDurableInfo{
++		JobID:         jobID,
++		SeqNum:        seqNum,
++		Err:           syncErr,
++		ApplyDuration: applyDuration,
++		SyncDuration:  syncDuration,
++		CorrelationID: b.correlationID,
++		BatchSize:     b.Len(),
++		KeyCount:      b.Count(),
++	}
++	if syncErr == nil {
++		d.durableCommitCount.Add(1)
++		d.durableCommitDuration.Add(uint64(syncDuration))
++		nanos := uint64(syncDuration)
++		for {
++			old := d.durableMaxSyncNanos.Load()
++			if nanos <= old || d.durableMaxSyncNanos.CompareAndSwap(old, nanos) {
++				break
++			}
++		}
++	} else {
++		d.durableFailedCount.Add(1)
++	}
++	d.opts.EventListener.BatchDurable(info)
++}
++
++// evictOldDurableJobsLocked removes the oldest entries from durableJobs when
++// the map exceeds the retention capacity. The capacity matches the bounded
++// retention window described in the durability API. Must be called with
++// durableJobsMu held.
++func (d *DB) evictOldDurableJobsLocked() {
++	// durableJobsCapacity defines the bounded retention window for job IDs.
++	const durableJobsCapacity = 64
++	for len(d.durableJobs) > durableJobsCapacity {
++		id := d.durableJobsMinKept
++		if _, ok := d.durableJobs[id]; ok {
++			delete(d.durableJobs, id)
++		}
++		d.durableJobsMinKept++
++		if d.durableJobsMinKept > d.durableJobsMaxSeen {
++			break
++		}
++	}
++}
++
+ // Metrics returns metrics about the database.
+ func (d *DB) Metrics() *Metrics {
+ 	metrics := &Metrics{}
+@@ -1942,6 +2190,8 @@ func (d *DB) Metrics() *Metrics {
+ 	metrics.Ingest = d.mu.versions.metrics.Ingest
+ 	metrics.Flush = d.mu.versions.metrics.Flush
+ 	metrics.Keys = d.mu.versions.metrics.Keys
++	metrics.DurableCommitCount = d.durableCommitCount.Load()
++	metrics.DurableCommitDuration = time.Duration(d.durableCommitDuration.Load())
+ 
+ 	metrics.Compact.EstimatedDebt = d.mu.versions.picker.estimatedCompactionDebt()
+ 	metrics.Compact.InProgressBytes = d.mu.versions.atomicInProgressBytes.Load()
+@@ -2085,6 +2335,61 @@ func (d *DB) Metrics() *Metrics {
+ 	return metrics
+ }
+ 
++// lookupJobSeqNum resolves a durability job ID to its last durable sequence
++// number. It returns the sequence number and nil on success, or zero and an
++// error for invalid, expired, or unknown job IDs.
++func (d *DB) lookupJobSeqNum(jobID int) (base.SeqNum, error) {
++	if jobID <= 0 {
++		return 0, errors.Newf("pebble: unknown durability job ID %d", jobID)
++	}
++	d.durableJobsMu.Lock()
++	seq, ok := d.durableJobs[jobID]
++	minKept := d.durableJobsMinKept
++	maxSeen := d.durableJobsMaxSeen
++	d.durableJobsMu.Unlock()
++	if ok {
++		return base.SeqNum(seq), nil
++	}
++	if maxSeen != 0 && jobID > 0 && jobID < minKept {
++		return 0, errors.Newf("pebble: durability job ID %d has expired", jobID)
++	}
++	return 0, errors.Newf("pebble: unknown durability job ID %d", jobID)
++}
++
++// WaitForJobDurability blocks until the batch associated with the given JobID
++// is known to have either become durably persisted or permanently failed
++// durability. It returns nil when that job's batch is durably persisted, a
++// non-nil error when WAL sync fails or the DB closes before durability is
++// achieved, and a clear non-nil error when called with a jobID that is unknown
++// to the current DB instance.
++func (d *DB) WaitForJobDurability(jobID int) error {
++	if d.opts.DisableWAL {
++		return nil
++	}
++	seq, err := d.lookupJobSeqNum(jobID)
++	if err != nil {
++		return err
++	}
++	return d.WaitForDurability(seq)
++}
++
++// WaitForJobDurabilityContext provides the same guarantee as
++// WaitForJobDurability but also honors context cancellation and deadlines.
++// It returns nil when the job's batch is durably persisted before the
++// context is done, a non-nil error if the DB closes or WAL sync fails
++// first, ctx.Err() if the context is canceled, and a clear error for
++// expired or unknown job IDs.
++func (d *DB) WaitForJobDurabilityContext(ctx context.Context, jobID int) error {
++	if d.opts.DisableWAL {
++		return nil
++	}
++	seq, err := d.lookupJobSeqNum(jobID)
++	if err != nil {
++		return err
++	}
++	return d.WaitForDurabilityContext(ctx, seq)
++}
++
+ // sstablesOptions hold the optional parameters to retrieve TableInfo for all sstables.
+ type sstablesOptions struct {
+ 	// set to true will return the sstable properties in TableInfo
+diff --git a/durable.go b/durable.go
 new file mode 100644
-index 0000000..e8aff97
+index 00000000..8133ed97
 --- /dev/null
-+++ b/drizzle-orm/src/sql/functions/window.ts
-@@ -0,0 +1,413 @@
-+import { is } from '~/entity.ts';
-+import { type AnyColumn, Column } from '~/column.ts';
-+import { type SQL, sql, type SQLWrapper } from '../sql.ts';
++++ b/durable.go
+@@ -0,0 +1,183 @@
++// Copyright 2025 The LevelDB-Go and Pebble Authors. All rights reserved. Use
++// of this source code is governed by a BSD-style license that can be found in
++// the LICENSE file.
 +
-+type ColumnDataType<T extends SQLWrapper> = T extends AnyColumn ? T['_']['data'] : string;
-+type NullableResult<T extends SQLWrapper> = ColumnDataType<T> | null;
-+type NonNullableResult<T extends SQLWrapper> = ColumnDataType<T>;
++package pebble
 +
-+export type WindowBoundaryTag =
-+	| 'unboundedPreceding'
-+	| 'preceding'
-+	| 'currentRow'
-+	| 'following'
-+	| 'unboundedFollowing';
++import (
++	"context"
++	"sync"
++	"sync/atomic"
 +
-+export type WindowFrameMode = 'rows' | 'range';
++	"github.com/cockroachdb/errors"
++)
 +
-+function assertPositiveInteger(value: number, paramName: string): void {
-+	if (typeof value !== 'number') {
-+		throw new Error(`${paramName} must be a number, received ${typeof value}`);
-+	}
-+	if (!Number.isFinite(value)) {
-+		throw new Error(`${paramName} must be a finite number, received ${value}`);
-+	}
-+	if (!Number.isInteger(value)) {
-+		throw new Error(`${paramName} must be an integer, received ${value}`);
-+	}
-+	if (value <= 0) {
-+		throw new Error(`${paramName} must be a positive integer, received ${value}`);
-+	}
++// durabilityTracker records the highest sequence number that has been durably
++// written to the WAL and wakes goroutines blocked in WaitForDurability.
++// seqNum only advances on success; the first error is latched in err and
++// causes all future waiters to wake with that error.
++type durabilityTracker struct {
++	mu     sync.Mutex
++	cond   sync.Cond
++	seqNum uint64
++	err    error
++
++	// pendingWaiters tracks the number of goroutines currently blocked in
++	// waitFor or waitForContext. Exposed via DurabilityStats.
++	pendingWaiters atomic.Int64
++
++	// subscribers holds one-shot notification channels registered via
++	// subscribe. Each entry records the target sequence number and a
++	// channel that will receive the result (nil on success, non-nil error
++	// on failure or close).
++	subscribers []durableSub
 +}
 +
-+function assertNonNegativeInteger(value: number, paramName: string): void {
-+	if (typeof value !== 'number') {
-+		throw new Error(`${paramName} must be a number, received ${typeof value}`);
-+	}
-+	if (!Number.isFinite(value)) {
-+		throw new Error(`${paramName} must be a finite number, received ${value}`);
-+	}
-+	if (!Number.isInteger(value)) {
-+		throw new Error(`${paramName} must be an integer, received ${value}`);
-+	}
-+	if (value < 0) {
-+		throw new Error(`${paramName} must be a non-negative integer, received ${value}`);
-+	}
++// durableSub is a one-shot subscription registered by subscribe.
++type durableSub struct {
++	seqNum uint64
++	ch     chan error
 +}
 +
-+export function assertValidWindowName(name: string): void {
-+	if (typeof name !== 'string') {
-+		throw new Error(`Window name must be a string, received ${typeof name}`);
-+	}
-+	if (name.length === 0) {
-+		throw new Error('Window name must be a non-empty string');
-+	}
-+	if (name.trim().length === 0) {
-+		throw new Error('Window name must not consist entirely of whitespace');
-+	}
++func newDurabilityTracker() *durabilityTracker {
++	t := &durabilityTracker{}
++	t.cond.L = &t.mu
++	return t
 +}
 +
-+/**
-+ * Validates a WindowSpec object, throwing a descriptive error for any
-+ * structurally invalid field. Intended for use at public API entry points
-+ * where callers may pass untyped or coerced objects at runtime.
-+ *
-+ * @param spec - The WindowSpec to validate.
-+ * @throws {Error} If partitionBy or orderBy are not arrays, contain null items,
-+ *   or if the frame has an unrecognized mode or missing boundary.
-+ */
-+export function validateWindowSpec(spec: WindowSpec): void {
-+	if (spec.partitionBy !== undefined) {
-+		if (!Array.isArray(spec.partitionBy)) {
-+			throw new Error('partitionBy must be an array of SQL expressions');
++func (t *durabilityTracker) notify(seqNum uint64, err error) {
++	t.mu.Lock()
++	if err != nil {
++		if t.err == nil {
++			t.err = err
 +		}
-+		for (const expr of spec.partitionBy) {
-+			if (expr == null) {
-+				throw new Error('partitionBy array must not contain null or undefined values');
++	} else if seqNum > t.seqNum {
++		t.seqNum = seqNum
++	}
++	t.sweepSubscribersLocked()
++	t.mu.Unlock()
++	t.cond.Broadcast()
++}
++
++func (t *durabilityTracker) close(err error) {
++	t.mu.Lock()
++	if t.err == nil {
++		t.err = err
++	}
++	t.sweepSubscribersLocked()
++	t.mu.Unlock()
++	t.cond.Broadcast()
++}
++
++func (t *durabilityTracker) waitFor(seqNum uint64) error {
++	t.pendingWaiters.Add(1)
++	defer t.pendingWaiters.Add(-1)
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	for {
++		if t.seqNum >= seqNum {
++			return nil
++		}
++		if t.err != nil {
++			return t.err
++		}
++		t.cond.Wait()
++	}
++}
++
++func (t *durabilityTracker) waitForContext(ctx context.Context, seqNum uint64) error {
++	t.pendingWaiters.Add(1)
++	defer t.pendingWaiters.Add(-1)
++	t.mu.Lock()
++	defer t.mu.Unlock()
++
++	done := ctx.Done()
++	if done != nil {
++		// Spawn a watcher that broadcasts on the cond when the context is
++		// canceled or its deadline expires. This ensures the goroutine
++		// blocked on cond.Wait below will wake up even if no new durable
++		// commits arrive.
++		stop := make(chan struct{})
++		defer close(stop)
++		go func() {
++			select {
++			case <-done:
++				// Broadcast is safe to call without holding the lock
++				// (per sync.Cond docs). The parent may have already
++				// returned, which is fine - the spurious wakeup is a
++				// no-op for any other waiter.
++				t.cond.Broadcast()
++			case <-stop:
++			}
++		}()
++	}
++
++	for {
++		if t.seqNum >= seqNum {
++			return nil
++		}
++		if t.err != nil {
++			return t.err
++		}
++		if done != nil {
++			select {
++			case <-done:
++				return ctx.Err()
++			default:
 +			}
 +		}
-+	}
-+	if (spec.orderBy !== undefined) {
-+		if (!Array.isArray(spec.orderBy)) {
-+			throw new Error('orderBy must be an array of SQL expressions');
-+		}
-+		for (const expr of spec.orderBy) {
-+			if (expr == null) {
-+				throw new Error('orderBy array must not contain null values');
-+			}
-+		}
-+	}
-+	if (spec.frame !== undefined) {
-+		if (typeof spec.frame._mode !== 'string') {
-+			throw new Error('frame._mode must be a string');
-+		}
-+		if (spec.frame._mode !== 'rows' && spec.frame._mode !== 'range') {
-+			throw new Error(`frame._mode must be 'rows' or 'range', received '${spec.frame._mode}'`);
-+		}
-+		if (!spec.frame.spec) {
-+			throw new Error('frame must include a spec object with from and to boundaries');
-+		}
-+		if (spec.frame.spec.from == null) {
-+			throw new Error('frame spec from boundary must not be null or undefined');
-+		}
-+		if (spec.frame.spec.to == null) {
-+			throw new Error('frame spec to boundary must not be null or undefined');
-+		}
++		t.cond.Wait()
 +	}
 +}
 +
-+export interface FrameBoundary {
-+	readonly _tag: WindowBoundaryTag;
-+	readonly offset?: number;
-+}
-+
-+export const unboundedPreceding: FrameBoundary = { _tag: 'unboundedPreceding' };
-+export const currentRow: FrameBoundary = { _tag: 'currentRow' };
-+export const unboundedFollowing: FrameBoundary = { _tag: 'unboundedFollowing' };
-+
-+export function preceding(offset: number): FrameBoundary {
-+	assertNonNegativeInteger(offset, 'preceding offset');
-+	return { _tag: 'preceding', offset };
-+}
-+
-+export function following(offset: number): FrameBoundary {
-+	assertNonNegativeInteger(offset, 'following offset');
-+	return { _tag: 'following', offset };
-+}
-+
-+function boundaryOrder(b: FrameBoundary): number {
-+	switch (b._tag) {
-+		case 'unboundedPreceding': return 0;
-+		case 'preceding': return 1;
-+		case 'currentRow': return 2;
-+		case 'following': return 3;
-+		case 'unboundedFollowing': return 4;
-+		default: throw new Error(`Unknown boundary tag: ${(b as any)._tag}`);
++// subscribe registers a one-shot channel notification that fires when the
++// given sequence number becomes durable or an error occurs. The returned
++// channel receives exactly one value. If the target is already satisfied
++// at call time, the channel is sent to immediately and no subscription is
++// stored.
++func (t *durabilityTracker) subscribe(seqNum uint64) <-chan error {
++	ch := make(chan error, 1)
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.seqNum >= seqNum {
++		ch <- nil
++		return ch
 +	}
++	if t.err != nil {
++		ch <- t.err
++		return ch
++	}
++	// Cap the number of outstanding subscriptions to avoid unbounded
++	// memory growth from pathological usage.
++	const maxSubscribers = 1024
++	if len(t.subscribers) >= maxSubscribers {
++		ch <- errors.New("pebble: too many pending durability subscriptions")
++		return ch
++	}
++	t.subscribers = append(t.subscribers, durableSub{seqNum: seqNum, ch: ch})
++	return ch
 +}
 +
-+export function assertOrderedWindowBoundaries(from: FrameBoundary, to: FrameBoundary): void {
-+	if (from == null || to == null) {
-+		throw new Error('assertOrderedWindowBoundaries: from and to must not be null');
-+	}
-+	const fromOrder = boundaryOrder(from);
-+	const toOrder = boundaryOrder(to);
-+	if (fromOrder > toOrder) {
-+		throw new Error(
-+			`Invalid window frame: 'from' boundary (${from._tag}) must not be later than 'to' boundary (${to._tag})`,
-+		);
-+	}
-+}
-+
-+function boundaryToSQL(b: FrameBoundary): SQL {
-+	switch (b._tag) {
-+		case 'unboundedPreceding': return sql.raw('unbounded preceding');
-+		case 'currentRow': return sql.raw('current row');
-+		case 'unboundedFollowing': return sql.raw('unbounded following');
-+		case 'preceding': {
-+			if (b.offset === undefined) throw new Error('preceding boundary requires an offset');
-+			return sql.raw(`${b.offset} preceding`);
-+		}
-+		case 'following': {
-+			if (b.offset === undefined) throw new Error('following boundary requires an offset');
-+			return sql.raw(`${b.offset} following`);
-+		}
-+		default: throw new Error(`Unknown frame boundary: ${(b as any)._tag}`);
-+	}
-+}
-+
-+export interface WindowFrameSpec {
-+	from: FrameBoundary;
-+	to: FrameBoundary;
-+}
-+
-+export interface WindowFrame {
-+	readonly _mode: WindowFrameMode;
-+	readonly spec: WindowFrameSpec;
-+}
-+
-+export function rows(spec: WindowFrameSpec): WindowFrame {
-+	if (spec.from == null || spec.to == null) {
-+		throw new Error('rows() frame spec must specify both from and to boundaries');
-+	}
-+	assertOrderedWindowBoundaries(spec.from, spec.to);
-+	return { _mode: 'rows', spec };
-+}
-+
-+export function range(spec: WindowFrameSpec): WindowFrame {
-+	if (spec.from == null || spec.to == null) {
-+		throw new Error('range() frame spec must specify both from and to boundaries');
-+	}
-+	assertOrderedWindowBoundaries(spec.from, spec.to);
-+	return { _mode: 'range', spec };
-+}
-+
-+export interface WindowSpec {
-+	partitionBy?: SQLWrapper[];
-+	orderBy?: (SQL | SQL.Aliased | Column)[];
-+	frame?: WindowFrame;
-+}
-+
-+export function buildWindowSpecSQL(spec: WindowSpec): SQL {
-+	if (spec == null) {
-+		throw new Error('buildWindowSpecSQL requires a non-null WindowSpec');
-+	}
-+	const parts: SQL[] = [];
-+	if (spec.partitionBy && spec.partitionBy.length > 0) {
-+		parts.push(sql`partition by ${sql.join(spec.partitionBy, sql`, `)}`);
-+	}
-+	if (spec.orderBy && spec.orderBy.length > 0) {
-+		parts.push(sql`order by ${sql.join(spec.orderBy as SQLWrapper[], sql`, `)}`);
-+	}
-+	if (spec.frame) {
-+		const { _mode, spec: frameBounds } = spec.frame;
-+		parts.push(
-+			sql`${sql.raw(_mode)} between ${boundaryToSQL(frameBounds.from)} and ${boundaryToSQL(frameBounds.to)}`,
-+		);
-+	}
-+	return parts.length > 0 ? sql.join(parts, sql` `) : sql``;
-+}
-+
-+export class OverBuilder<T> {
-+	constructor(
-+		private readonly fnSQL: SQL,
-+		private readonly mapper: ((v: any) => any) | Column | undefined,
-+	) {}
-+
-+	over(spec: WindowSpec): SQL<T>;
-+	over(windowName: string): SQL<T>;
-+	over(specOrName: WindowSpec | string): SQL<T> {
-+		if (specOrName == null) {
-+			throw new Error('over() argument must not be null or undefined');
-+		}
-+		let result: SQL;
-+		if (typeof specOrName === 'string') {
-+			assertValidWindowName(specOrName);
-+			result = sql`${this.fnSQL} over ${sql.identifier(specOrName)}`;
++// sweepSubscribersLocked delivers results to all satisfied subscribers and
++// removes them from the list. Must be called with t.mu held.
++func (t *durabilityTracker) sweepSubscribersLocked() {
++	n := 0
++	for _, sub := range t.subscribers {
++		if t.seqNum >= sub.seqNum {
++			sub.ch <- nil
++		} else if t.err != nil {
++			sub.ch <- t.err
 +		} else {
-+			validateWindowSpec(specOrName);
-+			const inner = buildWindowSpecSQL(specOrName);
-+			result = sql`${this.fnSQL} over (${inner})`;
-+		}
-+		if (this.mapper !== undefined) {
-+			return result.mapWith(this.mapper as any) as SQL<T>;
-+		}
-+		return result as SQL<T>;
-+	}
-+}
-+
-+export function rowNumber(): OverBuilder<number> {
-+	return new OverBuilder<number>(sql`row_number()`, Number);
-+}
-+
-+export function rank(): OverBuilder<number> {
-+	return new OverBuilder<number>(sql`rank()`, Number);
-+}
-+
-+export function denseRank(): OverBuilder<number> {
-+	return new OverBuilder<number>(sql`dense_rank()`, Number);
-+}
-+
-+export function ntile(buckets: number): OverBuilder<number> {
-+	assertPositiveInteger(buckets, 'ntile buckets');
-+	return new OverBuilder<number>(sql`ntile(${sql.raw(String(buckets))})`, Number);
-+}
-+
-+export function percentRank(): OverBuilder<number> {
-+	return new OverBuilder<number>(sql`percent_rank()`, Number);
-+}
-+
-+export function cumeDist(): OverBuilder<number> {
-+	return new OverBuilder<number>(sql`cume_dist()`, Number);
-+}
-+
-+export function lag<T extends SQLWrapper>(expression: T): OverBuilder<NullableResult<T>>;
-+export function lag<T extends SQLWrapper>(expression: T, offset: number): OverBuilder<NullableResult<T>>;
-+export function lag<T extends SQLWrapper>(expression: T, offset: number, defaultValue: SQLWrapper): OverBuilder<NonNullableResult<T>>;
-+export function lag<T extends SQLWrapper>(
-+	expression: T,
-+	offset?: number,
-+	defaultValue?: SQLWrapper,
-+): OverBuilder<NullableResult<T>> | OverBuilder<NonNullableResult<T>> {
-+	if (expression == null) {
-+		throw new Error('lag expression must not be null or undefined');
-+	}
-+	if (offset !== undefined) {
-+		assertNonNegativeInteger(offset, 'lag offset');
-+	}
-+	const parts: SQLWrapper[] = [expression];
-+	if (offset !== undefined) {
-+		parts.push(sql.raw(String(offset)));
-+		if (defaultValue !== undefined) {
-+			parts.push(defaultValue);
-+			const fnSQL = sql`lag(${sql.join(parts, sql`, `)})`;
-+			const mapper = is(expression, Column) ? expression : undefined;
-+			return new OverBuilder<NonNullableResult<T>>(fnSQL, mapper);
++			t.subscribers[n] = sub
++			n++
 +		}
 +	}
-+	const fnSQL = sql`lag(${sql.join(parts, sql`, `)})`;
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<NullableResult<T>>(fnSQL, mapper);
++	t.subscribers = t.subscribers[:n]
 +}
 +
-+export function lead<T extends SQLWrapper>(expression: T): OverBuilder<NullableResult<T>>;
-+export function lead<T extends SQLWrapper>(expression: T, offset: number): OverBuilder<NullableResult<T>>;
-+export function lead<T extends SQLWrapper>(expression: T, offset: number, defaultValue: SQLWrapper): OverBuilder<NonNullableResult<T>>;
-+export function lead<T extends SQLWrapper>(
-+	expression: T,
-+	offset?: number,
-+	defaultValue?: SQLWrapper,
-+): OverBuilder<NullableResult<T>> | OverBuilder<NonNullableResult<T>> {
-+	if (expression == null) {
-+		throw new Error('lead expression must not be null or undefined');
-+	}
-+	if (offset !== undefined) {
-+		assertNonNegativeInteger(offset, 'lead offset');
-+	}
-+	const parts: SQLWrapper[] = [expression];
-+	if (offset !== undefined) {
-+		parts.push(sql.raw(String(offset)));
-+		if (defaultValue !== undefined) {
-+			parts.push(defaultValue);
-+			const fnSQL = sql`lead(${sql.join(parts, sql`, `)})`;
-+			const mapper = is(expression, Column) ? expression : undefined;
-+			return new OverBuilder<NonNullableResult<T>>(fnSQL, mapper);
-+		}
-+	}
-+	const fnSQL = sql`lead(${sql.join(parts, sql`, `)})`;
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<NullableResult<T>>(fnSQL, mapper);
++func (t *durabilityTracker) state() (uint64, error) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.seqNum, t.err
 +}
 +
-+export function firstValue<T extends SQLWrapper>(expression: T): OverBuilder<NullableResult<T>> {
-+	if (expression == null) {
-+		throw new Error('firstValue expression must not be null or undefined');
-+	}
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<NullableResult<T>>(sql`first_value(${expression})`, mapper);
-+}
-+
-+export function lastValue<T extends SQLWrapper>(expression: T): OverBuilder<NullableResult<T>> {
-+	if (expression == null) {
-+		throw new Error('lastValue expression must not be null or undefined');
-+	}
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<NullableResult<T>>(sql`last_value(${expression})`, mapper);
-+}
-+
-+export function nthValue<T extends SQLWrapper>(expression: T, n: number): OverBuilder<NullableResult<T>> {
-+	if (expression == null) {
-+		throw new Error('nthValue expression must not be null or undefined');
-+	}
-+	assertPositiveInteger(n, 'nthValue n');
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<NullableResult<T>>(sql`nth_value(${expression}, ${sql.raw(String(n))})`, mapper);
-+}
-+
-+export function windowSum<T extends SQLWrapper>(expression: T): OverBuilder<number | null> {
-+	if (expression == null) {
-+		throw new Error('windowSum expression must not be null or undefined');
-+	}
-+	return new OverBuilder<number | null>(sql`sum(${expression})`, undefined);
-+}
-+
-+export function windowAvg<T extends SQLWrapper>(expression: T): OverBuilder<number | null> {
-+	if (expression == null) {
-+		throw new Error('windowAvg expression must not be null or undefined');
-+	}
-+	return new OverBuilder<number | null>(sql`avg(${expression})`, undefined);
-+}
-+
-+export function windowMin<T extends SQLWrapper>(
-+	expression: T,
-+): OverBuilder<(T extends AnyColumn ? T['_']['data'] : unknown) | null> {
-+	if (expression == null) {
-+		throw new Error('windowMin expression must not be null or undefined');
-+	}
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<(T extends AnyColumn ? T['_']['data'] : unknown) | null>(sql`min(${expression})`, mapper);
-+}
-+
-+export function windowMax<T extends SQLWrapper>(
-+	expression: T,
-+): OverBuilder<(T extends AnyColumn ? T['_']['data'] : unknown) | null> {
-+	if (expression == null) {
-+		throw new Error('windowMax expression must not be null or undefined');
-+	}
-+	const mapper = is(expression, Column) ? expression : undefined;
-+	return new OverBuilder<(T extends AnyColumn ? T['_']['data'] : unknown) | null>(sql`max(${expression})`, mapper);
-+}
-+
-+export function windowCount(expression?: SQLWrapper): OverBuilder<number | null> {
-+	if (expression !== undefined) {
-+		if (expression === null) {
-+			throw new Error('windowCount expression must not be null; pass no argument for count(*)');
-+		}
-+		return new OverBuilder<number | null>(sql`count(${expression})`, undefined);
-+	}
-+	return new OverBuilder<number | null>(sql`count(*)`, undefined);
-+}
-+
-+export type WindowDefinition = { name: string; spec: WindowSpec };
-+
-+export function windowSpec(
-+	partitionBy?: SQLWrapper[],
-+	orderBy?: (SQL | SQL.Aliased | Column)[],
-+	frame?: WindowFrame,
-+): WindowSpec {
-+	return {
-+		...(partitionBy !== undefined && { partitionBy }),
-+		...(orderBy !== undefined && { orderBy }),
-+		...(frame !== undefined && { frame }),
-+	};
-+}
-diff --git a/drizzle-orm/src/sqlite-core/dialect.ts b/drizzle-orm/src/sqlite-core/dialect.ts
-index 317c8df..9b23de5 100644
---- a/drizzle-orm/src/sqlite-core/dialect.ts
-+++ b/drizzle-orm/src/sqlite-core/dialect.ts
-@@ -19,6 +19,7 @@ import {
- } from '~/relations.ts';
- import type { Name, Placeholder } from '~/sql/index.ts';
- import { and, eq } from '~/sql/index.ts';
-+import { buildWindowSpecSQL } from '~/sql/functions/window.ts';
- import { Param, type QueryWithTypings, SQL, sql, type SQLChunk } from '~/sql/sql.ts';
- import { SQLiteColumn } from '~/sqlite-core/columns/index.ts';
- import type {
-@@ -311,6 +312,7 @@ export abstract class SQLiteDialect {
- 			joins,
- 			orderBy,
- 			groupBy,
-+			windows,
- 			limit,
- 			offset,
- 			distinct,
-@@ -372,6 +374,14 @@ export abstract class SQLiteDialect {
+diff --git a/event.go b/event.go
+index 8400b94c..9fc5a856 100644
+--- a/event.go
++++ b/event.go
+@@ -727,6 +727,74 @@ func (i WALDeleteInfo) SafeFormat(w redact.SafePrinter, _ rune) {
+ 	w.Printf("[JOB %d] WAL deleted %s", redact.Safe(i.JobID), i.FileNum)
+ }
  
- 		const groupBySql = groupByList.length > 0 ? sql` group by ${sql.join(groupByList)}` : undefined;
- 
-+		let windowsSql: SQL | undefined;
-+		if (windows && windows.length > 0) {
-+			const winChunks = windows.map(({ name, spec }) =>
-+				sql`${sql.identifier(name)} as (${buildWindowSpecSQL(spec)})`
-+			);
-+			windowsSql = sql` window ${sql.join(winChunks, sql`, `)}`;
-+		}
++// BatchDurableInfo contains the info passed to the EventListener.BatchDurable
++// callback.
++type BatchDurableInfo struct {
++	// JobID uniquely identifies the durability event; it is not the same as the
++	// job ID of the commit operation.
++	JobID int
++	// SeqNum is the sequence number assigned to the first key in the batch.
++	SeqNum base.SeqNum
++	// Err is non-nil when durability could not be achieved (e.g. WAL sync
++	// failed, or the DB closed before the sync completed).
++	Err error
++	// ApplyDuration is the elapsed time from the commit call until the batch
++	// became visible in the memtable.
++	ApplyDuration time.Duration
++	// SyncDuration is the wall-clock time from the end of the memtable apply
++	// phase until the WAL sync completed and the batch became durably
++	// persisted. It measures only the sync portion of the commit.
++	SyncDuration time.Duration
++	// CorrelationID is the value supplied via WriteOptions.CommitCorrelationID,
++	// or zero when none was supplied.
++	CorrelationID uint64
++	// BatchSize is the encoded size of the batch in bytes.
++	BatchSize int
++	// KeyCount is the number of keys in the batch.
++	KeyCount uint32
++}
 +
- 		const orderBySql = this.buildOrderBy(orderBy);
++func (i BatchDurableInfo) String() string {
++	return redact.StringWithoutMarkers(i)
++}
++
++// SafeFormat implements redact.SafeFormatter.
++func (i BatchDurableInfo) SafeFormat(w redact.SafePrinter, _ rune) {
++	if i.Err != nil {
++		w.Printf("[JOB %d] batch durable error: seqnum=%d keys=%d size=%s err=%s",
++			redact.Safe(i.JobID), redact.Safe(i.SeqNum),
++			redact.Safe(i.KeyCount), redact.Safe(humanize.Bytes.Uint64(uint64(i.BatchSize))),
++			i.Err)
++		return
++	}
++	w.Printf("[JOB %d] batch durable: seqnum=%d keys=%d size=%s apply=%s sync=%s",
++		redact.Safe(i.JobID), redact.Safe(i.SeqNum),
++		redact.Safe(i.KeyCount), redact.Safe(humanize.Bytes.Uint64(uint64(i.BatchSize))),
++		redact.Safe(i.ApplyDuration), redact.Safe(i.SyncDuration))
++}
++
++// DurabilityStats contains detailed statistics about durability tracking.
++type DurabilityStats struct {
++	// HighestDurableSeqNum is the highest sequence number known to be durable.
++	HighestDurableSeqNum base.SeqNum
++	// PendingWaiters is the number of goroutines currently blocked in
++	// WaitForDurability or WaitForDurabilityContext.
++	PendingWaiters int64
++	// TotalDurableCommits is the number of Sync commits that achieved
++	// durability successfully.
++	TotalDurableCommits uint64
++	// TotalFailedCommits is the number of Sync commits that failed durability.
++	TotalFailedCommits uint64
++	// CumulativeSyncDuration is the total SyncDuration across all successful
++	// durable commits.
++	CumulativeSyncDuration time.Duration
++	// MaxSyncDuration is the maximum SyncDuration observed for any single
++	// successful durable commit.
++	MaxSyncDuration time.Duration
++	// FirstErr is the first durability error observed, or nil.
++	FirstErr error
++}
++
+ // WriteStallBeginInfo contains the info for a write stall begin event.
+ type WriteStallBeginInfo struct {
+ 	Reason string
+@@ -1008,6 +1076,14 @@ type EventListener struct {
+ 	// WALDeleted is invoked after a WAL has been deleted.
+ 	WALDeleted func(WALDeleteInfo)
  
- 		const limitSql = this.buildLimit(limit);
-@@ -379,7 +389,7 @@ export abstract class SQLiteDialect {
- 		const offsetSql = offset ? sql` offset ${offset}` : undefined;
++	// BatchDurable is invoked exactly once for each batch that was committed
++	// with Sync=true, after the batch has been durably persisted to the WAL.
++	// It is never invoked for batches committed with Sync=false, for batches
++	// that fail to commit, or when DisableWAL is true. The callback must not
++	// block. If the DB closes or durability cannot be achieved before sync
++	// completes, it is still invoked once with a non-nil Err.
++	BatchDurable func(BatchDurableInfo)
++
+ 	// WriteStallBegin is invoked when writes are intentionally delayed.
+ 	WriteStallBegin func(WriteStallBeginInfo)
  
- 		const finalQuery =
--			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}`;
-+			sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${windowsSql}${orderBySql}${limitSql}${offsetSql}`;
- 
- 		if (setOperators.length > 0) {
- 			return this.buildSetOperations(finalQuery, setOperators);
-diff --git a/drizzle-orm/src/sqlite-core/query-builders/select.ts b/drizzle-orm/src/sqlite-core/query-builders/select.ts
-index 950d26f..59632f1 100644
---- a/drizzle-orm/src/sqlite-core/query-builders/select.ts
-+++ b/drizzle-orm/src/sqlite-core/query-builders/select.ts
-@@ -32,6 +32,7 @@ import {
- 	type ValueOrArray,
- } from '~/utils.ts';
- import { ViewBaseConfig } from '~/view-common.ts';
-+import { assertValidWindowName, type WindowSpec, type WindowDefinition } from '~/sql/functions/window.ts';
- import { extractUsedTable } from '../utils.ts';
- import { SQLiteViewBase } from '../view-base.ts';
- import type {
-@@ -704,6 +705,15 @@ export abstract class SQLiteSelectQueryBuilderBase<
- 		return this as any;
+@@ -1108,6 +1184,9 @@ func (l *EventListener) EnsureDefaults(logger Logger) {
+ 	if l.WALDeleted == nil {
+ 		l.WALDeleted = func(info WALDeleteInfo) {}
  	}
-
-+	window(name: string, spec: WindowSpec) {
-+		assertValidWindowName(name);
-+		if (!this.config.windows) {
-+			this.config.windows = [];
-+		}
-+		this.config.windows.push({ name, spec });
-+		return this as any;
++	if l.BatchDurable == nil {
++		l.BatchDurable = func(info BatchDurableInfo) {}
 +	}
+ 	if l.WriteStallBegin == nil {
+ 		l.WriteStallBegin = func(info WriteStallBeginInfo) {}
+ 	}
+@@ -1199,6 +1278,9 @@ func MakeLoggingEventListener(logger Logger) EventListener {
+ 		WALDeleted: func(info WALDeleteInfo) {
+ 			logger.Infof("%s", info)
+ 		},
++		BatchDurable: func(info BatchDurableInfo) {
++			logger.Infof("%s", info)
++		},
+ 		WriteStallBegin: func(info WriteStallBeginInfo) {
+ 			logger.Infof("%s", info)
+ 		},
+@@ -1327,6 +1409,10 @@ func TeeEventListener(a, b EventListener) EventListener {
+ 			a.PossibleAPIMisuse(info)
+ 			b.PossibleAPIMisuse(info)
+ 		},
++		BatchDurable: func(info BatchDurableInfo) {
++			a.BatchDurable(info)
++			b.BatchDurable(info)
++		},
+ 	}
+ }
+ 
+diff --git a/metrics.go b/metrics.go
+index a1ddcd65..4d381e35 100644
+--- a/metrics.go
++++ b/metrics.go
+@@ -210,6 +210,17 @@ type Metrics struct {
+ 	Filter     FilterMetrics
+ 	Levels     AllLevelMetrics
+ 
++	// DurableCommitCount is the number of Sync commits that have been durably
++	// persisted since the DB was opened. Only populated when
++	// EventListener.BatchDurable is configured.
++	DurableCommitCount uint64
 +
- 	/**
- 	 * Adds an `order by` clause to the query.
- 	 *
-diff --git a/drizzle-orm/src/sqlite-core/query-builders/select.types.ts b/drizzle-orm/src/sqlite-core/query-builders/select.types.ts
-index b19aa1c..4c87245 100644
---- a/drizzle-orm/src/sqlite-core/query-builders/select.types.ts
-+++ b/drizzle-orm/src/sqlite-core/query-builders/select.types.ts
-@@ -1,3 +1,4 @@
-+import type { WindowSpec, WindowDefinition } from '~/sql/functions/window.ts';
- import type { ColumnsSelection, Placeholder, SQL, View } from '~/sql/sql.ts';
- import type { SQLiteColumn } from '~/sqlite-core/columns/index.ts';
- import type { SQLiteTable, SQLiteTableWithColumns } from '~/sqlite-core/table.ts';
-@@ -61,6 +62,7 @@ export interface SQLiteSelectConfig {
- 	joins?: SQLiteSelectJoinConfig[];
- 	orderBy?: (SQLiteColumn | SQL | SQL.Aliased)[];
- 	groupBy?: (SQLiteColumn | SQL | SQL.Aliased)[];
-+	windows?: WindowDefinition[];
- 	distinct?: boolean;
- 	setOperators: {
- 		rightSelect: TypedQueryBuilder<any, any>;
++	// DurableCommitDuration is the cumulative time spent in the WAL sync
++	// phase (not the total commit time) across all durably persisted Sync
++	// commits since the DB was opened. Only populated when
++	// EventListener.BatchDurable is configured.
++	DurableCommitDuration time.Duration
++
+ 	MemTable struct {
+ 		// The number of bytes allocated by memtables and large (flushable)
+ 		// batches.
+diff --git a/open.go b/open.go
+index 3edf11ed..ffd8f831 100644
+--- a/open.go
++++ b/open.go
+@@ -74,6 +74,9 @@ func FileCacheSize(maxOpenFiles int) int {
+ func Open(dirname string, opts *Options) (db *DB, err error) {
+ 	// Make a copy of the options so that we don't mutate the passed in options.
+ 	opts = opts.Clone()
++	// Capture whether BatchDurable was user-configured before EnsureDefaults
++	// replaces nil callbacks with no-ops.
++	batchDurableConfigured := opts.EventListener != nil && opts.EventListener.BatchDurable != nil
+ 	opts.EnsureDefaults()
+ 	if err := opts.Validate(); err != nil {
+ 		return nil, err
+@@ -149,21 +152,24 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	d := &DB{
+-		cacheHandle:         opts.Cache.NewHandle(),
+-		dirname:             dirname,
+-		opts:                opts,
+-		cmp:                 opts.Comparer.Compare,
+-		equal:               opts.Comparer.Equal,
+-		merge:               opts.Merger.Merge,
+-		split:               opts.Comparer.Split,
+-		abbreviatedKey:      opts.Comparer.AbbreviatedKey,
+-		largeBatchThreshold: (opts.MemTableSize - uint64(memTableEmptySize)) / 2,
+-		dirs:                rs.dirs,
+-		objProvider:         rs.objProvider,
+-		closed:              new(atomic.Value),
+-		closedCh:            make(chan struct{}),
+-		bgCtx:               ctx,
+-		bgCtxCancel:         cancel,
++		cacheHandle:            opts.Cache.NewHandle(),
++		dirname:                dirname,
++		opts:                   opts,
++		cmp:                    opts.Comparer.Compare,
++		equal:                  opts.Comparer.Equal,
++		merge:                  opts.Merger.Merge,
++		split:                  opts.Comparer.Split,
++		abbreviatedKey:         opts.Comparer.AbbreviatedKey,
++		largeBatchThreshold:    (opts.MemTableSize - uint64(memTableEmptySize)) / 2,
++		dirs:                   rs.dirs,
++		objProvider:            rs.objProvider,
++		closed:                 new(atomic.Value),
++		closedCh:               make(chan struct{}),
++		bgCtx:                  ctx,
++		bgCtxCancel:            cancel,
++		durabilityTracker:      newDurabilityTracker(),
++		batchDurableConfigured: batchDurableConfigured,
++		durableJobs:            make(map[int]uint64),
+ 	}
+ 	d.mu.versions = &versionSet{}
+ 	d.diskAvailBytes.Store(math.MaxUint64)
+@@ -226,6 +232,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
+ 		visibleSeqNum: &d.mu.versions.visibleSeqNum,
+ 		apply:         d.commitApply,
+ 		write:         d.commitWrite,
++		// onDurable is always wired so that WaitForDurability works even when
++		// no BatchDurable callback is configured.
++		onDurable:     d.onBatchDurable,
+ 	})
+ 	d.mu.nextJobID = 1
+ 	d.mu.mem.nextSize = min(opts.MemTableSize, initialMemTableSize)
+diff --git a/options.go b/options.go
+index 5733690f..ad989b0d 100644
+--- a/options.go
++++ b/options.go
+@@ -405,6 +405,11 @@ type WriteOptions struct {
+ 	//
+ 	// The default value is true.
+ 	Sync bool
++
++	// CommitCorrelationID is an optional caller-supplied value that, when
++	// non-zero, is propagated to BatchDurableInfo.CorrelationID when the batch
++	// becomes durable. A zero value means no correlation ID is attached.
++	CommitCorrelationID uint64
+ }
+ 
+ // Sync specifies the default write options for writes which synchronize to

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coding-quality grader for C6 / C7 trials (rubric v3: evaluation/rubrics/coding_quality.json).
+"""Coding-quality grader for C6 / C7 / C8 trials (rubric v3: evaluation/rubrics/coding_quality.json).
 
 Simple model:
   * pass/fail (D1) is the source benchmark's hidden-test verdict, exactly as before;
@@ -57,27 +57,29 @@ def entries() -> dict[str, dict]:
     with _ENTRIES_LOCK:  # graded from several threads; fill once, atomically
         if not _ENTRIES:
             loaded = {}
-            for f in glob.glob(str(BASE_DIR / "dataset/c[67]/C*.json")):
+            for f in glob.glob(str(BASE_DIR / "dataset/c[678]/C*.json")):
                 e = with_task_rubric(json.loads(Path(f).read_text()))
                 loaded[e["instance_id"]] = e
             _ENTRIES.update(loaded)
     return _ENTRIES
 
 
-def _id_mapping() -> tuple[str, dict]:
+def _id_epochs() -> list[dict]:
     p = BASE_DIR / "results" / "id_mapping.json"
     if not p.exists():
-        return "", {}
+        return []
     m = json.loads(p.read_text())
-    return m["runs_before"], m["old_to_new"]
+    return m.get("epochs") or [{"runs_before": m["runs_before"], "old_to_new": m["old_to_new"]}]
 
 
 def entry_for_run(run_name: str) -> dict | None:
     """Current entry for a run folder name '<id>_<agent>_<model>_<YYYYMMDD>_<HHMMSS>'."""
     rec_id = run_name.split("_")[0]
     ts = re.findall(r"(\d{8}_\d{6})", run_name)
-    before, old_to_new = _id_mapping()
-    eid = old_to_new.get(rec_id, rec_id) if ts and before and ts[-1] < before else rec_id
+    eid = rec_id
+    for ep in _id_epochs():  # map through every restructure made after the run
+        if ts and ts[-1] < ep["runs_before"]:
+            eid = ep["old_to_new"].get(eid, eid)
     return entries().get(eid)
 
 

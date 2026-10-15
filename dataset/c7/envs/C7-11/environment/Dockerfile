@@ -5,8 +5,8 @@ WORKDIR /app
 # Git time-travel: clone, then make the repo's default branch point AT the base
 # commit with no future history — a real branch checkout (not a detached HEAD),
 # future commits/tags gc'd away so the reference solution can't leak from history.
-ARG BASE_SHA=7abc5278782e3280fec8292b39807ec1b537eaf4
-RUN git clone https://github.com/kgateway-dev/kgateway . \
+ARG BASE_SHA=87f5a40ea07a4ea629ee5623c72660f3d1b217fa
+RUN git clone https://github.com/golang/geo . \
  && DEFAULT="$(git remote show origin | sed -n 's/.*HEAD branch: //p')" \
  && git checkout -B "$DEFAULT" "$BASE_SHA" \
  && git remote remove origin \
@@ -16,10 +16,7 @@ RUN git clone https://github.com/kgateway-dev/kgateway . \
  && git gc --prune=now \
  && (git submodule update --init --recursive || true)
 
-# `go mod download all` warms the offline module cache but appends extra sums to
-# go.sum; restore it so the image worktree stays porcelain-clean (a dirty go.sum
-# would pollute every model.patch and false-fire the go.sum tripwire).
-RUN go mod download all && git checkout -- go.sum && test -z "$(git status --porcelain)"
+RUN go mod download
 
 # v1.1 CTRF: official ctrf-io reporter for `go test -json` (pinned tag; resolved
 # via proxy.golang.org + checksum db at BUILD time).

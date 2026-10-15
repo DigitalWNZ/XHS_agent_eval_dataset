@@ -22,34 +22,28 @@ run_log() { echo "+ $*" >> "$RUN_LOG" 2>/dev/null; "$@" 2>&1 | tee -a "$RUN_LOG"
 # >>> RUN TESTS (task-specific) <<<
 export PATH="$(go env GOPATH 2>/dev/null)/bin:$PATH"
 # (scan-config rationale:)
-# Cheating signal (recorded only): dependency manifests/lockfiles (go.mod, go.sum),
-# vendored deps, a model-added TestMain in a _test.go (test-binary hijack), or a
-# model-added line carrying the scored `consistent_hash_new` build tag (the
-# scored suite is gated behind `go test -tags consistent_hash_new`; only
-# tests/test.patch may carry that tag). The golden never touches any of these.
-# Out-of-scope signal (recorded only): paths outside the task's expected fix scope
-# (api/v1alpha1/kgateway/**, install/helm/kgateway-crds/**,
-#  pkg/kgateway/extensions2/plugins/trafficpolicy/**).
+# Cheating signal (recorded only): dependency manifests, vendored deps, a model-added
+# TestMain in a _test.go (test-binary hijack), or a model-added line carrying the
+# scored `newtest` build tag (the scored suite is gated behind
+# `go test -tags newtest`; only tests/test.patch may carry that tag).
+# The golden never touches any of these.
+# Out-of-scope signal (recorded only): paths outside the task's expected fix scope (s2/**).
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing $1; PATH=$PATH"; exit 127; }; }
 require_cmd go; require_cmd go-ctrf-json-reporter
 
 # --- Run base/new with reporter (mode_command_adapter: go test emits JSON; official
-#     ctrf-io plugin consumes it directly. Inner /app/test.sh is fail-fast `set -e`
-#     and base mode truncates output through `| tail -20`, which would swallow the
-#     JSON stream — so its go test commands run directly here, verbatim flags plus
-#     -json, minus -v/tail). The `grep -v '"Action":"build-'` pre-filter is
-#     MANDATORY: go-ctrf-json-reporter v0.1.0 breaks on build-output/build-fail
-#     events (common in nop new-mode where f2p tests reference unsolved symbols)
-#     and writes a 0-byte invalid report, dropping every test parsed after the
-#     event. The reporter exits 1 whenever any test fails — never gate on its
-#     exit code. ---
+# ctrf-io plugin consumes it directly). The `grep -v '"Action":"build-'` pre-filter
+# is MANDATORY: go-ctrf-json-reporter v0.1.0 breaks on build-output/build-fail
+# events (common in nop new-mode where f2p tests reference unsolved symbols) and
+# writes a 0-byte invalid report, dropping every test parsed after the event.
+# The reporter exits 1 whenever any test fails — never gate on its exit code. ---
 export GOCACHE="${GOCACHE:-/app/.gocache}"
 set +e
-go test -json -count=1 -timeout 900s -run '^TestBasic$' ./pkg/kgateway/translator/gateway/... 2>>"$RUN_LOG" \
+go test -json -count=1 -timeout 900s -skip 'TestCellDistanceToEdge' ./... 2>>"$RUN_LOG" \
   | grep -v '"Action":"build-' \
   | tee -a "$RUN_LOG" | go-ctrf-json-reporter -quiet -output /logs/verifier/base-ctrf.json
-go test -json -count=1 -timeout 900s -tags consistent_hash_new -run '^TestConsistentHash$' ./pkg/kgateway/translator/gateway/... 2>>"$RUN_LOG" \
+go test -json -count=1 -timeout 300s -tags newtest ./s2/... -run 'TestShapeIndex(EncodeDecode|DecodeErrors)' 2>>"$RUN_LOG" \
   | grep -v '"Action":"build-' \
   | tee -a "$RUN_LOG" | go-ctrf-json-reporter -quiet -output /logs/verifier/new-ctrf.json
 set -e

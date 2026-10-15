@@ -2,7 +2,9 @@
 - evaluation/rubrics/coding_quality.json: pass/fail stays as D1; 3 common LLM-judge items (Readability,
   Maintainability, Robustness; meanings from C3 D3-D5) with perfect/accept/bad criteria.
 - evaluation/rubrics/tasks/<ID>.json: 1-2 case-specific LLM-judge items per case (picked from the v1
-  task-specific judge items) + the case's maintainability notes as judge context."""
+  task-specific judge items) + the case's maintainability notes as judge context.
+Provenance only: it writes the task rubrics under the 2026-10-14 IDs. The current files were then renamed by
+tools/restructure_v2.py (2026-10-15 layout); don't re-run this on the current dataset."""
 import json
 import pathlib
 import sys
@@ -21,8 +23,8 @@ PICK = {  # case -> v1 judge item ids (1-2), chosen for being task-specific and 
 }
 
 framework = {
-    "name": "Coding quality rubric (C6 / C7)",
-    "name_zh": "编码质量评分标准（C6 / C7）",
+    "name": "Coding quality rubric (C6 / C7 / C8)",
+    "name_zh": "编码质量评分标准（C6 / C7 / C8）",
     "version": "3.0",
     "applies_to": ["C6", "C7"],
     "summary": ("Pass/fail stays exactly as before (D1: the source benchmark's hidden tests). On top, an LLM judge "

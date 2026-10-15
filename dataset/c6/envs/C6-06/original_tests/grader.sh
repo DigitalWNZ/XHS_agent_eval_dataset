@@ -5,17 +5,17 @@
 
 # Install uv
 
-
 # Check if we're in a valid working directory
 if [ "$PWD" = "/" ]; then
     echo "Error: No working directory set. Please set a WORKDIR in your Dockerfile before running this script."
     exit 1
 fi
 
+cp /tests/test.py /app/test.py
+
 uvx \
   -p 3.13 \
   -w pytest==8.4.1 \
-  -w mteb==1.36.8 \
   -w pytest-json-ctrf==0.3.5 \
   pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
 

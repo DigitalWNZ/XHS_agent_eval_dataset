@@ -1,10 +1,10 @@
 > [!NOTE]
 > This guide was written for the first containerized entry, `polyglot-c-py`, when it was
-> C6-01. After the 2026-10-14 restructure it is **C7-01** (daily work), and C6 now holds the 7
-> discriminative entries. Read "C6-01" below as today's C7-01 (`--category c7 --entry C7-01`).
-> C7-01 now uses the original Terminal-Bench pytest suite (`tb2_pytest`) instead of the custom
+> C6-01. It became C7-01 on 2026-10-14 and **C6-05** (discriminative) on 2026-10-15. Read "C6-01"
+> below as today's C6-05 (`--category c6 --entry C6-05`).
+> It now uses the original Terminal-Bench pytest suite (`tb2_pytest`) instead of the custom
 > verifier described in section 2. Section 3's scoring is also outdated: D1 is now snapped to the
-> tiers in `c6_discriminative.json` / `c7_daily.json`, and D2 (LLM-judge code quality) was added; see
+> tiers in `c6_discriminative.json` / `c7_daily.json` / `c8_hard.json`, and D2 (LLM-judge code quality) was added; see
 > [coding_rubric.md](coding_rubric.md). For the current layout, IDs and field reference, see
 > [c6_entry_format.md](c6_entry_format.md).
 

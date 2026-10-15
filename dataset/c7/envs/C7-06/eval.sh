@@ -3,39 +3,93 @@ set -uxo pipefail
 source /opt/miniconda3/bin/activate
 conda activate testbed
 cd /testbed
-sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
-export LANG=en_US.UTF-8
-export LANGUAGE=en_US:en
-export LC_ALL=en_US.UTF-8
 git config --global --add safe.directory /testbed
 cd /testbed
 git status
 git show
-git -c core.fileMode=false diff 437196da9a386bd4cc62b0ce3f2de4aba468613d
+git -c core.fileMode=false diff d06c5b358149c02a62da8a5469264d05f29ac659
 source /opt/miniconda3/bin/activate
 conda activate testbed
 python -m pip install -e .
-git checkout 437196da9a386bd4cc62b0ce3f2de4aba468613d tests/delete/tests.py
+git checkout d06c5b358149c02a62da8a5469264d05f29ac659 tests/dbshell/test_mysql.py
 git apply -v - <<'EOF_114329324912'
-diff --git a/tests/delete/tests.py b/tests/delete/tests.py
---- a/tests/delete/tests.py
-+++ b/tests/delete/tests.py
-@@ -605,6 +605,12 @@ def receiver(instance, **kwargs):
+diff --git a/tests/dbshell/test_mysql.py b/tests/dbshell/test_mysql.py
+--- a/tests/dbshell/test_mysql.py
++++ b/tests/dbshell/test_mysql.py
+@@ -50,41 +50,49 @@ def test_options_override_settings_proper_values(self):
+             'optiondbname',
+         ]
+         expected_env = {'MYSQL_PWD': 'optionpassword'}
+-        self.assertEqual(
+-            self.settings_to_cmd_args_env({
+-                'NAME': 'settingdbname',
+-                'USER': 'settinguser',
+-                'PASSWORD': 'settingpassword',
+-                'HOST': 'settinghost',
+-                'PORT': settings_port,
+-                'OPTIONS': {
+-                    'db': 'optiondbname',
+-                    'user': 'optionuser',
+-                    'passwd': 'optionpassword',
+-                    'host': 'optionhost',
+-                    'port': options_port,
+-                },
+-            }),
+-            (expected_args, expected_env),
+-        )
++        for keys in [('database', 'password'), ('db', 'passwd')]:
++            with self.subTest(keys=keys):
++                database, password = keys
++                self.assertEqual(
++                    self.settings_to_cmd_args_env({
++                        'NAME': 'settingdbname',
++                        'USER': 'settinguser',
++                        'PASSWORD': 'settingpassword',
++                        'HOST': 'settinghost',
++                        'PORT': settings_port,
++                        'OPTIONS': {
++                            database: 'optiondbname',
++                            'user': 'optionuser',
++                            password: 'optionpassword',
++                            'host': 'optionhost',
++                            'port': options_port,
++                        },
++                    }),
++                    (expected_args, expected_env),
++                )
  
- 
- class FastDeleteTests(TestCase):
-+    def test_fast_delete_all(self):
-+        with self.assertNumQueries(1) as ctx:
-+            User.objects.all().delete()
-+        sql = ctx.captured_queries[0]['sql']
-+        # No subqueries is used when performing a full delete.
-+        self.assertNotIn('SELECT', sql)
- 
-     def test_fast_delete_fk(self):
-         u = User.objects.create(
+-    def test_options_password(self):
++    def test_options_non_deprecated_keys_preferred(self):
+         expected_args = [
+             'mysql',
+             '--user=someuser',
+             '--host=somehost',
+             '--port=444',
+-            'somedbname',
++            'optiondbname',
+         ]
+         expected_env = {'MYSQL_PWD': 'optionpassword'}
+         self.assertEqual(
+             self.settings_to_cmd_args_env({
+-                'NAME': 'somedbname',
++                'NAME': 'settingdbname',
+                 'USER': 'someuser',
+                 'PASSWORD': 'settingpassword',
+                 'HOST': 'somehost',
+                 'PORT': 444,
+-                'OPTIONS': {'password': 'optionpassword'},
++                'OPTIONS': {
++                    'database': 'optiondbname',
++                    'db': 'deprecatedoptiondbname',
++                    'password': 'optionpassword',
++                    'passwd': 'deprecatedoptionpassword',
++                },
+             }),
+             (expected_args, expected_env),
+         )
 
 EOF_114329324912
 : '>>>>> Start Test Output'
-./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 delete.tests
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 dbshell.test_mysql
 : '>>>>> End Test Output'
-git checkout 437196da9a386bd4cc62b0ce3f2de4aba468613d tests/delete/tests.py
+git checkout d06c5b358149c02a62da8a5469264d05f29ac659 tests/dbshell/test_mysql.py
