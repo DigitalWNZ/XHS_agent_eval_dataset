@@ -51,6 +51,8 @@ def load(category, since):
             patch = v.get("model_patch_bytes")
             q.update(score=float(v.get("reward") or 0), timeout=any(e.get("event") == "agent_timeout" for e in tr),
                      no_code=(diff == 0 and not patch), trial_dir=os.path.relpath(t, XHS))
+            if q["no_code"]:  # rubric: no code change -> "na", excluded from D2 (the judge sometimes says "bad")
+                q["quality_score"] = None
             rows.append(q)
     return rows
 
@@ -116,7 +118,7 @@ def main():
     for m in models:
         ts = [q for q in qs if q["model"] == m]
         col = lambda pred: f0(mean([100 * SC[i["level"]] if SC.get(i["level"]) is not None else None
-                                    for t in ts for i in t["items"] if pred(i)]))
+                                    for t in ts if not t["no_code"] for i in t["items"] if pred(i)]))
         o.append(f"| {m} | " + " | ".join(col(lambda i, k=k: i["id"] == k) for k in COMMON)
                  + f" | {col(lambda i: not i['common'])} | {f0(mean([t['quality_score'] for t in ts]))} |")
 
