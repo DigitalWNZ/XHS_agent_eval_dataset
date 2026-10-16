@@ -1,0 +1,106 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,101 @@
++import asyncio
++import functools
++import signal
++import threading
++from typing import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int
++) -> None:
++    if not tasks:
++        return
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be at least 1")
++
++    sem = asyncio.Semaphore(max_concurrent)
++    loop = asyncio.get_running_loop()
++    current_task = asyncio.current_task()
++    kb_interrupt: KeyboardInterrupt | None = None
++    sigint_received = False
++    aborting = False
++    child_tasks: list[asyncio.Task[None]] = []
++
++    def abort_all() -> None:
++        nonlocal aborting
++        if not aborting:
++            aborting = True
++            for ct in child_tasks:
++                if not ct.done():
++                    ct.cancel()
++
++    async def worker(task_fn: Callable[[], Awaitable[None]]) -> None:
++        nonlocal kb_interrupt
++        async with sem:
++            if aborting:
++                return
++            try:
++                await task_fn()
++            except KeyboardInterrupt as exc:
++                kb_interrupt = exc
++                abort_all()
++                raise asyncio.CancelledError() from exc
++            except BaseException:
++                abort_all()
++                raise
++
++    prev_handler = None
++    runner_managed = False
++
++    def on_sigint(signum, frame):
++        nonlocal kb_interrupt, sigint_received
++        if not sigint_received:
++            sigint_received = True
++            kb_interrupt = KeyboardInterrupt()
++            loop.call_soon_threadsafe(abort_all)
++            if current_task is not None and not current_task.done():
++                loop.call_soon_threadsafe(current_task.cancel)
++        else:
++            raise KeyboardInterrupt()
++
++    if threading.current_thread() is threading.main_thread():
++        try:
++            prev_handler = signal.getsignal(signal.SIGINT)
++            if (
++                isinstance(prev_handler, functools.partial)
++                and getattr(prev_handler.func, "__name__", "") == "_on_sigint"
++            ):
++                runner_managed = True
++            signal.signal(signal.SIGINT, on_sigint)
++        except ValueError:
++            prev_handler = None
++
++    try:
++        for t in tasks:
++            child_tasks.append(loop.create_task(worker(t)))
++        await asyncio.gather(*child_tasks)
++    except BaseException:
++        abort_all()
++        while any(not ct.done() for ct in child_tasks):
++            try:
++                await asyncio.gather(*child_tasks, return_exceptions=True)
++            except asyncio.CancelledError:
++                abort_all()
++        if kb_interrupt is not None:
++            if current_task is not None:
++                while current_task.cancelling() > 0:
++                    current_task.uncancel()
++            if runner_managed and callable(prev_handler):
++                main_task = prev_handler.keywords.get("main_task")
++                if main_task is not None and main_task is not current_task:
++                    prev_handler(signal.SIGINT, None)
++                    raise asyncio.CancelledError()
++            if current_task is not None:
++                current_task.add_done_callback(
++                    lambda t: t.exception() if not t.cancelled() else None
++                )
++            raise kb_interrupt
++        raise
++    finally:
++        if prev_handler is not None:
++            signal.signal(signal.SIGINT, prev_handler)

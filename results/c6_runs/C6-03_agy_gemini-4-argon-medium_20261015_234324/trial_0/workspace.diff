@@ -1,0 +1,207 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,195 @@
++#!/usr/bin/env python3
++import sys
++import cv2
++import numpy as np
++
++try:
++    import toml
++except ImportError:
++    toml = None
++
++
++def detect_jump_frames(video_path: str) -> tuple[int, int]:
++    cap = cv2.VideoCapture(str(video_path))
++    if not cap.isOpened():
++        raise RuntimeError(f"Could not open video file: {video_path}")
++
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if len(frames) < 3:
++        raise RuntimeError("Video has too few frames to analyze.")
++
++    bg = frames[0]
++    h, w = bg.shape[:2]
++
++    # Spatial min/max envelope of the empty background frame to absorb minor camera shake
++    kernel = np.ones((7, 7), np.uint8)
++    bg_min = cv2.erode(bg, kernel).astype(np.int16)
++    bg_max = cv2.dilate(bg, kernel).astype(np.int16)
++
++    open_kernel = np.ones((3, 3), np.uint8)
++    close_kernel = np.ones((25, 25), np.uint8)
++
++    border = 15
++    max_y = {}
++    mean_x = {}
++    pixel_count = {}
++
++    for idx in range(1, len(frames)):
++        fi = frames[idx].astype(np.int16)
++        d_bgr = np.maximum(0, np.maximum(bg_min - fi, fi - bg_max))
++        dist = np.sqrt((d_bgr.astype(np.float32) ** 2).sum(axis=2))
++
++        mask = (dist > 35).astype(np.uint8)
++        mask[:border, :] = 0
++        mask[h - border :, :] = 0
++        mask[:, :border] = 0
++        mask[:, w - border :] = 0
++        # Ignore region far below the track lanes if any
++        if h > 460:
++            mask[460:, :] = 0
++
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
++        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
++
++        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed)
++        valid_labels = [
++            i for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] > 50
++        ]
++        if not valid_labels:
++            continue
++
++        runner_mask = (mask > 0) & np.isin(labels, valid_labels)
++        ys, xs = np.where(runner_mask)
++        if len(ys) >= 200:
++            max_y[idx] = int(ys.max())
++            mean_x[idx] = float(xs.mean())
++            pixel_count[idx] = int(len(ys))
++
++    if not max_y:
++        raise RuntimeError("No runner detected in the video.")
++
++    # Find the apex of the hurdle jump: frame with highest lowest-body-point (minimum max_y)
++    # while the athlete is well within the horizontal bounds of the frame.
++    central_frames = [
++        idx
++        for idx in max_y
++        if pixel_count[idx] >= 400 and (0.15 * w) <= mean_x[idx] <= (0.85 * w)
++    ]
++    if not central_frames:
++        central_frames = list(max_y.keys())
++
++    f_apex = min(central_frames, key=lambda idx: max_y[idx])
++
++    # Pre-jump stance ground level and takeoff frame (last frame on ground before jump)
++    pre_window = [idx for idx in max_y if max(1, f_apex - 12) <= idx < f_apex]
++    if pre_window:
++        y_pre_ground = max(max_y[idx] for idx in pre_window)
++        takeoff_frame = pre_window[0]
++        for idx in range(f_apex - 1, 0, -1):
++            if idx in max_y and max_y[idx] >= y_pre_ground - 8:
++                takeoff_frame = idx
++                break
++    else:
++        takeoff_frame = max(1, f_apex - 5)
++
++    # Post-jump stance ground level and landing frame (first frame on ground after jump)
++    post_window = [
++        idx for idx in max_y if f_apex < idx <= min(len(frames) - 1, f_apex + 12)
++    ]
++    if post_window:
++        y_post_ground = max(max_y[idx] for idx in post_window)
++        land_frame = post_window[-1]
++        for idx in range(f_apex + 1, len(frames)):
++            if idx in max_y and max_y[idx] >= y_post_ground - 8:
++                land_frame = idx
++                break
++    else:
++        land_frame = min(len(frames) - 1, f_apex + 4)
++
++    return int(takeoff_frame), int(land_frame)
++
++
++def write_toml_output(takeoff_frame: int, land_frame: int, output_path: str = "/app/output.toml") -> dict:
++    data = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++    if toml is not None:
++        content = toml.dumps(data)
++    else:
++        content = (
++            f"jump_takeoff_frame_number = {int(takeoff_frame)}\n"
++            f"jump_land_frame_number = {int(land_frame)}\n"
++        )
++
++    with open(output_path, "w", encoding="utf-8") as f:
++        f.write(content)
++
++    if output_path != "/app/output.toml":
++        try:
++            with open("/app/output.toml", "w", encoding="utf-8") as f:
++                f.write(content)
++        except OSError:
++            pass
++
++    return data
++
++
++def analyze_jump(video_path: str, output_path: str = "/app/output.toml") -> dict:
++    takeoff_frame, land_frame = detect_jump_frames(video_path)
++    return write_toml_output(takeoff_frame, land_frame, output_path)
++
++
++def parse_args(argv: list[str]) -> tuple[str, str]:
++    video_path = None
++    output_path = "/app/output.toml"
++
++    positional = []
++    i = 0
++    while i < len(argv):
++        arg = argv[i]
++        if arg in ("-i", "--input", "-v", "--video", "-f", "--file") and i + 1 < len(argv):
++            video_path = argv[i + 1]
++            i += 2
++        elif arg.startswith(("--input=", "--video=", "--file=")):
++            video_path = arg.split("=", 1)[1]
++            i += 1
++        elif arg in ("-o", "--output") and i + 1 < len(argv):
++            output_path = argv[i + 1]
++            i += 2
++        elif arg.startswith("--output="):
++            output_path = arg.split("=", 1)[1]
++            i += 1
++        elif not arg.startswith("-"):
++            positional.append(arg)
++            i += 1
++        else:
++            i += 1
++
++    if video_path is None and positional:
++        video_path = positional[0]
++        if len(positional) > 1:
++            output_path = positional[1]
++
++    if video_path is None:
++        video_path = "/app/example_video.mp4"
++
++    return video_path, output_path
++
++
++def main(argv: list[str] | None = None) -> None:
++    if argv is None:
++        argv = sys.argv[1:]
++    video_path, output_path = parse_args(argv)
++    analyze_jump(video_path, output_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

@@ -1,0 +1,179 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_jump(video_path: str) -> dict:
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Could not open video file: {video_path}")
++
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if len(frames) < 5:
++        raise ValueError("Video has too few frames to analyze.")
++
++    bg = frames[0]
++    h, w = bg.shape[:2]
++
++    # Use shift-tolerant background bounds (5x5 neighborhood) to suppress 1-2px camera shake
++    k5 = np.ones((5, 5), np.uint8)
++    bg_max = cv2.dilate(bg, k5).astype(np.int16)
++    bg_min = cv2.erode(bg, k5).astype(np.int16)
++
++    # Track region of interest: vertically from fence/torso down to below runner's lane
++    y_top = int(round(100 * h / 540))
++    y_bot = int(round(420 * h / 540))
++    x_left = int(round(10 * w / 960))
++    x_right = int(round(950 * w / 960))
++
++    open_kernel = np.ones((3, 3), np.uint8)
++
++    frame_stats = {}
++    for idx, f in enumerate(frames):
++        if idx == 0:
++            continue
++        f16 = f.astype(np.int16)
++        diff = np.maximum(0, np.maximum(f16 - bg_max, bg_min - f16)).max(axis=2)
++        roi = (diff[y_top:y_bot, x_left:x_right] > 30).astype(np.uint8)
++        roi = cv2.morphologyEx(roi, cv2.MORPH_OPEN, open_kernel)
++
++        ys, xs = np.where(roi > 0)
++        if len(ys) >= 300:
++            ys_full = ys + y_top
++            xs_full = xs + x_left
++            order = np.argsort(ys_full)[::-1]
++            bot_y = float(np.mean(ys_full[order[:30]]))
++            p99_y = float(np.percentile(ys_full, 99))
++            max_y = int(ys_full[order[0]])
++            mean_x = float(np.mean(xs_full))
++            frame_stats[idx] = {
++                "count": len(ys),
++                "mean_x": mean_x,
++                "bot_y": bot_y,
++                "p99_y": p99_y,
++                "max_y": max_y,
++            }
++
++    if not frame_stats:
++        raise ValueError("No runner detected in video.")
++
++    active_frames = sorted(frame_stats.keys())
++
++    # Find the apex of the hurdle jump: the frame with minimum bot_y
++    # where the runner is near the center of the frame (0.25*w <= mean_x <= 0.75*w)
++    center_frames = [
++        i for i in active_frames if 0.25 * w <= frame_stats[i]["mean_x"] <= 0.75 * w
++    ]
++    if not center_frames:
++        center_frames = active_frames
++
++    apex_frame = min(center_frames, key=lambda i: frame_stats[i]["bot_y"])
++
++    # Pre-jump stance baseline: max bot_y in the window [apex_frame - 12, apex_frame - 2]
++    pre_window = [
++        i for i in active_frames if apex_frame - 12 <= i <= apex_frame - 2
++    ]
++    if not pre_window:
++        pre_window = [i for i in active_frames if i < apex_frame]
++
++    y_stance_pre = max(frame_stats[i]["bot_y"] for i in pre_window)
++
++    # Post-jump landing baseline: max bot_y in the window [apex_frame + 2, apex_frame + 12]
++    post_window = [
++        i for i in active_frames if apex_frame + 2 <= i <= apex_frame + 12
++    ]
++    if not post_window:
++        post_window = [i for i in active_frames if i > apex_frame]
++
++    y_stance_post = max(frame_stats[i]["bot_y"] for i in post_window)
++
++    # A foot is on the ground when bot_y is within 8px (scaled) of the stance ground level
++    tol = 8.0 * (h / 540.0)
++
++    # Takeoff frame: last frame before apex_frame where the foot is still on the ground
++    takeoff_candidates = [
++        i for i in pre_window if frame_stats[i]["bot_y"] >= y_stance_pre - tol
++    ]
++    if takeoff_candidates:
++        takeoff_frame = max(takeoff_candidates)
++    else:
++        takeoff_frame = apex_frame - 5
++
++    # Landing frame: first frame after apex_frame where the foot returns to the ground
++    land_candidates = [
++        i for i in post_window if frame_stats[i]["bot_y"] >= y_stance_post - tol
++    ]
++    if land_candidates:
++        land_frame = min(land_candidates)
++    else:
++        land_frame = apex_frame + 4
++
++    return {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++
++def process_video(video_path: str, output_path: str = "/app/output.toml") -> dict:
++    result = analyze_jump(video_path)
++    with open(output_path, "w") as f:
++        toml.dump(result, f)
++    return result
++
++
++def main():
++    video_path = "/app/example_video.mp4"
++    output_path = "/app/output.toml"
++
++    args = sys.argv[1:]
++    i = 0
++    while i < len(args):
++        arg = args[i]
++        if arg in ("-i", "--input", "--video") and i + 1 < len(args):
++            video_path = args[i + 1]
++            i += 2
++        elif arg in ("-o", "--output") and i + 1 < len(args):
++            output_path = args[i + 1]
++            i += 2
++        elif arg.startswith("--input=") or arg.startswith("--video="):
++            video_path = arg.split("=", 1)[1]
++            i += 1
++        elif arg.startswith("--output="):
++            output_path = arg.split("=", 1)[1]
++            i += 1
++        elif not arg.startswith("-"):
++            if video_path == "/app/example_video.mp4":
++                video_path = arg
++            else:
++                output_path = arg
++            i += 1
++        else:
++            i += 1
++
++    process_video(video_path, output_path)
++
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

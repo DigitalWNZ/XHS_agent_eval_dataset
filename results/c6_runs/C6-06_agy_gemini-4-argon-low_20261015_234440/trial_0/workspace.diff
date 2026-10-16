@@ -1,0 +1,109 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,104 @@
++import asyncio
++import signal
++import threading
++from collections.abc import Awaitable, Callable
++
++
++class _WrappedKeyboardInterrupt(Exception):
++    def __init__(self, orig: KeyboardInterrupt) -> None:
++        self.orig = orig
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int
++) -> None:
++    if not tasks:
++        return
++
++    sem = asyncio.Semaphore(max_concurrent)
++    cancelled = False
++
++    async def runner(task_fn: Callable[[], Awaitable[None]]) -> None:
++        nonlocal cancelled
++        try:
++            async with sem:
++                if cancelled:
++                    return
++                await task_fn()
++        except KeyboardInterrupt as exc:
++            cancelled = True
++            raise _WrappedKeyboardInterrupt(exc) from exc
++        except BaseException:
++            cancelled = True
++            raise
++
++    loop = asyncio.get_running_loop()
++    current_task = asyncio.current_task()
++    sigint_received = False
++    prev_handler = None
++    handler_installed = False
++
++    task_objs = [asyncio.create_task(runner(t)) for t in tasks]
++
++    def on_sigint_in_loop() -> None:
++        nonlocal cancelled
++        cancelled = True
++        for t in task_objs:
++            if not t.done() and t.cancelling() == 0:
++                t.cancel()
++        if (
++            current_task is not None
++            and not current_task.done()
++            and current_task.cancelling() == 0
++        ):
++            current_task.cancel()
++
++    def on_sigint(signum: int, frame: object) -> None:
++        nonlocal sigint_received
++        sigint_received = True
++        loop.call_soon_threadsafe(on_sigint_in_loop)
++
++    if threading.current_thread() is threading.main_thread():
++        try:
++            prev_handler = signal.getsignal(signal.SIGINT)
++            signal.signal(signal.SIGINT, on_sigint)
++            handler_installed = True
++        except (ValueError, OSError, RuntimeError):
++            pass
++
++    try:
++        await asyncio.gather(*task_objs)
++    except BaseException as exc:
++        cancelled = True
++        for t in task_objs:
++            if not t.done() and t.cancelling() == 0:
++                t.cancel()
++        while True:
++            pending = [t for t in task_objs if not t.done()]
++            if not pending:
++                break
++            try:
++                await asyncio.wait(pending)
++            except (asyncio.CancelledError, KeyboardInterrupt):
++                pass
++
++        for t in task_objs:
++            if not t.cancelled():
++                _ = t.exception()
++
++        if isinstance(exc, _WrappedKeyboardInterrupt):
++            raise exc.orig
++
++        if sigint_received:
++            if current_task is not None and hasattr(current_task, "uncancel"):
++                while current_task.cancelling() > 0:
++                    current_task.uncancel()
++            raise KeyboardInterrupt()
++
++        raise
++    finally:
++        if handler_installed:
++            try:
++                signal.signal(signal.SIGINT, prev_handler)
++            except (ValueError, OSError, RuntimeError):
++                pass

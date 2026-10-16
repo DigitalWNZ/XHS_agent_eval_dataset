@@ -1,0 +1,166 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++import argparse
++import os
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_video(video_path: str) -> tuple[int, int]:
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise RuntimeError(f"Could not open video file: {video_path}")
++
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret or frame is None:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if len(frames) < 3:
++        raise RuntimeError("Video has too few frames to analyze.")
++
++    h, w = frames[0].shape[:2]
++    f0_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY).astype(np.float32)
++    f0_blur = cv2.GaussianBlur(frames[0], (5, 5), 0).astype(np.float32)
++
++    # Bottom strip of the track (below the hurdle lane) has no runner and no moving trees
++    bg_y_start = int(h * 0.70)
++    f0_bg_gray = f0_gray[bg_y_start:, :]
++
++    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
++    kernel_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
++
++    active_frames = {}
++
++    for idx, frame in enumerate(frames):
++        if idx == 0:
++            continue
++
++        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
++        (dx, dy), _ = cv2.phaseCorrelate(f0_bg_gray, g[bg_y_start:, :])
++        M = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
++        aligned = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
++
++        al_blur = cv2.GaussianBlur(aligned, (5, 5), 0).astype(np.float32)
++        diff_vec = al_blur - f0_blur
++        # Compensate for any global illumination shift estimated on the background strip
++        bg_shift = np.median(diff_vec[bg_y_start:, :], axis=(0, 1))
++        diff = np.linalg.norm(diff_vec - bg_shift, axis=2)
++
++        mask = (diff > 35.0).astype(np.uint8)
++        # Ignore warp border replication and bottom foreground lanes
++        border = 4
++        mask[:border, :] = 0
++        mask[int(h * 0.73):, :] = 0
++        mask[:, :border] = 0
++        mask[:, w - border:] = 0
++
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
++        dil = cv2.dilate(mask, kernel_dil)
++        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dil)
++
++        if num_labels > 1:
++            largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
++            athlete_mask = (mask > 0) & (labels == largest_label)
++            cnt = int(np.sum(athlete_mask))
++            if cnt > 1000:
++                ys, xs = np.where(athlete_mask)
++                active_frames[idx] = {
++                    "cnt": cnt,
++                    "x_mean": float(np.mean(xs)),
++                    "y_min": int(np.min(ys)),
++                    "y_max": int(np.max(ys)),
++                }
++
++    if not active_frames:
++        raise RuntimeError("No athlete detected in the video.")
++
++    # Find the peak of the jump when the athlete is airborne near the hurdle center
++    central_candidates = [
++        idx
++        for idx, info in active_frames.items()
++        if 0.25 * w <= info["x_mean"] <= 0.75 * w and info["cnt"] >= 3000
++    ]
++    if not central_candidates:
++        central_candidates = list(active_frames.keys())
++
++    t_peak = min(central_candidates, key=lambda i: (active_frames[i]["y_max"], active_frames[i]["y_min"]))
++
++    # Pre-jump ground level from stance frames before peak
++    pre_indices = [i for i in active_frames if t_peak - 12 <= i < t_peak]
++    ground_pre = max(active_frames[i]["y_max"] for i in pre_indices) if pre_indices else active_frames[t_peak]["y_max"]
++
++    takeoff_frame = t_peak - 1
++    for i in range(t_peak - 1, min(active_frames.keys()) - 1, -1):
++        if i in active_frames and active_frames[i]["y_max"] >= ground_pre - 8:
++            takeoff_frame = i
++            break
++
++    # Post-jump ground level from stance frames after peak
++    post_indices = [i for i in active_frames if t_peak < i <= t_peak + 12]
++    ground_post = max(active_frames[i]["y_max"] for i in post_indices) if post_indices else active_frames[t_peak]["y_max"]
++
++    land_frame = t_peak + 1
++    for i in range(t_peak + 1, max(active_frames.keys()) + 1):
++        if i in active_frames and active_frames[i]["y_max"] >= ground_post - 8:
++            land_frame = i
++            break
++
++    return int(takeoff_frame), int(land_frame)
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Analyze hurdle jump video and output takeoff/landing frames.")
++    parser.add_argument("positional", nargs="*", help="Input video path (and optional output TOML path)")
++    parser.add_argument("-i", "--input", "--video", dest="input_video", help="Path to input MP4 video")
++    parser.add_argument("-o", "--output", dest="output_toml", help="Path to output TOML file")
++    args, _ = parser.parse_known_args()
++
++    video_path = args.input_video
++    output_path = args.output_toml
++
++    if not video_path:
++        if len(args.positional) >= 1:
++            video_path = args.positional[0]
++        else:
++            video_path = "/app/example_video.mp4"
++
++    if not output_path and len(args.positional) >= 2:
++        output_path = args.positional[1]
++
++    takeoff_frame, land_frame = analyze_video(video_path)
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    default_out = "/app/output.toml"
++    out_paths = {os.path.abspath(default_out)}
++    if output_path:
++        out_paths.add(os.path.abspath(output_path))
++
++    for path in out_paths:
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w", encoding="utf-8") as f:
++            toml.dump(result, f)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

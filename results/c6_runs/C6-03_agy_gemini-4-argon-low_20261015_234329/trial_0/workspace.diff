@@ -1,0 +1,163 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++import argparse
++import os
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_jump(video_path: str) -> tuple[int, int]:
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Could not open video file: {video_path}")
++
++    frames = []
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frames.append(frame)
++    cap.release()
++
++    if len(frames) < 3:
++        raise ValueError("Video has too few frames to analyze.")
++
++    bg0 = frames[0].astype(np.float32)
++    bg0_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY).astype(np.float32)
++    h, w = bg0_gray.shape
++
++    # Track region parameters (scaled to video dimensions if needed, matching 960x540)
++    y_top = int(round(180 * h / 540.0))
++    y_bot = int(round(420 * h / 540.0))
++    x_left = int(round(10 * w / 960.0))
++    x_right = int(round(950 * w / 960.0))
++
++    kernel_open = np.ones((3, 3), np.uint8)
++    kernel_dilate = np.ones((15, 15), np.uint8)
++
++    frame_stats = {}
++    for i, frame in enumerate(frames):
++        f_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
++        shift, _ = cv2.phaseCorrelate(bg0_gray, f_gray)
++        M = np.float32([[1, 0, -shift[0]], [0, 1, -shift[1]]])
++        aligned = cv2.warpAffine(
++            frame.astype(np.float32), M, (w, h), borderMode=cv2.BORDER_REPLICATE
++        )
++        diff = np.linalg.norm(aligned - bg0, axis=2)
++
++        roi = diff[y_top:y_bot, x_left:x_right]
++        mask = (roi > 45.0).astype(np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
++
++        # Find largest connected component after dilation to group runner body parts
++        mask_dil = cv2.dilate(mask, kernel_dilate)
++        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_dil)
++        if num_labels <= 1:
++            continue
++
++        largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
++        runner_mask = (labels == largest_label) & (mask > 0)
++        ys, xs = np.where(runner_mask)
++
++        if len(ys) >= 1000:
++            ys_full = ys + y_top
++            xs_full = xs + x_left
++            frame_stats[i] = {
++                "count": len(ys_full),
++                "y_max": float(np.max(ys_full)),
++                "y_p99": float(np.percentile(ys_full, 99)),
++                "y_mean": float(np.mean(ys_full)),
++                "x_mean": float(np.mean(xs_full)),
++            }
++
++    if not frame_stats:
++        raise RuntimeError("No runner detected in video.")
++
++    active_frames = sorted(frame_stats.keys())
++    y_p99_vals = np.array([frame_stats[i]["y_p99"] for i in active_frames])
++    y_max_vals = np.array([frame_stats[i]["y_max"] for i in active_frames])
++
++    # Find the apex of the jump (minimum y_p99 / y_max among active frames)
++    apex_idx = int(np.argmin(y_p99_vals))
++    apex_frame = active_frames[apex_idx]
++    apex_y = y_p99_vals[apex_idx]
++
++    # Ground baseline is estimated from the 75th percentile of y_p99 during active frames
++    ground_y = float(np.percentile(y_p99_vals, 75))
++
++    # Threshold for foot being in contact with the ground vs clearly airborne
++    # Typically ground_y ~ 359, apex_y ~ 232. Contact is within ~10px of ground_y.
++    contact_thresh = ground_y - max(8.0, 0.08 * (ground_y - apex_y))
++
++    # Walk backward from apex_frame to find takeoff (last frame on ground before jump)
++    takeoff_frame = active_frames[0]
++    for idx in range(apex_idx, -1, -1):
++        if y_p99_vals[idx] >= contact_thresh:
++            takeoff_frame = active_frames[idx]
++            break
++
++    # Walk forward from apex_frame to find landing (first frame back on ground after jump)
++    land_frame = active_frames[-1]
++    for idx in range(apex_idx, len(active_frames)):
++        if y_p99_vals[idx] >= contact_thresh:
++            land_frame = active_frames[idx]
++            break
++
++    return int(takeoff_frame), int(land_frame)
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Analyze hurdle jump video and extract takeoff and landing frames."
++    )
++    parser.add_argument(
++        "video_path",
++        nargs="?",
++        default="/app/example_video.mp4",
++        help="Path to input MP4 video file",
++    )
++    parser.add_argument(
++        "-i", "--input", "--video", dest="input_opt", help="Path to input MP4 video file"
++    )
++    parser.add_argument(
++        "-o",
++        "--output",
++        dest="output_opt",
++        default="/app/output.toml",
++        help="Path to output TOML file",
++    )
++    args, unknown = parser.parse_known_args()
++
++    video_path = args.input_opt if args.input_opt else args.video_path
++    output_path = args.output_opt
++
++    # If a second positional argument was passed as output path
++    if unknown and not unknown[0].startswith("-"):
++        output_path = unknown[0]
++
++    takeoff_frame, land_frame = analyze_jump(video_path)
++
++    result = {
++        "jump_takeoff_frame_number": int(takeoff_frame),
++        "jump_land_frame_number": int(land_frame),
++    }
++
++    with open(output_path, "w") as f:
++        toml.dump(result, f)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

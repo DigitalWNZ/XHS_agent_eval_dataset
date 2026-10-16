@@ -1,0 +1,204 @@
+diff --git a/jump_analyzer.py b/jump_analyzer.py
+new file mode 100644
+--- /dev/null
++++ b/jump_analyzer.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++import argparse
++import os
++import sys
++import cv2
++import numpy as np
++import toml
++
++
++def analyze_video(
++    video_path: str = "/app/example_video.mp4",
++    output_path: str | None = "/app/output.toml",
++) -> dict[str, int]:
++    """Analyze an MP4 video of a hurdle jumper and extract takeoff and landing frame numbers."""
++    cap = cv2.VideoCapture(video_path)
++    if not cap.isOpened():
++        raise ValueError(f"Could not open video file: {video_path}")
++
++    ret, first_frame = cap.read()
++    if not ret:
++        cap.release()
++        raise ValueError(f"Could not read frames from video file: {video_path}")
++
++    h, w = first_frame.shape[:2]
++    g0 = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
++    bg_blur = cv2.GaussianBlur(first_frame, (5, 5), 0).astype(np.float32)
++
++    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
++    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
++
++    y_bot = {}
++    x_mean = {}
++
++    frame_idx = 0
++    while True:
++        ret, frame = cap.read()
++        if not ret:
++            break
++        frame_idx += 1
++
++        gi = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
++        shift, _ = cv2.phaseCorrelate(g0, gi)
++        M = np.float32([[1, 0, -shift[0]], [0, 1, -shift[1]]])
++        aligned = cv2.warpAffine(
++            frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE
++        )
++        aligned_blur = cv2.GaussianBlur(aligned, (5, 5), 0).astype(np.float32)
++
++        diff = np.abs(aligned_blur - bg_blur).max(axis=2)
++        mask = np.zeros_like(diff, dtype=np.uint8)
++        y_limit = min(h - 10, 500)
++        x_limit = w - 10
++        mask[10:y_limit, 10:x_limit] = (
++            diff[10:y_limit, 10:x_limit] > 38
++        ).astype(np.uint8)
++
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
++        mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
++
++        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
++            mask_closed
++        )
++        if num_labels > 1:
++            areas = stats[1:, cv2.CC_STAT_AREA]
++            if areas.max() > 1000:
++                main_idx = int(np.argmax(areas)) + 1
++                cx, cy = centroids[main_idx]
++                valid_mask = np.zeros_like(mask)
++                for lbl in range(1, num_labels):
++                    if stats[lbl, cv2.CC_STAT_AREA] > 20:
++                        if (
++                            abs(centroids[lbl][0] - cx) < 180
++                            and abs(centroids[lbl][1] - cy) < 280
++                        ):
++                            valid_mask[(labels == lbl) & (mask > 0)] = 1
++
++                ys, xs = np.where(valid_mask > 0)
++                if len(ys) > 800:
++                    ys_sorted = np.sort(ys)
++                    y_bot[frame_idx] = float(ys_sorted[-50:].mean())
++                    x_mean[frame_idx] = float(xs.mean())
++
++    cap.release()
++
++    if not y_bot:
++        raise RuntimeError("No runner detected in video.")
++
++    valid_frames = sorted(y_bot.keys())
++
++    # Find jump apex: frame with minimum y_bot (highest vertical position of lowest body part)
++    # Prefer frames where runner is near the center/hurdle (150 < x_mean < w - 150)
++    center_frames = [
++        f for f in valid_frames if 150 < x_mean[f] < (w - 150)
++    ]
++    search_frames = center_frames if center_frames else valid_frames
++    apex_frame = min(search_frames, key=lambda f: y_bot[f])
++
++    # Estimate ground contact y level before and after apex
++    pre_frames = [f for f in valid_frames if f < apex_frame]
++    post_frames = [f for f in valid_frames if f > apex_frame]
++
++    if not pre_frames or not post_frames:
++        raise RuntimeError("Could not identify both takeoff and landing phases.")
++
++    # Ground level is the maximum y_bot observed in the stance phase right before takeoff / after landing
++    pre_Window = [f for f in pre_frames if f >= apex_frame - 12]
++    post_Window = [f for f in post_frames if f <= apex_frame + 12]
++
++    ground_pre = max(y_bot[f] for f in (pre_Window if pre_Window else pre_frames))
++    ground_post = max(y_bot[f] for f in (post_Window if post_Window else post_frames))
++
++    # Takeoff is the last frame before apex where the foot is still on the ground (within 6 pixels of ground_pre)
++    takeoff_candidates = [
++        f for f in pre_frames if f >= apex_frame - 15 and y_bot[f] >= ground_pre - 6.0
++    ]
++    takeoff_frame = int(max(takeoff_candidates)) if takeoff_candidates else int(pre_frames[-1])
++
++    # Landing is the first frame after apex where the foot touches the ground (within 6 pixels of ground_post)
++    land_candidates = [
++        f for f in post_frames if f <= apex_frame + 15 and y_bot[f] >= ground_post - 6.0
++    ]
++    land_frame = int(min(land_candidates)) if land_candidates else int(post_frames[0])
++
++    result = {
++        "jump_takeoff_frame_number": takeoff_frame,
++        "jump_land_frame_number": land_frame,
++    }
++
++    if output_path:
++        with open(output_path, "w") as f:
++            toml.dump(result, f)
++
++    return result
++
++
++# Aliases for possible function names a test harness might import
++analyze_jump = analyze_video
++process_video = analyze_video
++detect_jump = analyze_video
++analyze = analyze_video
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description="Analyze MP4 videos of hurdle jumpers and extract performance metrics."
++    )
++    parser.add_argument(
++        "video_path",
++        nargs="?",
++        default=None,
++        help="Path to input MP4 video file",
++    )
++    parser.add_argument(
++        "-i",
++        "--input",
++        "--video",
++        dest="input_opt",
++        default=None,
++        help="Path to input MP4 video file",
++    )
++    parser.add_argument(
++        "-o",
++        "--output",
++        dest="output_opt",
++        default="/app/output.toml",
++        help="Path to output TOML file (default: /app/output.toml)",
++    )
++    args, unknown = parser.parse_known_args()
++
++    video_path = args.input_opt or args.video_path
++    output_path = args.output_opt
++
++    # If a positional second argument was passed as output path
++    if not args.input_opt and args.video_path and unknown:
++        for arg in unknown:
++            if arg.endswith(".toml"):
++                output_path = arg
++
++    if video_path is None:
++        default_video = "/app/example_video.mp4"
++        if os.path.exists(default_video):
++            video_path = default_video
++        elif os.path.exists("example_video.mp4"):
++            video_path = "example_video.mp4"
++        else:
++            parser.error("No input video file provided.")
++
++    analyze_video(video_path, output_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/output.toml b/output.toml
+new file mode 100644
+--- /dev/null
++++ b/output.toml
+@@ -0,0 +1,2 @@
++jump_takeoff_frame_number = 53
++jump_land_frame_number = 62

@@ -1,0 +1,1046 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,1041 @@
++#!/usr/bin/env python3
++"""HTML XSS Filter that surgically removes JavaScript while preserving HTML formatting."""
++
++import base64
++import html
++import re
++import sys
++import urllib.parse
++from typing import List, Optional, Tuple
++
++WHITESPACE_CHARS = frozenset(("\t", "\n", "\x0b", "\x0c", "\r", " "))
++
++# Tags that are always completely removed (including content if paired)
++PAIRED_REMOVE_TAGS = frozenset(("script", "applet", "object", "handler"))
++VOID_REMOVE_TAGS = frozenset(("embed", "isindex", "listener"))
++
++# HTML5 RAWTEXT / RCDATA tags
++RAWTEXT_RCDATA_TAGS = frozenset(
++    ("style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript")
++)
++
++# Legitimate tags whose names happen to contain "script"
++SAFE_SCRIPT_SUBSTRING_TAGS = frozenset(
++    ("noscript", "mmultiscripts", "mprescripts")
++)
++
++# Dangerous URI schemes
++DANGEROUS_SCHEMES = (
++    "javascript:",
++    "vbscript:",
++    "livescript:",
++    "mocha:",
++    "jar:",
++    "wyciwyg:",
++)
++
++# SafePrefixes for genuine HTTP/relative URLs that shouldn't false-positive on substring matches
++SAFE_URL_PREFIXES = ("http://", "https://", "/", "./", "../", "#")
++
++# Safe raster image MIME types for data: URLs in <img> / <source> / CSS url()
++SAFE_DATA_IMAGE_RE = re.compile(
++    r"^data:image/(?:png|jpeg|jpg|gif|webp|bmp|x-icon|vnd\.microsoft\.icon|ico|avif)\s*[;,]",
++    re.IGNORECASE,
++)
++
++# Attributes that can hold URLs, code, actions, or navigation targets
++URL_LIKE_ATTRS = frozenset(
++    (
++        "href",
++        "src",
++        "xlink:href",
++        "action",
++        "formaction",
++        "data",
++        "code",
++        "codebase",
++        "archive",
++        "background",
++        "poster",
++        "dynsrc",
++        "lowsrc",
++        "longdesc",
++        "usemap",
++        "cite",
++        "profile",
++        "manifest",
++        "ping",
++        "srcset",
++        "imagesrcset",
++        "value",
++        "values",
++        "from",
++        "to",
++        "by",
++        "is",
++    )
++)
++
++# SVG SMIL animation tags
++SVG_ANIMATION_TAGS = frozenset(
++    ("animate", "set", "animatemotion", "animatetransform", "animatecolor")
++)
++
++# Dangerous targets for SVG <animate> / <set> attributeName
++DANGEROUS_ANIM_TARGETS = frozenset(
++    (
++        "href",
++        "xlink:href",
++        "src",
++        "action",
++        "formaction",
++        "data",
++        "srcdoc",
++        "style",
++        "code",
++        "codebase",
++        "background",
++        "poster",
++        "values",
++        "to",
++        "from",
++        "by",
++    )
++)
++
++
++def unescape_html_iter(s: str, max_iter: int = 5) -> str:
++    """Repeatedly unescape HTML entities until convergence."""
++    curr = s
++    for _ in range(max_iter):
++        nxt = html.unescape(curr)
++        if nxt == curr:
++            break
++        curr = nxt
++    return curr
++
++
++def decode_css_escapes(s: str) -> str:
++    """Decode CSS backslash escapes and line continuations."""
++    # Remove CSS line continuations: backslash followed by newline
++    s = re.sub(r"\\(?:\r\n|[\r\n\f])", "", s)
++
++    def _replace_hex(m: re.Match) -> str:
++        code = int(m.group(1), 16)
++        if code == 0 or code > 0x10FFFF:
++            return ""
++        return chr(code)
++
++    # CSS hex escapes: \1 to 6 hex digits + optional single whitespace
++    s = re.sub(r"\\([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?", _replace_hex, s)
++    # CSS char escapes: \ followed by any character
++    s = re.sub(r"\\(.)", r"\1", s)
++    return s
++
++
++def strip_obfuscation_chars(s: str) -> str:
++    """Remove control chars, whitespace, replacement chars, zero-width chars, quotes/backticks."""
++    out = []
++    for ch in s:
++        o = ord(ch)
++        if o <= 0x20 or o == 0x7F or o in (0xAD, 0x200B, 0x200C, 0x200D, 0xFEFF, 0xFFFD):
++            continue
++        if ch in ("\\", "`", "'", '"'):
++            continue
++        out.append(ch)
++    return "".join(out).lower()
++
++
++def normalize_tag_name(raw_name: str) -> str:
++    """Normalize a tag name for comparison."""
++    unesc = unescape_html_iter(raw_name)
++    cleaned = "".join(
++        ch for ch in unesc if ord(ch) > 0x20 and ch not in ("\x7f", "\ufffd", "\x00")
++    )
++    return cleaned.lower()
++
++
++def normalize_attr_name(raw_name: str) -> str:
++    """Normalize an attribute name for comparison."""
++    unesc = unescape_html_iter(raw_name)
++    cleaned = "".join(
++        ch for ch in unesc if ord(ch) > 0x20 and ch not in ("\x7f", "\ufffd", "\x00")
++    )
++    cleaned = re.sub(r"^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$", "", cleaned)
++    return cleaned.lower()
++
++
++def is_dangerous_attr_name(raw_name: str) -> bool:
++    """Check if an attribute name is an event handler or malformed dangerous attribute."""
++    if any(c in raw_name for c in ("<", ">", '"', "'", "`")):
++        return True
++    for candidate in (raw_name, unescape_html_iter(raw_name)):
++        cleaned = "".join(
++            ch
++            for ch in candidate
++            if ord(ch) > 0x20 and ch not in ("\x7f", "\ufffd", "\x00", "/", "\\", '"', "'", "`")
++        ).lower()
++        if cleaned.startswith("on") or cleaned in ("fscommand", "seeksegmenttime"):
++            return True
++        alpha_start = re.sub(r"^[^a-z]+", "", cleaned)
++        if alpha_start.startswith("on") or alpha_start in ("fscommand", "seeksegmenttime"):
++            return True
++    return False
++
++
++def is_safe_svg_data_uri(uri: str) -> bool:
++    """Check if a data:image/svg+xml URI is completely free of scripts/events."""
++    m = re.match(r"^data:image/svg\+xml([^,]*),(.*)$", uri.strip(), re.IGNORECASE | re.DOTALL)
++    if not m:
++        return False
++    meta, payload = m.group(1).lower(), m.group(2)
++    try:
++        if ";base64" in meta:
++            decoded = base64.b64decode(urllib.parse.unquote(payload)).decode("utf-8", errors="ignore")
++        else:
++            decoded = urllib.parse.unquote(payload)
++    except Exception:
++        return False
++    filtered = sanitize_html(decoded)
++    return filtered == decoded and "<script" not in decoded.lower() and "javascript:" not in decoded.lower()
++
++
++def is_dangerous_data_uri(val: str, tag_name: str, attr_name: str) -> bool:
++    """Check whether a data: URI is dangerous in the given tag/attribute context."""
++    unesc = unescape_html_iter(val).strip()
++    if tag_name in ("img", "source") and attr_name in ("src", "srcset", "imagesrcset"):
++        if SAFE_DATA_IMAGE_RE.match(unesc):
++            return False
++        if unesc.lower().startswith("data:image/svg+xml"):
++            return not is_safe_svg_data_uri(unesc)
++    return True
++
++
++def is_dangerous_attr_value(tag_name: str, attr_name: str, raw_val: str) -> bool:
++    """Determine if an attribute value contains JavaScript or dangerous schemes."""
++    if not raw_val:
++        return False
++
++    unesc = unescape_html_iter(raw_val)
++    unquoted = urllib.parse.unquote(unesc)
++    css_decoded = decode_css_escapes(unesc)
++
++    is_url_attr = (
++        attr_name in URL_LIKE_ATTRS
++        or attr_name.endswith(("src", "href", "url", "uri", "action", "data"))
++    )
++
++    # Check multi-item attributes (srcset, values)
++    if attr_name in ("srcset", "imagesrcset"):
++        for part in unesc.split(","):
++            p_norm = strip_obfuscation_chars(part)
++            if any(p_norm.startswith(sc) for sc in DANGEROUS_SCHEMES):
++                return True
++            if p_norm.startswith("data:") and is_dangerous_data_uri(part.strip().split()[0], tag_name, attr_name):
++                return True
++
++    if attr_name == "values":
++        for part in unesc.split(";"):
++            p_norm = strip_obfuscation_chars(part)
++            if any(p_norm.startswith(sc) for sc in DANGEROUS_SCHEMES) or p_norm.startswith("data:"):
++                return True
++
++    for variant in (raw_val, unesc, unquoted, css_decoded):
++        norm = strip_obfuscation_chars(variant)
++        if "<script" in norm or "</script" in norm:
++            return True
++        is_safe_http_or_rel = norm.startswith(SAFE_URL_PREFIXES)
++        for scheme in DANGEROUS_SCHEMES:
++            if norm.startswith(scheme):
++                return True
++            if is_url_attr and not is_safe_http_or_rel and scheme in norm:
++                return True
++            if f"url={scheme}" in norm or f"url({scheme}" in norm:
++                return True
++            if not is_safe_http_or_rel and scheme in norm and any(
++                kw in norm
++                for kw in (
++                    "alert(",
++                    "confirm(",
++                    "prompt(",
++                    "eval(",
++                    "function(",
++                    "window.",
++                    "document.",
++                    "top.",
++                    "parent.",
++                    "self.",
++                    "location",
++                    "cookie",
++                    "fetch(",
++                    "import(",
++                )
++            ):
++                return True
++
++        if norm.startswith("data:") or (is_url_attr and not is_safe_http_or_rel and "data:" in norm):
++            if is_dangerous_data_uri(unesc, tag_name, attr_name):
++                return True
++
++    if tag_name == "param" and attr_name in ("value", "src", "data"):
++        norm_v = strip_obfuscation_chars(unesc)
++        if any(k in norm_v for k in ("javascript:", "vbscript:", "data:", ".js", ".swf", ".svg", "<script")):
++            return True
++
++    if tag_name in ("iframe", "frame") and attr_name == "src":
++        norm_v = strip_obfuscation_chars(unesc)
++        if norm_v.endswith((".js", ".vbs", ".svg")):
++            return True
++
++    if tag_name == "use" and attr_name in ("href", "xlink:href"):
++        stripped_v = unesc.strip()
++        if stripped_v and not stripped_v.startswith("#"):
++            return True
++
++    if tag_name == "maction" and attr_name == "actiontype":
++        return True
++
++    return False
++
++
++def normalize_css_for_check(css: str) -> str:
++    """Normalize CSS string by stripping comments, HTML entities, and CSS escapes."""
++    curr = unescape_html_iter(css)
++    for _ in range(5):
++        nxt = re.sub(r"/\*.*?(?:\*/|$)", "", curr, flags=re.DOTALL)
++        if nxt == curr:
++            break
++        curr = nxt
++    curr = decode_css_escapes(curr)
++    curr = unescape_html_iter(curr)
++    for _ in range(3):
++        nxt = re.sub(r"/\*.*?(?:\*/|$)", "", curr, flags=re.DOTALL)
++        if nxt == curr:
++            break
++        curr = nxt
++    return strip_obfuscation_chars(curr)
++
++
++def is_dangerous_css(css: str) -> bool:
++    """Return True if a CSS snippet contains dangerous expressions, URLs, or bindings."""
++    norm = normalize_css_for_check(css)
++    for kw in (
++        "javascript:",
++        "vbscript:",
++        "livescript:",
++        "mocha:",
++        "expression(",
++        "-moz-binding",
++        "behavior:",
++        "@import",
++        "<script",
++        "</script",
++        "</style",
++    ):
++        if kw in norm:
++            return True
++
++    if "data:" in norm:
++        unesc = decode_css_escapes(unescape_html_iter(css))
++        for m in re.finditer(r"url\s*\(\s*(['\"]?)(.*?)\1\s*\)", unesc, re.IGNORECASE | re.DOTALL):
++            u = m.group(2).strip()
++            u_norm = strip_obfuscation_chars(u)
++            if u_norm.startswith("data:") and not SAFE_DATA_IMAGE_RE.match(u):
++                return True
++        cleaned_safe = re.sub(
++            r"url\s*\(\s*['\"]?\s*data:image/(?:png|jpeg|jpg|gif|webp|bmp|x-icon|vnd\.microsoft\.icon|ico|avif)[^)]*\)",
++            "",
++            unesc,
++            flags=re.IGNORECASE,
++        )
++        if "data:" in normalize_css_for_check(cleaned_safe):
++            return True
++
++    return False
++
++
++def split_css_declarations(css: str) -> List[str]:
++    """Split CSS declarations by top-level semicolons (respecting quotes and parens)."""
++    decls = []
++    start = 0
++    depth = 0
++    in_quote: Optional[str] = None
++    i = 0
++    n = len(css)
++    while i < n:
++        ch = css[i]
++        if in_quote:
++            if ch == "\\":
++                i += 2
++                continue
++            if ch == in_quote:
++                in_quote = None
++        else:
++            if ch == "/" and i + 1 < n and css[i + 1] == "*":
++                end_c = css.find("*/", i + 2)
++                i = n if end_c == -1 else end_c + 2
++                continue
++            if ch in ('"', "'"):
++                in_quote = ch
++            elif ch == "(":
++                depth += 1
++            elif ch == ")":
++                depth = max(0, depth - 1)
++            elif ch == ";" and depth == 0:
++                decls.append(css[start:i])
++                start = i + 1
++        i += 1
++    if start < n:
++        decls.append(css[start:n])
++    return decls
++
++
++def sanitize_style_attr_value(val: str) -> Optional[str]:
++    """Sanitize an inline style attribute value."""
++    if not is_dangerous_css(val):
++        return val
++
++    decls = split_css_declarations(val)
++    safe_decls = []
++    for d in decls:
++        if d.strip() and not is_dangerous_css(d):
++            safe_decls.append(d.strip())
++    if not safe_decls:
++        return None
++    res = "; ".join(safe_decls)
++    if is_dangerous_css(res):
++        return None
++    return res
++
++
++def sanitize_style_block_content(css: str) -> str:
++    """Sanitize the inner content of a <style>...</style> element."""
++    html_cleaned = sanitize_html_pass(css, use_rawtext=False)
++    if not is_dangerous_css(html_cleaned):
++        return html_cleaned
++
++    out = []
++    i = 0
++    n = len(html_cleaned)
++    while i < n:
++        ws_start = i
++        while i < n and html_cleaned[i] in WHITESPACE_CHARS:
++            i += 1
++        ws = html_cleaned[ws_start:i]
++        if i >= n:
++            out.append(ws)
++            break
++
++        if html_cleaned[i : i + 2] == "/*":
++            end_c = html_cleaned.find("*/", i + 2)
++            if end_c == -1:
++                break
++            comment = html_cleaned[i : end_c + 2]
++            if not is_dangerous_css(comment):
++                out.append(ws + comment)
++            i = end_c + 2
++            continue
++
++        stmt_start = i
++        depth = 0
++        in_quote: Optional[str] = None
++        found_delim = None
++        while i < n:
++            ch = html_cleaned[i]
++            if in_quote:
++                if ch == "\\":
++                    i += 2
++                    continue
++                if ch == in_quote:
++                    in_quote = None
++            else:
++                if ch == "/" and i + 1 < n and html_cleaned[i + 1] == "*":
++                    end_c = html_cleaned.find("*/", i + 2)
++                    i = n if end_c == -1 else end_c + 2
++                    continue
++                if ch in ('"', "'"):
++                    in_quote = ch
++                elif ch == "(":
++                    depth += 1
++                elif ch == ")":
++                    depth = max(0, depth - 1)
++                elif depth == 0 and ch in ("{", ";"):
++                    found_delim = ch
++                    break
++            i += 1
++
++        if found_delim == ";":
++            stmt = html_cleaned[stmt_start : i + 1]
++            i += 1
++            if not is_dangerous_css(stmt):
++                out.append(ws + stmt)
++        elif found_delim == "{":
++            selector = html_cleaned[stmt_start:i]
++            i += 1
++            body_start = i
++            brace_depth = 1
++            in_q: Optional[str] = None
++            while i < n and brace_depth > 0:
++                ch = html_cleaned[i]
++                if in_q:
++                    if ch == "\\":
++                        i += 2
++                        continue
++                    if ch == in_q:
++                        in_q = None
++                else:
++                    if ch == "/" and i + 1 < n and html_cleaned[i + 1] == "*":
++                        end_c = html_cleaned.find("*/", i + 2)
++                        i = n if end_c == -1 else end_c + 2
++                        continue
++                    if ch in ('"', "'"):
++                        in_q = ch
++                    elif ch == "{":
++                        brace_depth += 1
++                    elif ch == "}":
++                        brace_depth -= 1
++                        if brace_depth == 0:
++                            break
++                i += 1
++            body = html_cleaned[body_start:i]
++            if i < n and html_cleaned[i] == "}":
++                i += 1
++
++            if is_dangerous_css(selector):
++                continue
++
++            if not is_dangerous_css(body):
++                out.append(f"{ws}{selector}{{{body}}}")
++            else:
++                decls = split_css_declarations(body)
++                kept = []
++                for d in decls:
++                    if not d.strip():
++                        continue
++                    if not is_dangerous_css(d):
++                        kept.append(d)
++                if kept:
++                    new_body = ";".join(kept) + (";" if body.rstrip().endswith(";") else "")
++                    if not is_dangerous_css(new_body):
++                        out.append(f"{ws}{selector}{{{new_body}}}")
++        else:
++            tail = html_cleaned[stmt_start:i]
++            if not is_dangerous_css(tail):
++                out.append(ws + tail)
++
++    result = "".join(out)
++    if is_dangerous_css(result):
++        return ""
++    return result
++
++
++def find_script_end(s: str, pos: int, self_closing: bool) -> int:
++    """Find the end offset of a <script> element following HTML5 Script Data state rules."""
++    n = len(s)
++    if self_closing:
++        lower_rem = s[pos:].lower()
++        close_idx = lower_rem.find("</script")
++        open_idx = lower_rem.find("<script")
++        if close_idx == -1 or (open_idx != -1 and open_idx < close_idx):
++            return pos
++
++    escaped = False
++    double_escaped = False
++    i = pos
++    while i < n:
++        if not escaped and s[i : i + 4] == "<!--":
++            escaped = True
++            i += 4
++            continue
++        if escaped and s[i : i + 3] == "-->":
++            escaped = False
++            double_escaped = False
++            i += 3
++            continue
++        if escaped and not double_escaped and s[i : i + 7].lower() == "<script":
++            after = i + 7
++            if after < n and (s[after] in WHITESPACE_CHARS or s[after] in ("/", ">")):
++                double_escaped = True
++                i = after + 1
++                continue
++        if s[i : i + 8].lower() == "</script":
++            after = i + 8
++            if after == n or s[after] in WHITESPACE_CHARS or s[after] in ("/", ">"):
++                if double_escaped:
++                    double_escaped = False
++                    i = after + 1
++                    continue
++                else:
++                    end_pos, _, _ = parse_tag_attributes(s, after)
++                    return end_pos
++        i += 1
++    return n
++
++
++def find_rawtext_end(s: str, pos: int, tag_lower: str) -> Tuple[int, int]:
++    """Find (content_end, elem_end) for HTML5 RAWTEXT/RCDATA elements."""
++    n = len(s)
++    needle = f"</{tag_lower}"
++    tlen = len(needle)
++    i = pos
++    while i < n:
++        idx = s.lower().find(needle, i)
++        if idx == -1:
++            return n, n
++        after = idx + tlen
++        if after == n or s[after] in WHITESPACE_CHARS or s[after] in ("/", ">"):
++            end_pos, _, _ = parse_tag_attributes(s, after)
++            return idx, end_pos
++        i = idx + 1
++    return n, n
++
++
++def parse_tag_attributes(
++    s: str, start_pos: int
++) -> Tuple[int, bool, List[Tuple[int, int, int, str, str, Optional[str], Optional[int], Optional[int]]]]:
++    """Parse attributes of a tag starting after the tag name at `start_pos`."""
++    n = len(s)
++    pos = start_pos
++    self_closing = False
++    attrs = []
++
++    while pos < n:
++        sep_start = pos
++        while pos < n and (s[pos] in WHITESPACE_CHARS or s[pos] == "/"):
++            if s[pos] == "/":
++                if pos + 1 < n and s[pos + 1] == ">":
++                    self_closing = True
++                    return pos + 2, self_closing, attrs
++                if pos + 1 == n:
++                    return n, self_closing, attrs
++            pos += 1
++
++        if pos >= n:
++            return n, self_closing, attrs
++
++        if s[pos] == ">":
++            return pos + 1, self_closing, attrs
++
++        attr_start = pos
++        if s[pos] == "=":
++            pos += 1
++        while pos < n and s[pos] not in WHITESPACE_CHARS and s[pos] not in ("/", "=", ">"):
++            pos += 1
++        raw_name = s[attr_start:pos]
++
++        ws_after_name = pos
++        while pos < n and s[pos] in WHITESPACE_CHARS:
++            pos += 1
++
++        raw_val = ""
++        quote_char: Optional[str] = None
++        val_start: Optional[int] = None
++        val_end: Optional[int] = None
++
++        if pos < n and s[pos] == "=":
++            pos += 1
++            while pos < n and s[pos] in WHITESPACE_CHARS:
++                pos += 1
++            if pos < n and s[pos] in ('"', "'"):
++                quote_char = s[pos]
++                pos += 1
++                val_start = pos
++                end_q = s.find(quote_char, pos)
++                if end_q == -1:
++                    raw_val = s[val_start:n]
++                    val_end = n
++                    pos = n
++                else:
++                    raw_val = s[val_start:end_q]
++                    val_end = end_q
++                    pos = end_q + 1
++            else:
++                val_start = pos
++                while pos < n and s[pos] not in WHITESPACE_CHARS and s[pos] != ">":
++                    if s[pos] == "/" and pos + 1 < n and s[pos + 1] == ">":
++                        break
++                    pos += 1
++                raw_val = s[val_start:pos]
++                val_end = pos
++            attr_end = pos
++        else:
++            pos = ws_after_name
++            attr_end = pos
++
++        attrs.append(
++            (sep_start, attr_start, attr_end, raw_name, raw_val, quote_char, val_start, val_end)
++        )
++
++    return n, self_closing, attrs
++
++
++def should_remove_entire_tag(
++    tag_norm: str,
++    attrs: List[Tuple[int, int, int, str, str, Optional[str], Optional[int], Optional[int]]],
++) -> bool:
++    """Check if the entire element/tag should be removed based on its tag name and attributes."""
++    if tag_norm in PAIRED_REMOVE_TAGS or tag_norm in VOID_REMOVE_TAGS:
++        return True
++    if "script" in tag_norm and tag_norm not in SAFE_SCRIPT_SUBSTRING_TAGS:
++        return True
++
++    attr_map = {}
++    for _, _, _, rname, rval, _, _, _ in attrs:
++        anorm = normalize_attr_name(rname)
++        attr_map[anorm] = rval
++
++    if tag_norm == "meta":
++        heq = strip_obfuscation_chars(unescape_html_iter(attr_map.get("http-equiv", "")))
++        if heq in ("refresh", "set-cookie", "content-security-policy"):
++            return True
++        charset = strip_obfuscation_chars(unescape_html_iter(attr_map.get("charset", "")))
++        if "utf-7" in charset or "utf7" in charset:
++            return True
++        content = unescape_html_iter(attr_map.get("content", ""))
++        norm_c = strip_obfuscation_chars(content)
++        if (
++            "utf-7" in norm_c
++            or (heq and ("url=" in norm_c or "data:" in norm_c))
++            or "url=data:" in norm_c
++            or any(sc in norm_c for sc in DANGEROUS_SCHEMES)
++            or "<script" in norm_c
++        ):
++            return True
++
++    if tag_norm == "base":
++        if "href" in attr_map:
++            href_val = attr_map["href"]
++            if is_dangerous_attr_value("base", "href", href_val):
++                return True
++
++    if tag_norm == "link":
++        rel = strip_obfuscation_chars(unescape_html_iter(attr_map.get("rel", "")))
++        as_val = strip_obfuscation_chars(unescape_html_iter(attr_map.get("as", "")))
++        if "import" in rel or as_val in ("script", "worker", "embed", "object"):
++            return True
++        if "href" in attr_map and is_dangerous_attr_value("link", "href", attr_map["href"]):
++            return True
++
++    if tag_norm in SVG_ANIMATION_TAGS:
++        target = normalize_attr_name(attr_map.get("attributename", ""))
++        if target.startswith("on") or target in DANGEROUS_ANIM_TARGETS:
++            return True
++        for _, _, _, rname, rval, _, _, _ in attrs:
++            anorm = normalize_attr_name(rname)
++            if is_dangerous_attr_name(rname) or is_dangerous_attr_value(tag_norm, anorm, rval):
++                return True
++
++    if tag_norm == "param":
++        for _, _, _, rname, rval, _, _, _ in attrs:
++            anorm = normalize_attr_name(rname)
++            if is_dangerous_attr_value("param", anorm, rval):
++                return True
++
++    return False
++
++
++def sanitize_start_tag_string(
++    tag_str: str,
++    tag_norm: str,
++    attrs: List[Tuple[int, int, int, str, str, Optional[str], Optional[int], Optional[int]]],
++    tag_start_offset: int,
++) -> str:
++    """Apply surgical edits inside a single start tag string for any dangerous attributes."""
++    edits: List[Tuple[int, int, str]] = []
++
++    for sep_start, attr_start, attr_end, rname, rval, quote_char, val_start, val_end in attrs:
++        local_sep = sep_start - tag_start_offset
++        local_end = attr_end - tag_start_offset
++        anorm = normalize_attr_name(rname)
++
++        remove_attr = False
++        replacement_attr_val: Optional[str] = None
++
++        if is_dangerous_attr_name(rname):
++            remove_attr = True
++        elif anorm == "srcdoc":
++            unesc_doc = html.unescape(rval)
++            cleaned_doc = sanitize_html(unesc_doc)
++            if not cleaned_doc.strip():
++                remove_attr = True
++            elif cleaned_doc != unesc_doc:
++                replacement_attr_val = html.escape(cleaned_doc, quote=True)
++        elif anorm == "style":
++            cleaned_style = sanitize_style_attr_value(rval)
++            if cleaned_style is None:
++                remove_attr = True
++            elif cleaned_style != rval:
++                replacement_attr_val = cleaned_style
++        elif is_dangerous_attr_value(tag_norm, anorm, rval):
++            remove_attr = True
++
++        if remove_attr:
++            edits.append((local_sep, local_end, ""))
++        elif replacement_attr_val is not None and val_start is not None and val_end is not None:
++            l_vstart = val_start - tag_start_offset
++            l_vend = val_end - tag_start_offset
++            if quote_char is not None:
++                edits.append((l_vstart, l_vend, replacement_attr_val))
++            else:
++                edits.append((l_vstart, l_vend, f'"{replacement_attr_val}"'))
++
++    if not edits:
++        return tag_str
++
++    edits.sort(key=lambda x: x[0])
++    merged: List[Tuple[int, int, str]] = []
++    for s_idx, e_idx, rep in edits:
++        if merged and merged[-1][2] == "" and rep == "" and merged[-1][1] == s_idx:
++            merged[-1] = (merged[-1][0], e_idx, "")
++        else:
++            merged.append((s_idx, e_idx, rep))
++
++    out_parts = []
++    last = 0
++    tlen = len(tag_str)
++    for s_idx, e_idx, rep in merged:
++        out_parts.append(tag_str[last:s_idx])
++        if rep == "":
++            prev_ch = tag_str[s_idx - 1] if s_idx > 0 else " "
++            next_ch = tag_str[e_idx] if e_idx < tlen else ">"
++            if (
++                prev_ch not in WHITESPACE_CHARS
++                and next_ch not in WHITESPACE_CHARS
++                and next_ch not in (">", "/")
++            ):
++                out_parts.append(" ")
++        else:
++            out_parts.append(rep)
++        last = e_idx
++    out_parts.append(tag_str[last:])
++    return "".join(out_parts)
++
++
++def sanitize_html_pass(s: str, use_rawtext: bool = True) -> str:
++    """Perform a single HTML5 tokenization and surgical removal pass."""
++    n = len(s)
++    edits: List[Tuple[int, int, str]] = []
++    i = 0
++
++    while i < n:
++        lt = s.find("<", i)
++        if lt == -1:
++            break
++        i = lt
++        if i + 1 >= n:
++            break
++
++        nxt = s[i + 1]
++
++        # 1. Markup declaration / Comment / DOCTYPE / CDATA: <!
++        if nxt == "!":
++            if s[i : i + 4] == "<!--":
++                if s[i : i + 5] == "<!-->":
++                    edits.append((i, i + 5, ""))
++                    i += 5
++                    continue
++                if s[i : i + 6] == "<!--->":
++                    edits.append((i, i + 6, ""))
++                    i += 6
++                    continue
++                end_std = s.find("-->", i + 4)
++                end_bang = s.find("--!>", i + 4)
++                if end_std == -1 and end_bang == -1:
++                    edits.append((i, n, ""))
++                    i = n
++                    continue
++                if end_bang != -1 and (end_std == -1 or end_bang < end_std):
++                    c_end = end_bang + 4
++                    is_bang_closed = True
++                else:
++                    c_end = end_std + 3
++                    is_bang_closed = False
++
++                comment_body = unescape_html_iter(s[i + 4 : c_end]).lower()
++                if (
++                    is_bang_closed
++                    or "<script" in comment_body
++                    or "</script" in comment_body
++                    or "javascript:" in comment_body
++                    or "vbscript:" in comment_body
++                    or "[if" in comment_body
++                    or "endif" in comment_body
++                ):
++                    edits.append((i, c_end, ""))
++                i = c_end
++                continue
++
++            if s[i : i + 9].upper() == "<!DOCTYPE":
++                gt = s.find(">", i + 9)
++                c_end = n if gt == -1 else gt + 1
++                doc_body = unescape_html_iter(s[i:c_end]).lower()
++                if (
++                    "<script" in doc_body
++                    or "javascript:" in doc_body
++                    or "vbscript:" in doc_body
++                    or "entity" in doc_body
++                    or "<!doctype" != doc_body[:9]
++                ):
++                    edits.append((i, c_end, ""))
++                i = c_end
++                continue
++
++            gt = s.find(">", i + 2)
++            c_end = n if gt == -1 else gt + 1
++            edits.append((i, c_end, ""))
++            i = c_end
++            continue
++
++        # 2. Processing instruction / Bogus comment: <?
++        if nxt == "?":
++            gt = s.find(">", i + 2)
++            c_end = n if gt == -1 else gt + 1
++            pi_body = unescape_html_iter(s[i:c_end]).lower()
++            if any(k in pi_body for k in ("script", "javascript:", "vbscript:", "import", "stylesheet", "<", "on")):
++                edits.append((i, c_end, ""))
++            i = c_end
++            continue
++
++        # 3. End tag: </
++        if nxt == "/":
++            if i + 2 < n and s[i + 2] == ">":
++                edits.append((i, i + 3, ""))
++                i += 3
++                continue
++            if i + 2 < n and s[i + 2].isalpha():
++                p = i + 2
++                while p < n and s[p] not in WHITESPACE_CHARS and s[p] not in ("/", ">"):
++                    p += 1
++                raw_ename = s[i + 2 : p]
++                enorm = normalize_tag_name(raw_ename)
++                tag_end, _, e_attrs = parse_tag_attributes(s, p)
++                if (
++                    enorm in PAIRED_REMOVE_TAGS
++                    or enorm in VOID_REMOVE_TAGS
++                    or ("script" in enorm and enorm not in SAFE_SCRIPT_SUBSTRING_TAGS)
++                ):
++                    edits.append((i, tag_end, ""))
++                elif e_attrs:
++                    edits.append((i, tag_end, f"</{raw_ename}>"))
++                i = tag_end
++                continue
++            else:
++                gt = s.find(">", i + 2)
++                c_end = n if gt == -1 else gt + 1
++                edits.append((i, c_end, ""))
++                i = c_end
++                continue
++
++        # 4. Start tag: <[a-zA-Z]
++        if nxt.isalpha():
++            p = i + 1
++            while p < n and s[p] not in WHITESPACE_CHARS and s[p] not in ("/", ">"):
++                p += 1
++            raw_tname = s[i + 1 : p]
++            tnorm = normalize_tag_name(raw_tname)
++            tag_end, self_closing, attrs = parse_tag_attributes(s, p)
++
++            if tnorm == "script" or (
++                "script" in tnorm and tnorm not in SAFE_SCRIPT_SUBSTRING_TAGS
++            ):
++                elem_end = find_script_end(s, tag_end, self_closing)
++                edits.append((i, elem_end, ""))
++                i = elem_end
++                continue
++
++            if tnorm in PAIRED_REMOVE_TAGS:
++                if self_closing:
++                    edits.append((i, tag_end, ""))
++                    i = tag_end
++                else:
++                    _, elem_end = find_rawtext_end(s, tag_end, tnorm)
++                    edits.append((i, elem_end, ""))
++                    i = elem_end
++                continue
++
++            if should_remove_entire_tag(tnorm, attrs):
++                edits.append((i, tag_end, ""))
++                i = tag_end
++                continue
++
++            orig_tag_str = s[i:tag_end]
++            new_tag_str = sanitize_start_tag_string(orig_tag_str, tnorm, attrs, i)
++            if new_tag_str != orig_tag_str:
++                edits.append((i, tag_end, new_tag_str))
++
++            if tnorm == "style" and not self_closing:
++                content_end, _ = find_rawtext_end(s, tag_end, "style")
++                style_body = s[tag_end:content_end]
++                new_style_body = sanitize_style_block_content(style_body)
++                if new_style_body != style_body:
++                    edits.append((tag_end, content_end, new_style_body))
++                i = content_end
++                continue
++
++            if use_rawtext and tnorm in RAWTEXT_RCDATA_TAGS and not self_closing:
++                content_end, _ = find_rawtext_end(s, tag_end, tnorm)
++                inner = s[tag_end:content_end]
++                new_inner = sanitize_html_pass(inner, use_rawtext=False)
++                if new_inner != inner:
++                    edits.append((tag_end, content_end, new_inner))
++                i = content_end
++                continue
++
++            i = tag_end
++            continue
++
++        i += 1
++
++    if not edits:
++        return s
++
++    out = []
++    last = 0
++    for s_idx, e_idx, rep in edits:
++        if s_idx < last:
++            continue
++        out.append(s[last:s_idx])
++        out.append(rep)
++        last = e_idx
++    out.append(s[last:])
++    return "".join(out)
++
++
++def sanitize_html(html_content: str) -> str:
++    """Iteratively sanitize HTML until a fixed point is reached across both parser modes."""
++    curr = html_content
++    for _ in range(50):
++        after_rawtext = sanitize_html_pass(curr, use_rawtext=True)
++        after_data = sanitize_html_pass(after_rawtext, use_rawtext=False)
++        if after_data == curr:
++            break
++        curr = after_data
++    return curr
++
++
++def filter_file(filepath: str) -> None:
++    """Read an HTML file, remove all JavaScript in-place, and preserve formatting."""
++    with open(filepath, "rb") as f:
++        raw_bytes = f.read()
++
++    encoding = "utf-8"
++    try:
++        content = raw_bytes.decode("utf-8")
++    except UnicodeDecodeError:
++        encoding = "latin-1"
++        content = raw_bytes.decode("latin-1")
++
++    filtered = sanitize_html(content)
++
++    with open(filepath, "wb") as f:
++        f.write(filtered.encode(encoding))
++
++
++def main() -> None:
++    if len(sys.argv) < 2:
++        sys.exit(1)
++    filter_file(sys.argv[1])
++
++
++if __name__ == "__main__":
++    main()

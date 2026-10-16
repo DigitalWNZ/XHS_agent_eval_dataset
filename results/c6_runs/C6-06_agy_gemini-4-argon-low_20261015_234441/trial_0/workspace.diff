@@ -1,0 +1,74 @@
+diff --git a/run.py b/run.py
+new file mode 100644
+--- /dev/null
++++ b/run.py
+@@ -0,0 +1,69 @@
++import asyncio
++import signal
++import threading
++from collections.abc import Awaitable, Callable
++
++
++async def run_tasks(
++    tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int
++) -> None:
++    if not tasks:
++        return
++    if max_concurrent <= 0:
++        raise ValueError("max_concurrent must be greater than 0")
++
++    loop = asyncio.get_running_loop()
++    current_task = asyncio.current_task()
++    interrupted = False
++    prev_handler = None
++    installed_handler = False
++
++    if (
++        threading.current_thread() is threading.main_thread()
++        and signal.getsignal(signal.SIGINT) is signal.default_int_handler
++    ):
++
++        def _on_sigint(signum, frame):
++            nonlocal interrupted
++            if (
++                not interrupted
++                and current_task is not None
++                and not current_task.done()
++            ):
++                interrupted = True
++                current_task.cancel()
++                loop.call_soon_threadsafe(lambda: None)
++                return
++            raise KeyboardInterrupt()
++
++        try:
++            prev_handler = signal.signal(signal.SIGINT, _on_sigint)
++            installed_handler = True
++        except ValueError:
++            pass
++
++    semaphore = asyncio.Semaphore(max_concurrent)
++
++    async def _run_one(task_fn: Callable[[], Awaitable[None]]) -> None:
++        async with semaphore:
++            await task_fn()
++
++    running_tasks = [asyncio.create_task(_run_one(t)) for t in tasks]
++
++    try:
++        await asyncio.gather(*running_tasks)
++    except BaseException:
++        for t in running_tasks:
++            if not t.done() and not t.cancelling():
++                t.cancel()
++        await asyncio.gather(*running_tasks, return_exceptions=True)
++        if interrupted and current_task is not None:
++            if current_task.uncancel() == 0:
++                raise KeyboardInterrupt()
++        raise
++    finally:
++        if installed_handler:
++            try:
++                signal.signal(signal.SIGINT, prev_handler)
++            except ValueError:
++                pass

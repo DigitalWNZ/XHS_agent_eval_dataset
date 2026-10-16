@@ -1,0 +1,66 @@
+# C9 campaign report (runs ≥ 20261015_234242, < 20261015_234454)
+
+6 trials, 2 setups, rubric v3.0. **D1** = pass rate on the source benchmark's hidden tests (cell tier snapped to 100/67/33/0). **D2** = code quality from the LLM judge (Claude Opus 5.5): Readability, Maintainability, Robustness + 1–2 case items, perfect 1 / accept 0.6 / bad 0, quality = 100 × mean. D1 and D2 are not combined. Trials with no code change cannot be judged (na) and are excluded from D2.
+
+## Per case (passes/trials · D2 quality)
+
+| Case | Former ID | Task | gemini-4-argon-low | gemini-4-argon-medium |
+|---|---|---|---|---|
+| C9-01 | None | Customer-provided / 潮玩零售店工作台（单文件 HTML：商品、订单、售后） | 3/3 · 63 | 0/3 · 48 ∅2 |
+
+∅n = n trials ended with no code change (all were agent timeouts); ⚠n = invalid (validity audit).
+
+## Per model
+
+| Model | Trials | Passes | Pass rate | D1 (mean case tier) | D2 quality (graded trials) | No-code trials | Timeouts | Invalid |
+|---|---|---|---|---|---|---|---|---|
+| gemini-4-argon-low | 3 | 3 | 100% | 100 | 63 (n=3) | 0 | 0 | 0 |
+| gemini-4-argon-medium | 3 | 0 | 0% | 0 | 48 (n=1) | 2 | 1 | 0 |
+
+## Run metrics per model (mean per trial)
+
+Agent time = wall time of the agent run (capped by the budget). Tool calls are counted from the trajectory. Tokens = input + output as reported by the agent CLI; agy reports no usage when it hits its time budget, so for those trials the per-step usage in the saved trajectory is summed (marked * in the per-trial table; only available for runs after the partial-trajectory fix). Turns: Claude Code reports turns; agy always reports 1 per session, so use tool calls to compare.
+
+| Model | Agent time (min) | Tool calls | Tokens (K) | Turns (Claude) | Cost USD (Claude, total) |
+|---|---|---|---|---|---|
+| gemini-4-argon-low | 10 | 6 | 141 | — | — |
+| gemini-4-argon-medium | 47 | 9 | 151 | — | — |
+
+## Run metrics per case (mean per trial: agent time min · tool calls · tokens K)
+
+Same definitions as above, averaged over the trials of one case and model (— = no data, e.g. agy timeouts before the partial-trajectory fix).
+
+| Case | Task | gemini-4-argon-low | gemini-4-argon-medium |
+|---|---|---|---|
+| C9-01 | Customer-provided / 潮玩零售店工作台（单文件 HTML：商品、订单、售 | 9.8 · 6 · 141 | 47 · 9 · 151 |
+
+## D2 item scores per model (mean over judged items, 0–100)
+
+| Model | Readability | Maintainability | Robustness | Case-specific | Quality |
+|---|---|---|---|---|---|
+| gemini-4-argon-low | 73 | 60 | 60 | 60 | 63 |
+| gemini-4-argon-medium | 60 | 0 | 60 | 60 | 48 |
+
+## Quality among passing vs failing trials
+
+| Model | D2 on passing trials | D2 on failing trials (with code) |
+|---|---|---|
+| gemini-4-argon-low | 63 | — |
+| gemini-4-argon-medium | — | 48 |
+
+## Validity findings
+
+none
+
+## Per trial
+
+Item levels: P = perfect (100), A = accept (60), B = bad (0), – = not applicable. Read / Maint / Robust = the 3 common items; Case = the case-specific item(s) in order.
+
+| Case | Model | Trial | Pass | Score | D2 | Read | Maint | Robust | Case | Time (min) | Tool calls | Tokens (K) | Notes | Verifier reason |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| C9-01 | gemini-4-argon-low | 0 | ✅ | 1 | 60 | A | A | A | A,A | 11 | 7 | 206 |  | all 25 tests passed |
+| C9-01 | gemini-4-argon-low | 0 | ✅ | 1 | 60 | A | A | A | A,A | 9 | 6 | 88 |  | all 25 tests passed |
+| C9-01 | gemini-4-argon-low | 0 | ✅ | 1 | 68 | P | A | A | A,A | 9 | 6 | 130 |  | all 25 tests passed |
+| C9-01 | gemini-4-argon-medium | 0 | ❌ | 0 | — | – | – | – | –,– | 60 | 2 | 25* | timeout, no code | test_outputs.py::test_single_self_contained_file: failed |
+| C9-01 | gemini-4-argon-medium | 0 | ❌ | 0 | 48 | A | B | A | A,A | 25 | 24 | 401 |  | test_outputs.py::test_seed_products_and_orders: The test failed in the call phase due to a |
+| C9-01 | gemini-4-argon-medium | 0 | ❌ | 0 | — | – | – | – | –,– | 57 | 2 | 27 | no code | test_outputs.py::test_single_self_contained_file: failed |

@@ -1,0 +1,347 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,342 @@
++#!/usr/bin/env python3
++"""HTML XSS / JavaScript filter.
++
++Takes an HTML file path as argv[1] and modifies it in-place to remove
++all JavaScript and XSS vectors while preserving legitimate HTML structure,
++content, and formatting.
++"""
++
++import html
++import re
++import sys
++from urllib.parse import unquote
++import bs4
++from bs4 import BeautifulSoup, Comment
++from bs4.builder._htmlparser import HTMLParserTreeBuilder
++from bs4.dammit import EntitySubstitution
++from bs4.formatter import HTMLFormatter
++
++
++# Prevent BeautifulSoup from adding an extra newline after <!DOCTYPE ...>
++bs4.element.Doctype.SUFFIX = ">"
++
++
++class _UniversalSet(set):
++    """Set that claims membership for all items so BeautifulSoup preserves all whitespace."""
++
++    def __contains__(self, item: object) -> bool:
++        return True
++
++
++class PreserveWhitespaceBuilder(HTMLParserTreeBuilder):
++    """HTMLParser tree builder that preserves all whitespace and indentation."""
++
++    DEFAULT_PRESERVE_WHITESPACE_TAGS = _UniversalSet()
++
++    def initialize_soup(self, soup: BeautifulSoup) -> None:
++        super().initialize_soup(soup)
++        soup.preserve_whitespace_tag_stack.append(soup)
++
++
++class PreserveOrderFormatter(HTMLFormatter):
++    """Formatter that preserves attribute ordering and standard HTML5 void tags."""
++
++    def __init__(self) -> None:
++        super().__init__(
++            entity_substitution=EntitySubstitution.substitute_xml,
++            void_element_close_prefix="",
++        )
++
++    def attributes(self, tag: bs4.element.Tag):
++        if tag.attrs is None:
++            return []
++        return [
++            (k, (None if self.empty_attributes_are_booleans and v == "" else v))
++            for k, v in tag.attrs.items()
++        ]
++
++
++# Dangerous tags whose entire element (including content) should be removed
++DANGEROUS_TAGS = {
++    "script",
++    "noscript",
++    "iframe",
++    "frame",
++    "frameset",
++    "object",
++    "embed",
++    "applet",
++    "base",
++    "portal",
++}
++
++# Dangerous attributes that can execute JS directly
++DANGEROUS_ATTRS = {
++    "srcdoc",
++    "formaction",
++    "xlink:href",
++}
++
++# SVG animation / event attributes that can trigger XSS without "on*" prefix
++SVG_DANGEROUS_ATTRS = {
++    "attributename",
++    "values",
++    "from",
++    "to",
++    "by",
++}
++
++# Attributes that hold URLs or URI-like values
++URI_ATTRS = {
++    "href",
++    "src",
++    "action",
++    "formaction",
++    "data",
++    "poster",
++    "background",
++    "cite",
++    "codebase",
++    "longdesc",
++    "profile",
++    "usemap",
++    "dynsrc",
++    "lowsrc",
++    "xlink:href",
++}
++
++# Regex for control characters / whitespace obfuscation inside schemes
++_CTRL_WS_RE = re.compile(r"[\x00-\x20\x7f]+")
++
++# Regex for dangerous schemes after normalization
++_DANGEROUS_SCHEME_RE = re.compile(
++    r"^\s*(?:javascript|vbscript|livescript|mocha)\s*:",
++    re.IGNORECASE,
++)
++
++# Regex for dangerous data: URIs (allow safe image/* except image/svg+xml)
++_DATA_SCHEME_RE = re.compile(r"^\s*data\s*:", re.IGNORECASE)
++_SAFE_DATA_IMAGE_RE = re.compile(
++    r"^\s*data\s*:\s*image/(?:png|jpeg|jpg|gif|webp|bmp|x-icon|vnd\.microsoft\.icon)\s*[;,]",
++    re.IGNORECASE,
++)
++
++# CSS dangerous patterns
++_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
++_CSS_DANGEROUS_RE = re.compile(
++    r"(?:expression\s*\(|"
++    r"(?:javascript|vbscript|livescript|mocha)\s*:|"
++    r"-moz-binding\s*:|"
++    r"behavior\s*:|"
++    r"@import)",
++    re.IGNORECASE,
++)
++
++
++def _normalize_value(val: str) -> str:
++    """Decode HTML entities, URL encoding, CSS escapes, and strip control/whitespace chars."""
++    if not val:
++        return ""
++    prev = None
++    cur = val
++    for _ in range(5):
++        if cur == prev:
++            break
++        prev = cur
++        cur = html.unescape(cur)
++        try:
++            cur = unquote(cur)
++        except Exception:
++            pass
++    cur = _CTRL_WS_RE.sub("", cur)
++    return cur.lower()
++
++
++def is_dangerous_uri(val: str) -> bool:
++    """Return True if an attribute value contains a dangerous URI scheme."""
++    if not val:
++        return False
++    norm = _normalize_value(val)
++    if _DANGEROUS_SCHEME_RE.match(norm):
++        return True
++    if _DATA_SCHEME_RE.match(norm):
++        if not _SAFE_DATA_IMAGE_RE.match(norm):
++            return True
++    if "javascript:" in norm or "vbscript:" in norm:
++        return True
++    return False
++
++
++def sanitize_css(css_text: str) -> str:
++    """Sanitize CSS text (either inside <style> or style attribute)."""
++    if not css_text:
++        return css_text
++    no_comments = _CSS_COMMENT_RE.sub("", css_text)
++    unescaped = html.unescape(no_comments)
++    unescaped_css = re.sub(
++        r"\\([0-9a-fA-F]{1,6})\s?",
++        lambda m: chr(int(m.group(1), 16)) if int(m.group(1), 16) < 0x110000 else "",
++        unescaped,
++    )
++    unescaped_css = unescaped_css.replace("\\", "")
++    if _CSS_DANGEROUS_RE.search(unescaped_css) or _CSS_DANGEROUS_RE.search(
++        _normalize_value(unescaped_css)
++    ):
++        return ""
++    return css_text
++
++
++def sanitize_soup(soup: BeautifulSoup) -> None:
++    """Remove JavaScript and XSS vectors from a BeautifulSoup tree in-place."""
++    # Remove HTML comments (prevents IE conditional comments & comment breakout mXSS)
++    for comment in list(soup.find_all(string=lambda t: isinstance(t, Comment))):
++        comment.extract()
++
++    for tag in list(soup.find_all(True)):
++        if tag.name is None:
++            continue
++        tag_name = tag.name.lower()
++
++        if tag_name in DANGEROUS_TAGS or tag_name.endswith(":script"):
++            tag.decompose()
++            continue
++
++        if tag_name in {
++            "animate",
++            "animatetransform",
++            "animatemotion",
++            "set",
++            "foreignobject",
++            "handler",
++            "listener",
++        }:
++            tag.decompose()
++            continue
++
++        if tag_name == "meta":
++            http_equiv = tag.get("http-equiv", "")
++            if isinstance(http_equiv, list):
++                http_equiv = " ".join(http_equiv)
++            content = tag.get("content", "")
++            if isinstance(content, list):
++                content = " ".join(content)
++            if (
++                "refresh" in str(http_equiv).lower()
++                or "set-cookie" in str(http_equiv).lower()
++            ):
++                tag.decompose()
++                continue
++            if is_dangerous_uri(str(content)) or "url=" in _normalize_value(str(content)):
++                tag.decompose()
++                continue
++
++        if tag_name == "link":
++            rel = tag.get("rel", [])
++            if isinstance(rel, str):
++                rel_list = [rel.lower()]
++            else:
++                rel_list = [r.lower() for r in rel]
++            if any(
++                r in {"import", "preload", "modulepreload", "prefetch"}
++                for r in rel_list
++            ):
++                tag.decompose()
++                continue
++
++        if tag_name == "style":
++            if tag.string is not None:
++                cleaned = sanitize_css(str(tag.string))
++                if not cleaned and str(tag.string).strip():
++                    tag.decompose()
++                    continue
++                elif cleaned != str(tag.string):
++                    tag.string.replace_with(cleaned)
++            else:
++                full_css = tag.get_text()
++                if sanitize_css(full_css) == "" and full_css.strip() != "":
++                    tag.decompose()
++                    continue
++
++        attrs = dict(tag.attrs) if tag.attrs else {}
++        for attr_name, attr_val in attrs.items():
++            attr_lower = attr_name.lower().strip()
++            attr_clean = _CTRL_WS_RE.sub("", attr_lower)
++
++            if attr_clean.startswith("on") or attr_lower.startswith("on"):
++                del tag.attrs[attr_name]
++                continue
++
++            if attr_clean in DANGEROUS_ATTRS or attr_clean in SVG_DANGEROUS_ATTRS:
++                del tag.attrs[attr_name]
++                continue
++
++            if isinstance(attr_val, list):
++                val_str = " ".join(str(v) for v in attr_val)
++            else:
++                val_str = str(attr_val) if attr_val is not None else ""
++
++            if attr_clean == "style":
++                cleaned_style = sanitize_css(val_str)
++                if not cleaned_style:
++                    del tag.attrs[attr_name]
++                elif cleaned_style != val_str:
++                    tag.attrs[attr_name] = cleaned_style
++                continue
++
++            if attr_clean in URI_ATTRS or is_dangerous_uri(val_str):
++                if is_dangerous_uri(val_str):
++                    del tag.attrs[attr_name]
++                    continue
++
++
++_RAW_SCRIPT_TAG_RE = re.compile(
++    r"<\s*script\b[^>]*>.*?</\s*script\b[^>]*>|<\s*/?\s*script\b[^>]*>",
++    re.IGNORECASE | re.DOTALL,
++)
++_RAW_EVENT_ATTR_RE = re.compile(
++    r"""(?<=\s)on[a-z0-9_:-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"']+)""",
++    re.IGNORECASE,
++)
++_RAW_JS_URI_RE = re.compile(
++    r"""(?:j[\s\x00-\x20]*a[\s\x00-\x20]*v[\s\x00-\x20]*a[\s\x00-\x20]*s[\s\x00-\x20]*c[\s\x00-\x20]*r[\s\x00-\x20]*i[\s\x00-\x20]*p[\s\x00-\x20]*t|v[\s\x00-\x20]*b[\s\x00-\x20]*s[\s\x00-\x20]*c[\s\x00-\x20]*r[\s\x00-\x20]*i[\s\x00-\x20]*p[\s\x00-\x20]*t)\s*:""",
++    re.IGNORECASE,
++)
++
++
++def filter_html(content: str) -> str:
++    """Filter JavaScript and XSS payloads from HTML string while preserving formatting."""
++    content = content.replace("\x00", "")
++    formatter = PreserveOrderFormatter()
++
++    prev = None
++    cur = content
++    for _ in range(3):
++        if cur == prev:
++            break
++        prev = cur
++        soup = BeautifulSoup(cur, builder=PreserveWhitespaceBuilder())
++        sanitize_soup(soup)
++        cur = soup.decode(formatter=formatter)
++
++    cur = _RAW_SCRIPT_TAG_RE.sub("", cur)
++    cur = _RAW_EVENT_ATTR_RE.sub("", cur)
++    cur = _RAW_JS_URI_RE.sub("blocked:", cur)
++
++    return cur
++
++
++def main() -> None:
++    if len(sys.argv) < 2:
++        sys.exit(1)
++    filepath = sys.argv[1]
++    with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as f:
++        content = f.read()
++
++    filtered = filter_html(content)
++
++    with open(filepath, "w", encoding="utf-8", errors="surrogateescape") as f:
++        f.write(filtered)
++
++
++if __name__ == "__main__":
++    main()

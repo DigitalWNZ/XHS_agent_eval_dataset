@@ -1,0 +1,367 @@
+diff --git a/filter.py b/filter.py
+new file mode 100644
+--- /dev/null
++++ b/filter.py
+@@ -0,0 +1,362 @@
++#!/usr/bin/env python3
++"""HTML XSS / JavaScript filter.
++
++Usage:
++    python3 /app/filter.py <html_file>
++
++Modifies <html_file> in-place to remove JavaScript and prevent XSS attacks
++while preserving legitimate HTML structure, formatting, tables, headers, and
++non-dangerous attributes.
++"""
++
++import html
++import re
++import sys
++from urllib.parse import unquote
++from bs4 import BeautifulSoup, Comment, Declaration, Doctype, ProcessingInstruction
++from bs4.builder._htmlparser import HTMLParserTreeBuilder
++from bs4.dammit import EntitySubstitution
++from bs4.formatter import HTMLFormatter
++
++# Prevent BeautifulSoup from inserting an extra newline after <!DOCTYPE ...>
++Doctype.SUFFIX = ">"
++
++
++class _AllWhitespaceSet(set):
++    """Set that contains everything so BeautifulSoup preserves original whitespace/indentation."""
++
++    def __contains__(self, item: object) -> bool:
++        return True
++
++
++class _PreserveOrderHTMLFormatter(HTMLFormatter):
++    """HTMLFormatter that preserves original attribute order and minimal entity substitution."""
++
++    def __init__(self) -> None:
++        super().__init__(
++            entity_substitution=EntitySubstitution.substitute_xml,
++            void_element_close_prefix="",
++            empty_attributes_are_booleans=False,
++        )
++
++    def attributes(self, tag):
++        if tag.attrs is None:
++            return []
++        return list(tag.attrs.items())
++
++# Tags to remove completely (including their contents) because they execute scripts,
++# load active/executable plugins or external documents, or change base URLs / meta refresh.
++REMOVE_WITH_CONTENT_TAGS = {
++    "script",
++    "applet",
++    "object",
++    "embed",
++    "iframe",
++    "frame",
++    "frameset",
++    "base",
++    "basefont",
++    "bgsound",
++    "keygen",
++    "portal",
++}
++
++# Tags whose wrapper should be unwrapped so their inner content is not parsed as rawtext
++# or noscript/template fallback that could hide or mutate payloads, while keeping safe text/elements.
++UNWRAP_TAGS = {
++    "noscript",
++    "noembed",
++    "noframes",
++    "template",
++}
++
++# Rawtext tags whose content might contain unparsed HTML tags (mXSS vectors when serialized).
++RAWTEXT_TAGS = {
++    "textarea",
++    "title",
++    "xmp",
++    "plaintext",
++    "listing",
++}
++
++# Attributes that can contain URLs or navigation targets.
++URL_ATTRIBUTES = {
++    "href",
++    "src",
++    "action",
++    "formaction",
++    "xlink:href",
++    "data",
++    "poster",
++    "background",
++    "cite",
++    "code",
++    "codebase",
++    "archive",
++    "usemap",
++    "longdesc",
++    "dynsrc",
++    "lowsrc",
++    " icon",
++    "icon",
++    "manifest",
++    " ping",
++    "ping",
++    " to",
++    "to",
++    "from",
++    "by",
++    "values",
++}
++
++# Attributes that directly execute or enable scripts/dangerous behavior regardless of value.
++ALWAYS_DANGEROUS_ATTRS = {
++    "srcdoc",
++    "fscommand",
++    "seeksegmenttime",
++    "autofocus",
++    "onload",
++    "onerror",
++}
++
++# Control characters and whitespace frequently used to obfuscate schemes like `java\tscript:`.
++CONTROL_AND_SPACE_RE = re.compile(r"[\x00-\x20\x7f]+")
++
++# Dangerous CSS patterns (IE expression, javascript/vbscript in url, -moz-binding, behavior, @import).
++DANGEROUS_CSS_RE = re.compile(
++    r"(expression\s*\(|javascript\s*:|vbscript\s*:|livescript\s*:|mocha\s*:|"
++    r"behavior\s*:|-moz-binding\s*:|@import|\bdata\s*:[^,]*script)",
++    re.IGNORECASE,
++)
++
++
++def _normalize_for_scheme_check(value: str) -> str:
++    """Decode HTML entities and URL-encoding repeatedly and strip control/whitespace chars."""
++    prev = None
++    curr = value
++    for _ in range(5):
++        if curr == prev:
++            break
++        prev = curr
++        curr = html.unescape(curr)
++        try:
++            curr = unquote(curr)
++        except Exception:
++            pass
++    curr = CONTROL_AND_SPACE_RE.sub("", curr).lower()
++    return curr
++
++
++def is_dangerous_url(value: str) -> bool:
++    """Return True if a URL/attribute value uses a dangerous scheme (javascript:, vbscript:, etc.)."""
++    norm = _normalize_for_scheme_check(value)
++    dangerous_schemes = (
++        "javascript:",
++        "vbscript:",
++        "livescript:",
++        "mocha:",
++        "jar:",
++        "mhtml:",
++        "wyciwyg:",
++    )
++    if norm.startswith(dangerous_schemes):
++        return True
++    if norm.startswith("data:"):
++        # Allow safe image data URIs (except svg+xml which can contain script)
++        if norm.startswith(
++            (
++                "data:image/png",
++                "data:image/jpeg",
++                "data:image/jpg",
++                "data:image/gif",
++                "data:image/webp",
++                "data:image/bmp",
++                "data:image/x-icon",
++            )
++        ):
++            return False
++        return True
++    return False
++
++
++def is_dangerous_style(value: str) -> bool:
++    """Return True if a CSS style string contains script execution vectors."""
++    # Strip CSS comments /* ... */ and decode CSS backslash escapes
++    cleaned = re.sub(r"/\*.*?\*/", "", value, flags=re.DOTALL)
++    # Decode CSS hex escapes like \65 xpression
++    def _replace_css_escape(match: re.Match) -> str:
++        try:
++            code = int(match.group(1), 16)
++            return chr(code) if 0 < code < 0x110000 else ""
++        except ValueError:
++            return ""
++
++    cleaned = re.sub(r"\\([0-9a-fA-F]{1,6})\s?", _replace_css_escape, cleaned)
++    cleaned = cleaned.replace("\\", "")
++    cleaned = html.unescape(cleaned)
++    cleaned_nospace = CONTROL_AND_SPACE_RE.sub("", cleaned)
++    return bool(DANGEROUS_CSS_RE.search(cleaned) or DANGEROUS_CSS_RE.search(cleaned_nospace))
++
++
++def sanitize_html(raw_html: str) -> str:
++    """Sanitize HTML string to remove all JavaScript / XSS vectors."""
++    # Pre-pass: normalize null bytes which can break HTML parsing in browsers
++    cleaned_input = raw_html.replace("\x00", "")
++
++    formatter = _PreserveOrderHTMLFormatter()
++
++    # We perform two passes to guarantee idempotency and prevent mutation XSS (mXSS)
++    for _ in range(2):
++        builder = HTMLParserTreeBuilder(preserve_whitespace_tags=_AllWhitespaceSet())
++        soup = BeautifulSoup(cleaned_input, builder=builder)
++
++        # Remove comments (prevents conditional comments / mXSS tricks) and processing instructions
++        for node in soup.find_all(
++            string=lambda text: isinstance(text, (Comment, ProcessingInstruction))
++        ):
++            node.extract()
++
++        # Also sanitize Declarations if they contain scripts/tags
++        for node in soup.find_all(string=lambda text: isinstance(text, Declaration)):
++            if any(tok in str(node).lower() for tok in ("script", "javascript", "onload", "onerror")):
++                node.extract()
++
++        # First unwrap tags whose inner content should be inspected as normal DOM elements
++        for tag_name in UNWRAP_TAGS:
++            for tag in soup.find_all(tag_name):
++                tag.unwrap()
++
++        # Re-parse if we unwrapped tags that previously held unparsed text
++        for tag in list(soup.find_all(True)):
++            if tag.decomposed:
++                continue
++
++            name_lower = tag.name.lower() if tag.name else ""
++
++            # Any tag name containing '<', '>', or invalid tag characters is a malformed/nested tag trick
++            if not re.match(r"^[a-z0-9:_-]+$", name_lower):
++                tag.decompose()
++                continue
++
++            # Strip namespace prefix check (e.g. svg:script)
++            local_name = name_lower.split(":")[-1]
++
++            if name_lower in REMOVE_WITH_CONTENT_TAGS or local_name in REMOVE_WITH_CONTENT_TAGS:
++                tag.decompose()
++                continue
++
++            # SVG animation/foreignObject/set/use/handler elements are major XSS vectors without on*
++            if local_name in ("set", "animate", "animatetransform", "animatemotion", "animatecolor", "handler", "foreignobject", "use"):
++                tag.decompose()
++                continue
++
++            # Meta refresh or meta Content-Security-Policy / charset tricks that execute JS
++            if local_name == "meta":
++                http_equiv = str(tag.attrs.get("http-equiv", "")).lower().strip()
++                content = str(tag.attrs.get("content", ""))
++                if http_equiv in ("refresh", "set-cookie", "content-type") or "javascript" in _normalize_for_scheme_check(content) or "url=" in content.lower():
++                    tag.decompose()
++                    continue
++
++            # Link tags that load stylesheets/imports/manifests with dangerous schemes or rel=import
++            if local_name == "link":
++                rel_val = tag.attrs.get("rel", [])
++                if isinstance(rel_val, list):
++                    rel_str = " ".join(rel_val).lower()
++                else:
++                    rel_str = str(rel_val).lower()
++                href_val = str(tag.attrs.get("href", ""))
++                if "import" in rel_str or "preload" in rel_str or "prefetch" in rel_str or "modulepreload" in rel_str or is_dangerous_url(href_val):
++                    tag.decompose()
++                    continue
++
++            # Style tags: sanitize or remove if they contain dangerous CSS or embedded HTML tags
++            if local_name == "style":
++                style_text = tag.get_text()
++                # Check if style is inside svg/math (mXSS vector) or contains dangerous CSS or HTML tag openings
++                has_foreign_parent = any(
++                    p.name and p.name.lower() in ("svg", "math") for p in tag.parents
++                )
++                if (
++                    has_foreign_parent
++                    or is_dangerous_style(style_text)
++                    or re.search(r"<[a-zA-Z!/\?]", style_text)
++                ):
++                    tag.decompose()
++                    continue
++
++            # Rawtext tags (title, textarea, xmp, etc.): strip any embedded HTML tags to prevent breakout/mXSS
++            if local_name in RAWTEXT_TAGS:
++                text_content = tag.get_text()
++                if re.search(r"<[a-zA-Z!/\?]", text_content):
++                    tag.string = re.sub(r"<[^>]*>", "", text_content)
++
++            # Inspect and sanitize attributes
++            attrs_to_remove = []
++            for attr_name, attr_val in list(tag.attrs.items()):
++                attr_lower = attr_name.lower().strip()
++                attr_clean = re.sub(r"[^a-z0-9:_-]", "", attr_lower)
++
++                # Normalize attribute value to string for checking
++                if isinstance(attr_val, list):
++                    val_str = " ".join(str(v) for v in attr_val)
++                elif attr_val is None:
++                    val_str = ""
++                else:
++                    val_str = str(attr_val)
++
++                # 1. Remove any event handler attributes (on*)
++                if attr_lower.startswith("on") or attr_clean.startswith("on") or attr_lower in ALWAYS_DANGEROUS_ATTRS:
++                    attrs_to_remove.append(attr_name)
++                    continue
++
++                # 2. Remove XML/XLink namespace event or script attributes
++                if "on" in attr_lower.split(":")[-1] and attr_lower.split(":")[-1].startswith("on"):
++                    attrs_to_remove.append(attr_name)
++                    continue
++
++                # 3. Check style attribute
++                if attr_lower == "style":
++                    if is_dangerous_style(val_str):
++                        attrs_to_remove.append(attr_name)
++                    continue
++
++                # 4. Check srcdoc or any attribute containing dangerous URL schemes
++                if attr_lower in URL_ATTRIBUTES or is_dangerous_url(val_str):
++                    if is_dangerous_url(val_str):
++                        attrs_to_remove.append(attr_name)
++                        continue
++
++                # 5. Also check if any attribute value contains javascript: or vbscript: anywhere
++                norm_val = _normalize_for_scheme_check(val_str)
++                if any(
++                    scheme in norm_val
++                    for scheme in ("javascript:", "vbscript:", "livescript:", "expression(")
++                ):
++                    attrs_to_remove.append(attr_name)
++                    continue
++
++            for attr_name in attrs_to_remove:
++                del tag.attrs[attr_name]
++
++        cleaned_input = soup.decode(formatter=formatter)
++
++    return cleaned_input
++
++
++def main() -> None:
++    if len(sys.argv) < 2:
++        sys.exit("Usage: python3 /app/filter.py <html_file>")
++
++    file_path = sys.argv[1]
++    with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
++        content = f.read()
++
++    sanitized = sanitize_html(content)
++
++    with open(file_path, "w", encoding="utf-8", errors="surrogateescape") as f:
++        f.write(sanitized)
++
++
++if __name__ == "__main__":
++    main()
