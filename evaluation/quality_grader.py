@@ -479,7 +479,7 @@ def call_judge(spec: str, prompt: str, timeout_s: int = 600, retries: int = 2) -
 def find_trials(patterns: list[str], all_runs: bool, agents=("agy", "claude")) -> list[Path]:
     dirs = []
     if all_runs:
-        patterns = [str(BASE_DIR / "results" / "c[678]_runs" / "*")]
+        patterns = [str(BASE_DIR / "results" / "c[6789]_runs" / "*")]
     for pat in patterns:
         for d in sorted(glob.glob(pat)):
             d = Path(d)
